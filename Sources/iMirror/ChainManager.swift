@@ -160,7 +160,10 @@ final class ChainManager {
                 changed = true
             }
         }
-        for (udid, device) in present {
+        // go-ios's order, not the dictionary's: two new phones in one poll get
+        // their slots in a repeatable order.
+        for device in usb where present[device.udid] == device {
+            let udid = device.udid
             missingPolls[udid] = nil
             if let c = controller(udid) {
                 c.attached = device                   // e.g. an iOS update
