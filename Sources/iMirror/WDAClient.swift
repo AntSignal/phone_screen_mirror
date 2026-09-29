@@ -113,17 +113,38 @@ final class WDAClient {
                     completion(.alive)
                 } else {
                     self.sessionId = nil                       // session gone
-                    self.statusReady { completion($0 ? .needsSession : .down) }
+                    self.statusOrAdopt(completion)
                 }
             }
         } else {
-            statusReady { completion($0 ? .needsSession : .down) }
+            statusOrAdopt(completion)
         }
     }
 
-    private func statusReady(_ completion: @escaping (Bool) -> Void) {
-        send("GET", "/status", nil) { _, json, error in
-            completion(error == nil && WDAParse.ready(json))
+    /// No usable session of our own: read /status. WDA allows ONE session per
+    /// phone and creating one silently ends the old one — so if an agent (the
+    /// MCP server) already has a session, join it instead of reporting
+    /// `.needsSession`, which would make the app create its own and yank the
+    /// agent's out from under it mid-flow.
+    private func statusOrAdopt(_ completion: @escaping (Health) -> Void) {
+        send("GET", "/status", nil) { [weak self] _, json, error in
+            guard let self else { return }
+            guard error == nil, WDAParse.ready(json) else { completion(.down); return }
+            guard let active = WDAParse.activeSessionId(json) else { completion(.needsSession); return }
+            self.sessionId = active
+            // The mirror's MJPEG tuning is WDA-wide, so it must be re-applied
+            // when joining a session someone else created, or the stream drops
+            // to WDA's low defaults. The gesture settings match the MCP's own.
+            self.applyFastGestureSettings(sid: active)
+            self.applyMJPEGSettings(sid: active)
+            self.fetchWindowSize { result in
+                switch result {
+                case .success: completion(.alive)
+                case .failure:
+                    self.sessionId = nil
+                    completion(.needsSession)
+                }
+            }
         }
     }
 

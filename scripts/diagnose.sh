@@ -60,22 +60,35 @@ echo "--- stray/orphaned go-ios children (a leftover tunnel blocks a fresh one) 
 pgrep -fl "ios tunnel|ios runwda|ios forward" 2>/dev/null || echo "(none running)"
 echo "--- who holds the tunnel agent port 60105? ---"
 lsof -nP -iTCP:60105 2>/dev/null || echo "(nobody on 60105)"
-echo "--- relay 8100 / forward 8101 ---"
-lsof -nP -iTCP:8100 -sTCP:LISTEN 2>/dev/null || echo "(nothing listening on 8100)"
-lsof -nP -iTCP:8101 -sTCP:LISTEN 2>/dev/null || echo "(nothing listening on 8101)"
-echo "--- tunnel agent: any established device tunnel? ---"
+echo "--- device file: every phone the app runs, and its ports ---"
+DEVICES="${IMIRROR_DEVICES_FILE:-$SUPPORT/devices.json}"
+if [[ -f "$DEVICES" ]]; then
+  cat "$DEVICES"
+  echo
+else
+  echo "(no $DEVICES — the app isn't running, Automation is off, or it's an older build)"
+fi
+echo "--- tunnel agent: which phones have an established tunnel? ---"
 curl -sS --max-time 3 http://127.0.0.1:60105/tunnels 2>&1 | head -5 || echo "(agent not answering)"
-echo "--- is WDA reachable through the relay? ---"
-curl -sS --max-time 3 http://127.0.0.1:8100/status 2>&1 | head -20 || echo "(WDA not reachable on 8100)"
+echo "--- listeners on each phone's ports (relay 8100+10n, forward 8101+10n, MJPEG 9110+10n) ---"
+lsof -nP -iTCP -sTCP:LISTEN 2>/dev/null | awk 'NR==1 || $9 ~ /:(81[0-7][01]|91[1-8]0)$/' || true
+echo "--- is each phone's WDA reachable through its relay? ---"
+for port in $( (grep -oE '"wda_url" : "http://127\.0\.0\.1:[0-9]+' "$DEVICES" 2>/dev/null || true) \
+               | grep -oE '[0-9]+$'); do
+  printf ':%s -> ' "$port"
+  curl -sS --max-time 3 "http://127.0.0.1:$port/status" 2>&1 | tr -d '\n ' | cut -c1-160
+  echo
+done
+[[ -f "$DEVICES" ]] || { printf ':8100 -> '; curl -sS --max-time 3 http://127.0.0.1:8100/status 2>&1 | head -c 200; echo; }
 
 section "5. go-ios working dir + child logs"
 echo "path: $SUPPORT"
 ls -la "$SUPPORT" 2>&1
-for f in tunnel runwda forward; do
-  if [[ -f "$SUPPORT/$f.log" ]]; then
-    echo "--- last 40 lines of $f.log ---"
-    tail -40 "$SUPPORT/$f.log"
-  fi
+# One tunnel.log; runwda-/forward-/mjpeg-forward-<udid tail>.log per phone.
+for f in "$SUPPORT"/tunnel.log "$SUPPORT"/runwda*.log "$SUPPORT"/forward*.log "$SUPPORT"/mjpeg-forward*.log; do
+  [[ -f "$f" ]] || continue
+  echo "--- last 40 lines of $(basename "$f") ---"
+  tail -40 "$f"
 done
 echo "(child logs only exist if the app ran with IMIRROR_DEBUG=1 — see step 7)"
 
