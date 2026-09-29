@@ -59,7 +59,12 @@ fi
 
 # Bundle the MCP server so the in-app one-click MCP install works from a DMG.
 mkdir -p "$APP/Contents/Resources/mcp-server"
-cp "$ROOT/mcp-server/imirror_mcp.py" "$APP/Contents/Resources/mcp-server/" 2>/dev/null || true
+# Every server module, not just imirror_mcp.py: it imports wda_bringup, and a
+# bundle missing that file fails at import. Tests stay out of the app.
+for py in "$ROOT"/mcp-server/*.py; do
+    case "$(basename "$py")" in test_*) continue ;; esac
+    cp "$py" "$APP/Contents/Resources/mcp-server/" 2>/dev/null || true
+done
 [[ -f "$ROOT/mcp-server/requirements.txt" ]] && \
     cp "$ROOT/mcp-server/requirements.txt" "$APP/Contents/Resources/mcp-server/" || true
 

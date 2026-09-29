@@ -210,16 +210,32 @@ on session creation, which removes the multi-second stall that previously hit th
 first swipe of a session.
 
 **Self-managed transport.** On launch the app spawns `go-ios` as child processes
-and runs an in-process loopback relay:
+and runs an in-process loopback relay — one chain per iPhone attached by USB, all
+sharing one tunnel. For the first phone (slot 0):
 
 ```
 iMirror (CFNetwork)  → 127.0.0.1:8100 (relay) → :8101 (ios forward) --USB--> WDA HTTP  :8100
 iMirror (raw socket) -------------------------→ :9110 (ios forward) --USB--> WDA MJPEG :9100
-   ios tunnel start --userspace   iOS 17+ RSD tunnel (userspace = no root)
-   ios runwda                     launches WebDriverAgent (no Xcode)
-   ios forward 8101 8100          USB relay of WDA's HTTP port
-   ios forward 9110 9100          USB relay of WDA's MJPEG stream
+   ios tunnel start --userspace             iOS 17+ RSD tunnel (userspace = no root), shared
+   ios runwda --udid=U                      launches WebDriverAgent on that phone (no Xcode)
+   ios forward --udid=U 8101 8100           USB relay of WDA's HTTP port
+   ios forward --udid=U 9110 9100           USB relay of WDA's MJPEG stream
 ```
+
+**Several iPhones.** Every phone gets a port slot that sticks to its UDID: slot n
+uses relay `8100+10n`, forward `8101+10n`, MJPEG `9110+10n` (so the second phone
+is `:8110`), and an alias (`phone1`, `phone2`, … — rename it in Settings). Each
+phone has its own health probe and recovery ladder and keeps running whether or
+not the window shows it; the toolbar's phone picker (⌘] / ⌘[) chooses which one
+is mirrored and controlled. A stuck phone restarts only its own chain while
+another phone is healthy; the shared tunnel is restarted only when that phone
+has no tunnel route or no other phone would notice (rate-limited to once per two
+minutes, plus a manual "Restart USB tunnel (all phones)" in Settings). The app
+publishes every phone to `~/Library/Application Support/iMirror/devices.json`,
+which the MCP server reads — so one MCP server drives them all (see
+[mcp-server/README.md](mcp-server/README.md#several-devices)). The app also joins
+the WDA session an agent already has on a phone instead of creating its own:
+WDA allows one session per phone, and creating one silently ends the agent's.
 
 The MJPEG stream is read directly off its forwarded port over a raw socket, so
 it skips the CFNetwork relay entirely — only the WDA HTTP path needs the relay
@@ -343,11 +359,12 @@ distribute the notarized DMG directly.
   action). Scrolling is not frame-tight and has no inertial coast (a WDA
   limitation, not a tuning knob).
 - **Not reachable** (XCUITest limitation): App Switcher, Control Center, Siri.
-- **One physical device at a time** — the transport assumes a single phone and
-  fixed loopback ports (8100/8101 for WDA HTTP, 9110/9100 for the MJPEG
-  stream). Multi-device would need per-device port plumbing. A booted **iOS
-  Simulator** runs on a separate WDA (`:8201`), so it can be enabled alongside a
-  physical device.
+- **Several phones, one window.** Every iPhone attached by USB is driven at once
+  (up to 8, one port slot each); the window mirrors one at a time. A phone paired
+  only over Wi-Fi is not picked up. A booted **iOS Simulator** runs on its own
+  WDA (`:8201`) alongside them, and is listed to the MCP server as `sim`. All
+  phones share one go-ios tunnel, so a tunnel restart drops every phone for
+  about 20 s.
 - **Maintenance reality:** control depends on go-ios + WebDriverAgent tracking
   Apple's private wire protocols, so a new iOS major version can break the chain
   until those projects catch up. Pinned versions in

@@ -24,6 +24,10 @@ The iMirror app must be running with its toolbar **health dot green** (it brings
 WebDriverAgent up on `127.0.0.1:8100`). Verify with `ios_status` first; if it's
 not ready, tell the user to start the app rather than retrying blindly.
 
+With several phones attached, `ios_devices` lists them. Pass `device="<alias>"` on
+each call (the run records every phone, tagging each step), or the call fails
+asking which phone you mean.
+
 ## Workflow
 
 1. **Confirm scope.** Restate the flow you'll test and that you'll produce a

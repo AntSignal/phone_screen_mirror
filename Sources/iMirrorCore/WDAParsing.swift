@@ -19,4 +19,13 @@ public enum WDAParse {
     public static func ready(_ json: [String: Any]?) -> Bool {
         ((json?["value"] as? [String: Any])?["ready"] as? Bool) ?? false
     }
+
+    /// The session WDA is already serving, from `/status`'s top-level
+    /// `sessionId`. WDA allows one session per phone and creating one silently
+    /// kills the old — so the app joins an agent's session instead of making
+    /// its own and yanking it out from under the MCP server.
+    public static func activeSessionId(_ statusJSON: [String: Any]?) -> String? {
+        guard let id = statusJSON?["sessionId"] as? String, !id.isEmpty else { return nil }
+        return id
+    }
 }

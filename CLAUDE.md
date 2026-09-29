@@ -13,8 +13,11 @@ There is **no CI**. Before committing or opening a PR for anything under
 `mcp-server/`, run the unit suite locally and make sure it passes:
 
 ```bash
-mcp-server/.venv/bin/python -m pytest mcp-server/test_imirror_mcp.py
+mcp-server/.venv/bin/python -m pytest mcp-server
 ```
+
+(`mcp-server` runs every suite: `test_imirror_mcp.py`, `test_multi_device.py` and
+`test_wda_bringup.py`; the live ones skip themselves.)
 
 First-time setup (creates the venv the command above expects):
 
@@ -40,6 +43,14 @@ dot green:
 
 ```bash
 IMIRROR_LIVE=1 mcp-server/.venv/bin/python -m pytest mcp-server/test_integration.py -v
+```
+
+With two or more phones up, `test_integration_devices.py` checks them together
+(leave `IMIRROR_WDA` unset so the server reads the app's device file):
+
+```bash
+IMIRROR_LIVE_DEVICES=phone1,phone2 mcp-server/.venv/bin/python -m pytest \
+    mcp-server/test_integration_devices.py -v
 ```
 
 ## Conventions

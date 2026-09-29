@@ -9,22 +9,31 @@ wait for the toolbar health dot to go green, then connect this server.
 Capabilities: device screenshot, tap, swipe, type, hardware buttons, find-and-tap
 by visible text, accessibility source, and status/size.
 
+Several phones: the iMirror app brings WDA up on every attached iPhone, each on
+its own loopback port, and lists them in a device file (see _Registry). Every
+device tool then takes an optional `device` argument (alias or UDID), calls to
+different phones run in parallel, and calls to one phone run in order.
+
 SECURITY: talks to WDA over loopback only — WDA has no auth on the wire, so it
 must never be exposed beyond localhost. These tools fully control the phone; use
 on a device you own, with consent.
 
 Run:  pip install "mcp[cli]"  &&  python imirror_mcp.py
-Override target:  IMIRROR_WDA=http://127.0.0.1:8100
+Pin one target (the pre-multi-device behaviour):  IMIRROR_WDA=http://127.0.0.1:8100
 """
 from __future__ import annotations
 
-__version__ = "1.2.0"
+__version__ = "1.3.0"
 
 import atexit
 import base64
+import concurrent.futures
+import contextvars
+import dataclasses
 import functools
 import html
 import http.client
+import inspect
 import ipaddress
 import json
 import math
@@ -41,10 +50,13 @@ import time
 import urllib.error
 import urllib.request
 import xml.etree.ElementTree as ET
-from typing import Any
+from typing import Annotated, Any
 from urllib.parse import urlsplit
 
+import anyio
 from mcp.server.fastmcp import FastMCP, Image
+from mcp.types import ToolAnnotations
+from pydantic import Field
 
 import wda_bringup
 
@@ -138,17 +150,368 @@ if TARGET not in ("device", "simulator"):
 _IS_SIM = TARGET == "simulator"
 
 
+# ---- Targets: which phone a call drives -----------------------------------------
+#
+# A _Target is one WDA endpoint plus everything that must NOT be shared between
+# phones: the WDA session id, the cached window size, the gesture lock, and a
+# per-phone call lock. Three modes decide where targets come from:
+#
+#   pinned   — IMIRROR_WDA is set. Exactly one target (_LEGACY), exactly the
+#              pre-multi-device behaviour. Keeps the `imirror-sim` registration
+#              (IMIRROR_WDA=:8201) and every single-target test working.
+#   list     — no IMIRROR_WDA, and the iMirror app's device file is valid: one
+#              target per phone (plus the Simulator when it's enabled).
+#   fallback — no IMIRROR_WDA and no valid device file (an older iMirror app, or
+#              the app isn't running): _LEGACY on the default :8100.
+
+@dataclasses.dataclass(eq=False)
+class _Target:
+    key: str                      # the UDID, or "legacy"
+    alias: str                    # short name agents pass as `device`
+    udid: str | None
+    kind: str                     # "device" | "simulator"
+    wda: str                      # loopback base URL
+    session: dict[str, str | None] = dataclasses.field(
+        default_factory=lambda: {"id": None})
+    window: dict[str, Any] = dataclasses.field(
+        default_factory=lambda: {"size": None, "t": 0.0})
+    # Serialises /actions posts on this phone. WDA has one XCUITest queue per
+    # phone; two overlapping gestures stall it and can wedge the wire.
+    gesture_lock: Any = dataclasses.field(default_factory=threading.Lock)
+    # Held for a whole tool call, so calls to ONE phone run in order (as they
+    # always did) while calls to different phones run side by side. Re-entrant
+    # so ios_run_sequence's steps can run inside the sequence's own hold.
+    call_lock: Any = dataclasses.field(default_factory=threading.RLock)
+    product_type: str | None = None
+    ios_version: str | None = None
+    state: str | None = None
+    detail: str | None = None
+
+    @property
+    def is_sim(self) -> bool:
+        return self.kind == "simulator"
+
+
+_session: dict[str, str | None] = {"id": None}
+
+# Logical screen size, cached briefly so scroll helpers don't re-query every call.
+_window_cache: dict[str, Any] = {"size": None, "t": 0.0}
+
+# The single target of pinned/fallback mode. Its session/window dicts ARE the
+# long-standing module-level _session/_window_cache, so code and tests that
+# reach for those keep seeing the live state.
+_LEGACY = _Target(key="legacy", alias="default",
+                  udid=os.environ.get("IMIRROR_UDID") or None,
+                  kind=TARGET, wda=WDA, session=_session, window=_window_cache)
+
+_PINNED = "IMIRROR_WDA" in os.environ
+
+_DEVICES_FILE_DEFAULT = os.path.expanduser(
+    "~/Library/Application Support/iMirror/devices.json")
+_DEVICES_SCHEMA = 1
+
+
+def _devices_file() -> str:
+    return os.environ.get("IMIRROR_DEVICES_FILE") or _DEVICES_FILE_DEFAULT
+
+
+def _pid_alive(pid: Any) -> bool:
+    """True if `pid` is a live process we could signal. A dead owner means the
+    iMirror app crashed without deleting its device file, so the ports it lists
+    are stale and must not be driven."""
+    if not isinstance(pid, int) or isinstance(pid, bool) or pid <= 0:
+        return False
+    try:
+        os.kill(pid, 0)
+    except OSError:
+        return False
+    return True
+
+
+class _Registry:
+    """The iMirror app's device file, re-read whenever it changes on disk.
+
+    Targets are kept by UDID across reloads, so a phone's WDA session and locks
+    survive the app rewriting the file (it does on every state change). A file
+    is only trusted when its owner process is alive, it belongs to this user,
+    and its schema matches; each entry must also point at loopback (WDA has no
+    auth on the wire), or it is dropped."""
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._sig: tuple | None = None
+        self._by_udid: dict[str, _Target] = {}
+        self._order: list[str] = []
+        self._owner: int | None = None
+        self.goios: str | None = None
+        self.problem = "no device file yet"
+
+    def snapshot(self) -> tuple[bool, list[_Target]]:
+        """(valid, targets). `valid` is False when the file is missing, stale
+        or malformed — the caller then falls back to the single :8100 target."""
+        with self._lock:
+            self._refresh_locked()
+            if self._owner is None:
+                return False, []
+            return True, [self._by_udid[u] for u in self._order]
+
+    def _invalidate(self, problem: str) -> None:
+        self._owner = None
+        self._order = []
+        self.goios = None
+        self.problem = problem
+
+    def _refresh_locked(self) -> None:
+        path = _devices_file()
+        try:
+            st = os.stat(path)
+        except OSError:
+            self._sig = None
+            self._invalidate(f"no device file at {path}")
+            return
+        sig = (path, st.st_mtime_ns, st.st_size, st.st_ino)
+        if sig == self._sig:
+            # Unchanged file — but the app may have died since we parsed it.
+            if self._owner is not None and not _pid_alive(self._owner):
+                self._invalidate("the iMirror app that wrote the device file is gone")
+            return
+        self._sig = sig
+        if st.st_uid != os.getuid():
+            self._invalidate(f"{path} is not owned by this user")
+            return
+        try:
+            with open(path, encoding="utf-8") as f:
+                doc = json.load(f)
+        except (OSError, ValueError) as e:
+            self._invalidate(f"unreadable device file ({e})")
+            return
+        if not isinstance(doc, dict) or doc.get("schema") != _DEVICES_SCHEMA:
+            self._invalidate("device file has an unknown schema")
+            return
+        owner = doc.get("owner_pid")
+        if not _pid_alive(owner):
+            self._invalidate("the iMirror app that wrote the device file is gone")
+            return
+        order: list[str] = []
+        for entry in doc.get("devices") or []:
+            t = self._apply_entry(entry)
+            if t is not None and t.key not in order:
+                order.append(t.key)
+        self._owner = owner
+        self._order = order
+        goios = doc.get("goios")
+        self.goios = goios if isinstance(goios, str) and goios else None
+        self.problem = ""
+
+    def _apply_entry(self, e: Any) -> _Target | None:
+        if not isinstance(e, dict):
+            return None
+        udid, alias, kind, wda = e.get("udid"), e.get("alias"), e.get("kind"), e.get("wda_url")
+        if not (isinstance(udid, str) and udid and isinstance(alias, str) and alias):
+            return None
+        if kind not in ("device", "simulator"):
+            return None
+        if not (isinstance(wda, str) and _is_loopback_url(wda)):
+            return None                  # never drive a non-loopback WDA
+        wda = wda.rstrip("/")
+        t = self._by_udid.get(udid)
+        if t is None:
+            t = _Target(key=udid, alias=alias, udid=udid, kind=kind, wda=wda)
+            self._by_udid[udid] = t
+        elif t.wda != wda:
+            # The phone moved ports (its slot changed): its old session id means
+            # nothing on the new endpoint.
+            t.wda = wda
+            t.session["id"] = None
+            t.window.update(size=None, t=0.0)
+        t.alias, t.kind = alias, kind
+
+        def s(key: str) -> str | None:
+            v = e.get(key)
+            return v if isinstance(v, str) and v else None
+        t.product_type, t.ios_version = s("product_type"), s("ios_version")
+        t.state, t.detail = s("state"), s("detail")
+        return t
+
+
+_REGISTRY = _Registry()
+
+
+def _targets() -> tuple[str, list[_Target]]:
+    """(mode, targets) — see the mode table above."""
+    if _PINNED:
+        return "pinned", [_LEGACY]
+    valid, targets = _REGISTRY.snapshot()
+    if valid:
+        return "list", targets
+    return "fallback", [_LEGACY]
+
+
+def _short_udid(udid: str | None) -> str:
+    if not udid:
+        return "?"
+    return udid if len(udid) <= 14 else f"{udid[:8]}…{udid[-5:]}"
+
+
+def _describe(t: _Target) -> str:
+    what = "simulator" if t.is_sim else (t.product_type or "iPhone")
+    bits = [what]
+    if t.ios_version:
+        bits.append(f"iOS {t.ios_version}")
+    bits.append(_short_udid(t.udid))
+    if t.state:
+        bits.append(t.state)
+    return f"{t.alias} ({', '.join(bits)})"
+
+
+def _device_error(msg: str, code: str, targets: list[_Target]) -> MCPToolError:
+    listing = "; ".join(_describe(t) for t in targets) or "none"
+    return MCPToolError(f"{msg} Devices: {listing}. List them with ios_devices.",
+                        kind=ErrorKind.VALIDATION, code=code)
+
+
+def _norm_id(s: str) -> str:
+    return s.replace("-", "").lower()
+
+
+def _match(query: str, targets: list[_Target], source: str = "device") -> _Target:
+    """Resolve `query` to exactly one target: alias, then UDID, then a unique
+    UDID prefix, then a unique UDID suffix (4+ characters, dashes ignored).
+    Suffixes alone are weak — the two test phones' UDIDs both end in 401C — so
+    anything that matches more than one phone is refused, never guessed."""
+    q = query.strip()
+    ql = q.lower()
+    for t in targets:
+        if t.alias.lower() == ql:
+            return t
+    for t in targets:
+        if t.udid and t.udid.lower() == ql:
+            return t
+    qn = _norm_id(q)
+    if len(qn) >= 4:
+        for how, test in (("prefix", str.startswith), ("suffix", str.endswith)):
+            hits = [t for t in targets if t.udid and test(_norm_id(t.udid), qn)]
+            if len(hits) == 1:
+                return hits[0]
+            if len(hits) > 1:
+                raise _device_error(
+                    f"{source}={q!r} is a UDID {how} of more than one device; "
+                    f"use its alias or more of its UDID.", "DEVICE_AMBIGUOUS", targets)
+    raise _device_error(f"{source}={q!r} matches no device.", "DEVICE_UNKNOWN", targets)
+
+
+def _resolve(query: str = "", prefer: str | None = None) -> _Target:
+    """Pick the target a call drives.
+
+    With `query` empty: the only target of the preferred kind (sim_* tools
+    prefer the simulator); else IMIRROR_DEFAULT_DEVICE; else the only physical
+    phone (a Simulator switched on beside it doesn't count, so enabling one
+    doesn't break calls that name no device); else fail listing the choices —
+    silently driving the wrong phone is worse than asking."""
+    mode, targets = _targets()
+    q = (query or "").strip()
+    if mode != "list":
+        t = targets[0]
+        if not q or _match_one(q, t):
+            return t
+        why = ("pinned to one target by IMIRROR_WDA" if mode == "pinned"
+               else "not reading an iMirror device file "
+                    f"({_REGISTRY.problem}), so it only knows {t.wda}")
+        raise _device_error(f"device={q!r} is not available: this server is {why}.",
+                            "DEVICE_UNKNOWN", targets)
+    if q:
+        return _match(q, targets)
+    if prefer:
+        pool = [t for t in targets if t.kind == prefer]
+        if len(pool) == 1:
+            return pool[0]
+    env = os.environ.get("IMIRROR_DEFAULT_DEVICE", "").strip()
+    if env:
+        return _match(env, targets, source="IMIRROR_DEFAULT_DEVICE")
+    phones = [t for t in targets if t.kind == "device"]
+    if len(phones) == 1:
+        return phones[0]
+    if not phones and len(targets) == 1:
+        return targets[0]
+    if not targets:
+        raise MCPToolError(
+            "iMirror lists no devices. Is a phone plugged in by USB and is "
+            "Automation on (Settings ⚙)?", kind=ErrorKind.UNREACHABLE, code="NO_DEVICES")
+    raise _device_error("Several devices are attached; pass device=<alias or UDID>.",
+                        "DEVICE_REQUIRED", targets)
+
+
+def _match_one(q: str, t: _Target) -> bool:
+    try:
+        return _match(q, [t]) is t
+    except MCPToolError:
+        return False
+
+
+# The target the current tool call is driving. Set by _tool's wrapper for the
+# duration of one call (in that call's worker thread), read by every helper
+# below instead of a module global.
+_current: contextvars.ContextVar[_Target | None] = contextvars.ContextVar(
+    "imirror_target", default=None)
+
+
+def _cur() -> _Target:
+    """The target of the running call, or the default one when a helper is
+    called outside any tool (tests, atexit)."""
+    t = _current.get()
+    return t if t is not None else _resolve("")
+
+
+def _cur_or_none() -> _Target | None:
+    try:
+        return _cur()
+    except MCPToolError:
+        return None
+
+
+def _is_sim() -> bool:
+    t = _cur_or_none()
+    return t.is_sim if t is not None else _IS_SIM
+
+
+def _sim_udid() -> str:
+    """simctl's device argument: this simulator's UDID when known, else
+    `booted` (the pinned IMIRROR_TARGET=simulator profile, which predates
+    UDIDs and assumes one booted simulator)."""
+    t = _cur_or_none()
+    return (t.udid if t is not None and t.udid else "booted")
+
+
+def _label(t: _Target | None) -> str:
+    """How errors name a target: just the URL for the single-target modes (the
+    message they always had), alias + URL in list mode."""
+    if t is None:
+        return WDA
+    return t.wda if t is _LEGACY else f"{t.alias} ({t.wda})"
+
+
 def _unreachable_hint() -> str:
     """Actionable 'why can't I reach WDA' suffix, phrased for the current target."""
-    if _IS_SIM:
+    t = _cur_or_none()
+    if t is not None and t is not _LEGACY:
+        state = f" iMirror reports it as {t.state}" if t.state else ""
+        detail = f" ({t.detail})" if t.detail else ""
+        where = ("Is its WebDriverAgent running (Settings ⚙ → Simulator)?" if t.is_sim
+                 else f"Is its health dot green in iMirror?")
+        return f"{where}{state}{detail}. ios_devices lists every device."
+    if _is_sim():
         return (f"Is the simulator's WebDriverAgent running (scripts/sim-wda-up.sh) "
-                f"and reachable at {WDA}?")
+                f"and reachable at {_label(t)}?")
     return "Is the iMirror app running and is the health dot green?"
 
 
 def _wedged_hint() -> str:
     """Where to look when WDA is up but not answering, phrased for the target."""
-    return ("check the simulator's WebDriverAgent process" if _IS_SIM
+    t = _cur_or_none()
+    if t is not None and t is not _LEGACY:
+        return (f"check {t.alias}'s WebDriverAgent" if t.is_sim
+                else f"check {t.alias}'s health dot in iMirror")
+    return ("check the simulator's WebDriverAgent process" if _is_sim()
             else "check the iMirror health dot")
 
 
@@ -169,17 +532,28 @@ _TIMEOUT_PROBE = 5
 _TIMEOUT_INTERACT = 15
 _TIMEOUT_TREE = 60
 
-mcp = FastMCP("imirror")
-
-_session: dict[str, str | None] = {"id": None}
+mcp = FastMCP("imirror", instructions=(
+    "Drives real iPhones (and optionally a Simulator) through WebDriverAgent. "
+    "Several phones may be attached: ios_devices lists them. Every device tool "
+    "takes an optional `device` (alias or UDID); omit it when only one phone is "
+    "attached. Calls to different phones run in parallel."))
 
 # Optional per-run recording. Off until ios_start_run; every action/screenshot is
 # appended to _run["steps"], and ios_finish_run renders them into a report.
+# One run records at a time, across every phone: each step carries the alias of
+# the phone it ran on, so a two-phone flow reads as one interleaved timeline.
 _run: dict[str, Any] = {
     "active": False, "dir": None, "label": None, "started": None,
-    "device": None, "ios": None, "steps": [],
-    "recorder": None, "recording": None,
+    "device": None, "ios": None, "steps": [], "devices": {},
+    "recorder": None, "recording": None, "sim_target": False,
 }
+
+# Guards _run's step list, step numbering and screenshot file names. Two phones'
+# calls now run on different threads at the same time; without this, two
+# screenshots could get the same NNN name or a step could be appended to a run
+# that ios_finish_run is already rendering. Lock order: _recorder_lock, then
+# _run_lock — never the reverse.
+_run_lock = threading.RLock()
 
 
 def _record(action: str, detail: str = "", screenshot: str | None = None,
@@ -197,13 +571,32 @@ def _record(action: str, detail: str = "", screenshot: str | None = None,
     `{"kind": "idle", "reason": <settled|still-moving|empty|too-few-reads>}`
     for an `ios_await_idle` read. It is additive: the legacy `note` field
     keeps working unchanged for callers that don't pass a verdict.
+
+    `device` is the alias of the phone the step ran on (None for the single
+    pinned target, and for notes/sections, which belong to no phone).
     """
-    if not _run["active"]:
-        return
+    with _run_lock:
+        if not _run["active"]:
+            return
+        _append_step_locked(action, detail, screenshot, note, verdict)
+
+
+def _step_device() -> str | None:
+    """Alias of the phone the running call drives, for tagging run steps.
+    Reads the context only — recording must never raise DEVICE_REQUIRED."""
+    t = _current.get()
+    if t is None or t is _LEGACY:
+        return None
+    _run["devices"].setdefault(t.alias, _describe(t))
+    return t.alias
+
+
+def _append_step_locked(action: str, detail: str, screenshot: str | None,
+                        note: str, verdict: dict[str, Any] | None) -> None:
     step = {
         "i": len(_run["steps"]) + 1, "t": time.time(),
         "action": action, "detail": detail, "screenshot": screenshot, "note": note,
-        "verdict": verdict,
+        "verdict": verdict, "device": _step_device(),
     }
     _run["steps"].append(step)
     run_dir = _run.get("dir")
@@ -247,8 +640,8 @@ def _recorded(fn):
     No-op when no run is active: it still re-raises, but records nothing —
     behavior is identical to calling the undecorated function.
 
-    Apply this UNDER `@mcp.tool()` (i.e. `@mcp.tool()` on top, `@_recorded`
-    directly above `def`) so FastMCP registers/introspects the real function.
+    Apply this UNDER `@_tool()` (i.e. `@_tool()` on top, `@_recorded`
+    directly above `def`) so the tool registers/introspects the real function.
     `functools.wraps` preserves `__name__`/`__doc__`/signature for that.
     """
     @functools.wraps(fn)
@@ -269,39 +662,133 @@ def _recorded(fn):
     return wrapper
 
 
+_DEVICE_DOC = ("Which device to drive: an alias or UDID from ios_devices (a unique "
+               "UDID prefix or suffix of 4+ characters also works). Omit it when "
+               "only one phone is attached.")
+
+
+def _tool(*, per_device: bool = True, lock: bool = True, optional: bool = False,
+          prefer: str | None = None, read_only: bool = False):
+    """Register a tool with FastMCP; for device tools, add a `device` argument.
+
+    Returns a plain sync function under the tool's own name, so tests,
+    ios_run_sequence's step table and in-process callers keep calling tools
+    directly. FastMCP instead gets an async wrapper that runs the call on a
+    worker thread: FastMCP runs a sync tool on its event loop, which would make
+    every call wait for every other — a 10s ios_wait_for on one phone would
+    stall the other phone.
+
+    A device call resolves its phone (see _resolve), makes it the current
+    target for helpers (`_current`), and holds that phone's call_lock, so one
+    phone's calls stay in order while other phones run alongside. A call made
+    inside another (an ios_run_sequence step) keeps the outer call's phone.
+
+    `optional`: run with no target when none can be picked (ios_start_run).
+    `prefer`: kind to pick when `device` is omitted (sim_* → "simulator").
+    `lock=False`: don't queue behind this phone's other calls.
+    `read_only`: the tool never changes the device. Advertised to the client
+    as readOnlyHint, which is what lets Claude Code send two of these at once;
+    it runs other tool calls from one message one after another.
+    """
+    def deco(fn):
+        sig = inspect.signature(fn, eval_str=True)
+        if per_device:
+            sig = sig.replace(parameters=[
+                *sig.parameters.values(),
+                inspect.Parameter("device", inspect.Parameter.KEYWORD_ONLY, default="",
+                                  annotation=Annotated[str, Field(description=_DEVICE_DOC)]),
+            ])
+
+            @functools.wraps(fn)
+            def entry(*args: Any, device: str = "", **kwargs: Any) -> Any:
+                active = _current.get()
+                if active is not None:
+                    if device and not _match_one(device, active):
+                        raise MCPToolError(
+                            f"Already running on {active.alias}; a nested step cannot "
+                            f"switch to device={device!r}.", kind=ErrorKind.VALIDATION)
+                    return fn(*args, **kwargs)
+                try:
+                    t = _resolve(device, prefer=prefer)
+                except MCPToolError:
+                    if optional and not device:
+                        return fn(*args, **kwargs)
+                    raise
+                token = _current.set(t)
+                try:
+                    if lock:
+                        with t.call_lock:
+                            return fn(*args, **kwargs)
+                    return fn(*args, **kwargs)
+                finally:
+                    _current.reset(token)
+            entry.__signature__ = sig  # type: ignore[attr-defined]
+        else:
+            entry = fn
+
+        async def call(**kwargs: Any) -> Any:
+            return await anyio.to_thread.run_sync(functools.partial(entry, **kwargs))
+        functools.update_wrapper(call, fn)
+        call.__signature__ = sig  # type: ignore[attr-defined]  # after update_wrapper
+        mcp.add_tool(call, name=fn.__name__,
+                     annotations=ToolAnnotations(readOnlyHint=True) if read_only else None)
+        return entry
+    return deco
+
+
 # ---- HTTP helpers (keep-alive connection, reconnect on drop) -------------------
 
-# A reused HTTPConnection to WDA on loopback, kept *per thread*. Every WDA call
-# (every tap, and every poll iteration in wait_for/scroll_to/asserts) otherwise
-# paid a fresh TCP handshake *and* a fresh hop through the in-app relay's USB
-# tunnel. Reusing the connection removes that per-call setup. It's thread-local
-# (not one shared, lock-serialised connection) so a slow request on one thread —
-# e.g. a 60s /source — can't block a concurrent call on another thread. A
-# dropped/half-closed connection is detected on the next request and replaced.
+# A reused HTTPConnection to WDA on loopback, kept *per thread* and *per phone*.
+# Every WDA call (every tap, and every poll iteration in wait_for/scroll_to/
+# asserts) otherwise paid a fresh TCP handshake *and* a fresh hop through the
+# in-app relay's USB tunnel. Reusing the connection removes that per-call setup.
+# It's thread-local (not one shared, lock-serialised connection) so a slow
+# request on one thread — e.g. a 60s /source — can't block a concurrent call on
+# another thread, and keyed by base URL so a worker thread that served phone A
+# never sends phone B's request down A's socket. A dropped/half-closed
+# connection is detected on the next request and replaced.
 _conn_local = threading.local()
 
 
-def _drop_conn() -> None:
-    c = getattr(_conn_local, "c", None)
-    if c is not None:
-        try:
-            c.close()
-        except Exception:
-            pass
-        _conn_local.c = None
+def _conns() -> dict[str, http.client.HTTPConnection]:
+    d = getattr(_conn_local, "conns", None)
+    if d is None:
+        d = _conn_local.conns = {}
+    return d
+
+
+def _drop_conn(base: str | None = None) -> None:
+    """Close this thread's cached connection to `base` (default: the current
+    target's; every cached connection when no target can be picked)."""
+    conns = _conns()
+    if base is None:
+        t = _cur_or_none()
+        keys = [t.wda] if t is not None else list(conns)
+    else:
+        keys = [base]
+    for k in keys:
+        c = conns.pop(k, None)
+        if c is not None:
+            try:
+                c.close()
+            except Exception:
+                pass
 
 
 def _http(method: str, path: str, data: bytes | None,
           timeout: float) -> tuple[int, bytes]:
-    """Send one request over this thread's cached keep-alive connection and return
-    (status, raw_body). Raises the underlying socket/http.client error on a
-    connection-level failure (the caller decides whether to retry)."""
-    parts = urlsplit(WDA)
+    """Send one request over this thread's cached keep-alive connection to the
+    current target and return (status, raw_body). Raises the underlying
+    socket/http.client error on a connection-level failure (the caller decides
+    whether to retry)."""
+    base = _cur().wda
+    parts = urlsplit(base)
     host, port = parts.hostname, parts.port or 80
-    c = getattr(_conn_local, "c", None)
+    conns = _conns()
+    c = conns.get(base)
     if c is None:
         c = http.client.HTTPConnection(host, port, timeout=timeout)
-        _conn_local.c = c
+        conns[base] = c
     try:
         c.timeout = timeout
         c.request(method, path, body=data,
@@ -309,7 +796,7 @@ def _http(method: str, path: str, data: bytes | None,
         r = c.getresponse()
         return r.status, r.read()
     except Exception:
-        _drop_conn()          # poison so the next call reconnects clean
+        _drop_conn(base)      # poison so the next call reconnects clean
         raise
 
 
@@ -340,8 +827,8 @@ def _req(method: str, path: str, body: dict | None = None,
                 f"wedged — {_wedged_hint()}.", kind=ErrorKind.WEDGED) from e
         except OSError as e:
             raise MCPToolError(
-                f"Cannot reach WDA at {WDA} ({e}). {_unreachable_hint()}",
-                kind=ErrorKind.UNREACHABLE) from e
+                f"Cannot reach WDA at {_label(_cur_or_none())} ({e}). "
+                f"{_unreachable_hint()}", kind=ErrorKind.UNREACHABLE) from e
         # HTTP errors (4xx/5xx) come back as a normal response with http.client,
         # not an exception — callers (e.g. _session_post) rely on seeing the code
         # and any JSON error body, so return them rather than raising.
@@ -392,7 +879,7 @@ def _screenshot_quality() -> int:
     PNG) and 1 on a physical device (where 1/2 make WDA JPEG-encode device-side,
     cutting encode time and payload). An explicit valid env value always wins.
     Never raises."""
-    default = 0 if _IS_SIM else 1
+    default = 0 if _is_sim() else 1
     raw = os.environ.get("IMIRROR_SCREENSHOT_QUALITY")
     if raw is None:
         return default
@@ -404,8 +891,9 @@ def _screenshot_quality() -> int:
 
 
 def _ensure_session() -> str:
-    if _session["id"]:
-        return _session["id"]  # type: ignore[return-value]
+    session = _cur().session
+    if session["id"]:
+        return session["id"]  # type: ignore[return-value]
     # shouldWaitForQuiescence:false slashes gesture latency — measured on-device, a
     # swipe's /actions drops from ~1300ms to ~10-200ms (XCUITest otherwise blocks each
     # gesture until the UI settles). Use settle_ms on scroll/swipe when a following
@@ -416,7 +904,7 @@ def _ensure_session() -> str:
     sid = (j.get("value") or {}).get("sessionId") or j.get("sessionId")
     if not sid:
         raise RuntimeError(f"WDA session create failed (HTTP {code}): {j}")
-    _session["id"] = sid
+    session["id"] = sid
     # Disable XCUITest's idle/animation wait — the big latency win (a swipe over
     # animating content drops ~13s -> ~1s, static lists ~1.3s -> near-instant).
     # Best-effort; the capability above is ignored by this WDA build, but this
@@ -442,7 +930,7 @@ def _session_post(subpath: str, body: dict, _retry: bool = True) -> dict[str, An
     sid = _ensure_session()
     code, j = _req("POST", f"/session/{sid}{subpath}", body)
     if code == 404 and _retry:               # stale session (WDA restarted)
-        _session["id"] = None
+        _cur().session["id"] = None
         return _session_post(subpath, body, _retry=False)
     if code >= 400:
         raise MCPToolError(f"WDA error (HTTP {code}) on {subpath}: {j}",
@@ -455,7 +943,7 @@ def _session_get(subpath: str, _retry: bool = True) -> dict[str, Any]:
     sid = _ensure_session()
     code, j = _req("GET", f"/session/{sid}{subpath}")
     if code == 404 and _retry:               # stale session (WDA restarted)
-        _session["id"] = None
+        _cur().session["id"] = None
         return _session_get(subpath, _retry=False)
     if code >= 400:
         raise MCPToolError(f"WDA error (HTTP {code}) on {subpath}: {j}",
@@ -468,10 +956,9 @@ def _pointer(steps: list[dict]) -> dict:
                          "parameters": {"pointerType": "touch"}, "actions": steps}]}
 
 
-# Serialise gesture (/actions) posts across threads. WDA has a single XCUITest
-# queue; two overlapping gestures stall it and can wedge the wire. With several
-# agents (or test threads) sharing one MCP server, the lock prevents that.
-_gesture_lock = threading.Lock()
+# Gesture (/actions) posts are serialised per phone by _Target.gesture_lock:
+# WDA has a single XCUITest queue per phone, and two overlapping gestures stall
+# it and can wedge the wire. Different phones' gestures don't wait on each other.
 
 # Serialise the simulator recorder handoff (start/stop) across threads. Two
 # racing ios_start_run calls could otherwise interleave their _run["recorder"]
@@ -482,27 +969,26 @@ _recorder_lock = threading.RLock()
 
 
 def _gesture(steps: list[dict]) -> None:
-    if not _gesture_lock.acquire(timeout=5):
+    lock = _cur().gesture_lock
+    if not lock.acquire(timeout=5):
         raise RuntimeError("WDA gesture lock timeout — another gesture is stuck")
     try:
         _session_post("/actions", _pointer(steps))
     finally:
-        _gesture_lock.release()
-
-
-# Logical screen size, cached briefly so scroll helpers don't re-query every call.
-_window_cache: dict[str, Any] = {"size": None, "t": 0.0}
+        lock.release()
 
 
 def _win_size() -> tuple[float, float]:
+    """This phone's logical screen size, cached for 30s (see _Target.window)."""
+    window = _cur().window
     now = time.monotonic()
-    cached = _window_cache["size"]
-    if cached and now - _window_cache["t"] < 30:
+    cached = window["size"]
+    if cached and now - window["t"] < 30:
         return cached
     j = _session_get("/window/size")
     v = j.get("value", j)
     size = (float(v["width"]), float(v["height"]))
-    _window_cache.update(size=size, t=now)
+    window.update(size=size, t=now)
     return size
 
 
@@ -569,7 +1055,7 @@ def _find_element(text: str, visible_only: bool = False, _retry: bool = True) ->
                    {"using": "predicate string", "value": predicate},
                    timeout=_TIMEOUT_PROBE)
     if code == 404 and _retry:
-        _session["id"] = None
+        _cur().session["id"] = None
         return _find_element(text, visible_only=visible_only, _retry=False)
     return (j.get("value") or {}).get("ELEMENT") or \
            (j.get("value") or {}).get("element-6066-11e4-a52e-4f735466cecf")
@@ -793,7 +1279,7 @@ def _render_source_text(root: dict[str, Any]) -> str:
 
 # ---- Read-only tools -----------------------------------------------------------
 
-@mcp.tool()
+@_tool(read_only=True)
 def ios_status() -> str:
     """Check whether WebDriverAgent is up and ready to accept commands.
 
@@ -804,16 +1290,75 @@ def ios_status() -> str:
     """
     _, j = _req("GET", "/status")
     v = j.get("value", {})
-    return json.dumps({
+    out = {
         "ready": v.get("ready"),
         "message": v.get("message"),
         "ios": v.get("os", {}).get("version"),
         "device": v.get("device"),
         "server_version": __version__,
-    })
+    }
+    t = _cur()
+    if t is not _LEGACY:                 # list mode: say which phone answered
+        out.update(alias=t.alias, udid=t.udid, kind=t.kind)
+    return json.dumps(out)
 
 
-@mcp.tool()
+_PROBE_S = 2.0
+
+
+def _probe_status(t: _Target) -> dict[str, Any]:
+    """One fresh, short /status read of `t`. Uses its own connection and no
+    locks, so a phone busy with a long call still answers here."""
+    parts = urlsplit(t.wda)
+    c = http.client.HTTPConnection(parts.hostname, parts.port or 80, timeout=_PROBE_S)
+    try:
+        c.request("GET", "/status")
+        r = c.getresponse()
+        body = r.read()
+        v = (json.loads(body) if body else {}).get("value") or {}
+        return {"wda_ready": bool(v.get("ready")),
+                "ios": (v.get("os") or {}).get("version")}
+    except Exception as e:  # unreachable, timed out, or not JSON
+        return {"wda_ready": False, "error": f"{type(e).__name__}: {e}"[:160]}
+    finally:
+        c.close()
+
+
+@_tool(per_device=False, read_only=True)
+def ios_devices() -> str:
+    """List the devices this server can drive, and whether each one answers.
+
+    Returns JSON {"mode", "default", "devices": [{"alias", "udid", "kind",
+    "product_type", "ios", "wda", "app_state", "wda_ready", "is_default"}]}.
+    Pass a device's `alias` (or its UDID) as `device` to any other tool.
+    `mode` is "list" when the iMirror app is publishing its phones, "pinned"
+    when IMIRROR_WDA fixes one target, and "fallback" when neither (then only
+    127.0.0.1:8100 is known). `default` is the device a call without `device`
+    goes to, or null when several are attached and you must choose.
+    """
+    mode, targets = _targets()
+    try:
+        default = _resolve("").alias
+    except MCPToolError:
+        default = None
+    with concurrent.futures.ThreadPoolExecutor(max_workers=max(1, len(targets))) as ex:
+        probes = list(ex.map(_probe_status, targets))
+    devices = []
+    for t, p in zip(targets, probes):
+        devices.append({
+            "alias": t.alias, "udid": t.udid, "kind": t.kind,
+            "product_type": t.product_type, "ios": t.ios_version or p.get("ios"),
+            "wda": t.wda, "app_state": t.state, "wda_ready": p["wda_ready"],
+            "is_default": t.alias == default,
+            **({"error": p["error"]} if "error" in p else {}),
+        })
+    out: dict[str, Any] = {"mode": mode, "default": default, "devices": devices}
+    if mode == "fallback":
+        out["note"] = f"not using an iMirror device file: {_REGISTRY.problem}"
+    return json.dumps(out)
+
+
+@_tool(read_only=True)
 def ios_window_size() -> str:
     """Get the device's logical screen size in points for the CURRENT orientation.
 
@@ -873,13 +1418,13 @@ def _screenshot_bytes_wda() -> bytes:
 
 
 def _screenshot_bytes_simctl() -> bytes:
-    """Capture a screenshot via `simctl io booted screenshot`. Simulator-only,
+    """Capture a screenshot via `simctl io <sim> screenshot`. Simulator-only,
     session-free, and faster than the WDA round-trip. Raises RuntimeError (via
     `_simctl`) or OSError on failure; callers should fall back to WDA."""
     fd, path = tempfile.mkstemp(suffix=".png")
     os.close(fd)
     try:
-        _simctl("io", "booted", "screenshot", path)
+        _simctl("io", _sim_udid(), "screenshot", path)
         with open(path, "rb") as f:
             return f.read()
     finally:
@@ -889,7 +1434,7 @@ def _screenshot_bytes_simctl() -> bytes:
             pass
 
 
-@mcp.tool()
+@_tool(read_only=True)
 def ios_screenshot() -> Image:
     """Capture the iPhone's current screen. Returns a PNG by default. On a
     physical device, IMIRROR_SCREENSHOT_QUALITY=1/2 makes WDA return smaller,
@@ -903,7 +1448,7 @@ def ios_screenshot() -> Image:
     permission (the frame comes from WebDriverAgent, not a Mac screen capture).
     Use it to see the device state before/after an action.
     """
-    if _IS_SIM:
+    if _is_sim():
         try:
             data = _screenshot_bytes_simctl()
         except (RuntimeError, OSError):
@@ -917,25 +1462,30 @@ def ios_screenshot() -> Image:
     else:
         data = _screenshot_bytes_wda()
     fmt, ext = _img_kind(data)
-    if _run["active"]:
-        # Cap saved screenshots per run so a looping agent can't fill the disk
-        # (~0.5 MB each). Past the cap the screenshot still returns to the caller;
-        # it just isn't persisted into the run.
-        cap = int(os.environ.get("IMIRROR_MAX_RUN_SHOTS", "500"))
-        saved = sum(1 for s in _run["steps"] if s["screenshot"])
-        if saved < cap:
-            fname = f"{len(_run['steps']) + 1:03d}{ext}"
-            with open(os.path.join(_run["dir"], fname), "wb") as f:
-                f.write(data)
-            _record("screenshot", screenshot=fname)
-        elif not _run.get("cap_noted"):
-            _run["cap_noted"] = True
-            _record("note", f"screenshot cap reached ({cap}); further shots not saved",
-                    note="info")
+    # Number, name, write and record under one lock: two phones' screenshots
+    # can land at the same moment, and must not share an NNN file name.
+    with _run_lock:
+        if _run["active"]:
+            # Cap saved screenshots per run so a looping agent can't fill the disk
+            # (~0.5 MB each). Past the cap the screenshot still returns to the caller;
+            # it just isn't persisted into the run.
+            cap = int(os.environ.get("IMIRROR_MAX_RUN_SHOTS", "500"))
+            saved = sum(1 for s in _run["steps"] if s["screenshot"])
+            if saved < cap:
+                alias = _step_device()
+                suffix = f"-{alias}" if alias else ""
+                fname = f"{len(_run['steps']) + 1:03d}{suffix}{ext}"
+                with open(os.path.join(_run["dir"], fname), "wb") as f:
+                    f.write(data)
+                _record("screenshot", screenshot=fname)
+            elif not _run.get("cap_noted"):
+                _run["cap_noted"] = True
+                _record("note", f"screenshot cap reached ({cap}); further shots not saved",
+                        note="info")
     return Image(data=data, format=fmt)
 
 
-@mcp.tool()
+@_tool(read_only=True)
 def ios_source(format: str = "text") -> str:
     """Get the accessibility hierarchy of the current screen.
 
@@ -1016,7 +1566,7 @@ def _idle_fingerprint(root: dict[str, Any]) -> tuple:
     return tuple(fp)
 
 
-@mcp.tool()
+@_tool(read_only=True)
 def ios_await_idle(timeout_s: float = 5.0, min_stable_ms: int = 600) -> str:
     """Block until the screen's accessibility structure stops changing.
 
@@ -1110,7 +1660,7 @@ def ios_await_idle(timeout_s: float = 5.0, min_stable_ms: int = 600) -> str:
 
 # ---- Control tools -------------------------------------------------------------
 
-@mcp.tool()
+@_tool()
 @_recorded
 def ios_tap(x: float, y: float, settle_ms: int = 0) -> str:
     """Tap the screen at a point, in logical points (see ios_window_size).
@@ -1134,7 +1684,7 @@ def ios_tap(x: float, y: float, settle_ms: int = 0) -> str:
     return f"tapped ({x}, {y})"
 
 
-@mcp.tool()
+@_tool()
 @_recorded
 def ios_swipe(from_x: float, from_y: float, to_x: float, to_y: float,
               duration_ms: int = 250, settle_ms: int = 0) -> str:
@@ -1159,7 +1709,7 @@ def ios_swipe(from_x: float, from_y: float, to_x: float, to_y: float,
     return f"swiped ({from_x},{from_y}) -> ({to_x},{to_y})"
 
 
-@mcp.tool()
+@_tool()
 @_recorded
 def ios_scroll(direction: str, distance_pct: float = 40, x_pct: float = 50,
                y_pct: float = 50, duration_ms: int = 300, settle_ms: int = 300) -> str:
@@ -1183,7 +1733,7 @@ def ios_scroll(direction: str, distance_pct: float = 40, x_pct: float = 50,
                        "distance_pts": round(dist, 1)})
 
 
-@mcp.tool()
+@_tool()
 @_recorded
 def ios_scroll_to(text: str, direction: str = "down", max_swipes: int = 10,
                   distance_pct: float = 35, settle_ms: int = 350) -> str:
@@ -1222,7 +1772,7 @@ def ios_scroll_to(text: str, direction: str = "down", max_swipes: int = 10,
                         kind=ErrorKind.NOT_FOUND)
 
 
-@mcp.tool()
+@_tool()
 @_recorded
 def ios_type(text: str) -> str:
     """Type text into the currently focused field. Tap a text field first.
@@ -1234,7 +1784,7 @@ def ios_type(text: str) -> str:
     return f"typed {len(text)} char(s)"
 
 
-@mcp.tool()
+@_tool()
 @_recorded
 def ios_press_button(name: str = "home") -> str:
     """Press a hardware button. name ∈ {home, volumeUp, volumeDown}.
@@ -1245,7 +1795,7 @@ def ios_press_button(name: str = "home") -> str:
     allowed = {"home", "volumeUp", "volumeDown"}
     if name not in allowed:
         raise RuntimeError(f"name must be one of {sorted(allowed)}")
-    if name in ("volumeUp", "volumeDown") and _IS_SIM:
+    if name in ("volumeUp", "volumeDown") and _is_sim():
         # Volume is a physical button; WDA returns an opaque HTTP 500 on a
         # simulator. Fail early with something the caller can act on.
         raise RuntimeError(
@@ -1262,7 +1812,7 @@ def ios_press_button(name: str = "home") -> str:
     return f"pressed {name}"
 
 
-@mcp.tool()
+@_tool()
 @_recorded
 def ios_find_and_tap(text: str, retries: int = 0, retry_delay_s: float = 0.5) -> str:
     """Find an on-screen element by its visible label/name and tap it.
@@ -1296,7 +1846,7 @@ def ios_find_and_tap(text: str, retries: int = 0, retry_delay_s: float = 0.5) ->
         time.sleep(retry_delay_s)
 
 
-@mcp.tool()
+@_tool(read_only=True)
 @_recorded
 def ios_wait_for(text: str, timeout_s: float = 10.0) -> str:
     """Wait until an element with the given visible label/name/value appears.
@@ -1347,7 +1897,7 @@ def _wait_for_timeout_snapshot() -> str:
         return f"(could not read current screen: {e})"
 
 
-@mcp.tool()
+@_tool()
 def ios_orientation(set_to: str = "") -> str:
     """Get the device orientation, or set it.
 
@@ -1364,13 +1914,13 @@ def ios_orientation(set_to: str = "") -> str:
         _session_post("/orientation", {"orientation": val})
         # Width/height swap on rotation — drop the cached window size so the next
         # ios_scroll computes its geometry from the new dimensions, not stale ones.
-        _window_cache.update(size=None, t=0.0)
+        _cur().window.update(size=None, t=0.0)
         _record("orientation", f"set {val}")
     j = _session_get("/orientation")
     return json.dumps({"orientation": j.get("value")})
 
 
-@mcp.tool()
+@_tool()
 def ios_launch_app(bundle_id: str) -> str:
     """Launch (or foreground) an app by bundle id, e.g. com.apple.Preferences."""
     _session_post("/wda/apps/launch", {"bundleId": bundle_id})
@@ -1378,7 +1928,7 @@ def ios_launch_app(bundle_id: str) -> str:
     return f"launched {bundle_id}"
 
 
-@mcp.tool()
+@_tool()
 def ios_terminate_app(bundle_id: str) -> str:
     """Terminate a running app by bundle id."""
     _session_post("/wda/apps/terminate", {"bundleId": bundle_id})
@@ -1386,7 +1936,7 @@ def ios_terminate_app(bundle_id: str) -> str:
     return f"terminated {bundle_id}"
 
 
-@mcp.tool()
+@_tool()
 def ios_activate_app(bundle_id: str) -> str:
     """Bring an already-running app to the foreground by bundle id."""
     _session_post("/wda/apps/activate", {"bundleId": bundle_id})
@@ -1394,7 +1944,7 @@ def ios_activate_app(bundle_id: str) -> str:
     return f"activated {bundle_id}"
 
 
-@mcp.tool()
+@_tool(read_only=True)
 def ios_app_state(bundle_id: str) -> str:
     """Report an app's running state as JSON: not-installed / not-running /
     background / foreground (WDA numeric code included)."""
@@ -1407,7 +1957,7 @@ def ios_app_state(bundle_id: str) -> str:
     return json.dumps({"bundleId": bundle_id, "state": state, "code": code})
 
 
-@mcp.tool()
+@_tool()
 def ios_open_url(url: str) -> str:
     """Open a URL or deep link (https://… or myapp://…) on the device."""
     _session_post("/url", {"url": url})
@@ -1416,15 +1966,14 @@ def ios_open_url(url: str) -> str:
 
 
 def _simctl_pbcopy(text: str) -> None:
-    """Set the simulator's clipboard via `simctl pbcopy booted`. Simulator-only,
+    """Set the simulator's clipboard via `simctl pbcopy <sim>`. Simulator-only,
     session-free, and free of WDA's foreground caveat. Raises RuntimeError when
     the current target isn't a simulator, when `xcrun` is missing, or when
     simctl exits non-zero (surfacing its stderr); callers should fall back
     to WDA."""
-    if not _IS_SIM:
-        raise RuntimeError("simctl tools require IMIRROR_TARGET=simulator.")
+    _require_sim()
     try:
-        r = subprocess.run(["xcrun", "simctl", "pbcopy", "booted"],
+        r = subprocess.run(["xcrun", "simctl", "pbcopy", _sim_udid()],
                            input=text.encode(), capture_output=True, text=False)
     except FileNotFoundError as e:
         raise RuntimeError("`xcrun` not found — install the Xcode command-line tools.") from e
@@ -1433,7 +1982,7 @@ def _simctl_pbcopy(text: str) -> None:
         raise RuntimeError(f"simctl pbcopy failed: {stderr or r.returncode}")
 
 
-@mcp.tool()
+@_tool()
 def ios_clipboard_set(text: str) -> str:
     """Set the device clipboard to `text`.
 
@@ -1443,7 +1992,7 @@ def ios_clipboard_set(text: str) -> str:
     WebDriverAgent is foreground; with another app in front this may be
     ignored — call after a WDA-owned screen or expect a no-op.
     """
-    if _IS_SIM:
+    if _is_sim():
         try:
             _simctl_pbcopy(text)
             _record("clipboard_set", repr(text))
@@ -1459,7 +2008,7 @@ def ios_clipboard_set(text: str) -> str:
     return f"set clipboard ({len(text)} chars)"
 
 
-@mcp.tool()
+@_tool(read_only=True)
 def ios_clipboard_get() -> str:
     """Read the device clipboard (plaintext).
 
@@ -1468,13 +2017,13 @@ def ios_clipboard_get() -> str:
     fails. On a physical device, the same foreground caveat as
     ios_clipboard_set applies.
     """
-    if _IS_SIM:
+    if _is_sim():
         try:
             # strip=False: pbpaste's stdout IS the clipboard content verbatim —
             # trailing newlines, indentation, and other meaningful whitespace
             # must round-trip unchanged (unlike UDID/device-list callers, where
             # _simctl's default strip=True is correct).
-            text = _simctl("pbpaste", "booted", strip=False)
+            text = _simctl("pbpaste", _sim_udid(), strip=False)
             _record("clipboard_get", f"{len(text)} chars")
             return text
         except (RuntimeError, OSError):
@@ -1496,29 +2045,34 @@ _BUNDLED_IOS = "/Applications/iMirror.app/Contents/Resources/ios"
 
 
 def _ios_bin() -> str:
-    """Path to the go-ios `ios` binary: IMIRROR_IOS_BIN if set, else the copy
-    bundled in an installed iMirror.app, else `ios` on PATH."""
+    """Path to the go-ios `ios` binary: IMIRROR_IOS_BIN if set, else the one
+    the running iMirror app uses (from its device file, list mode only), else
+    the copy bundled in an installed iMirror.app, else `ios` on PATH."""
     env = os.environ.get("IMIRROR_IOS_BIN")
     if env:
         return env
+    if not _PINNED:
+        valid, _ = _REGISTRY.snapshot()
+        if valid and _REGISTRY.goios and os.path.exists(_REGISTRY.goios):
+            return _REGISTRY.goios
     if os.path.exists(_BUNDLED_IOS):
         return _BUNDLED_IOS
     return "ios"
 
 
-@mcp.tool()
+@_tool()
 def ios_install_app(path: str) -> str:
     """Install an app on the current target (see IMIRROR_TARGET).
 
     Device (default): installs an .ipa/.app via the bundled go-ios; needs a
     signature already valid for the device.
-    Simulator: installs a simulator-SDK .app via `xcrun simctl install booted`.
+    Simulator: installs a simulator-SDK .app via `xcrun simctl install`.
     A device .ipa will NOT run on a simulator — build the app for the simulator
     SDK. Shell-out (not WDA); degrades with a clear error if the tool is absent.
     """
     if not os.path.exists(path):
         raise RuntimeError(f"No such file: {path}")
-    if _IS_SIM:
+    if _is_sim():
         _install_on_simulator(path)
     else:
         _install_on_device(path)
@@ -1527,10 +2081,15 @@ def ios_install_app(path: str) -> str:
 
 
 def _install_on_device(path: str) -> None:
-    """Install `path` on the connected device via go-ios (resolved by _ios_bin)."""
+    """Install `path` on the current device via go-ios (resolved by _ios_bin).
+    Passes --udid whenever the phone is known: without it go-ios installs on
+    whichever phone it lists first, which with two attached is a coin toss."""
+    args = [_ios_bin(), "install", f"--path={path}"]
+    t = _cur_or_none()
+    if t is not None and t.udid:
+        args.append(f"--udid={t.udid}")
     try:
-        subprocess.run([_ios_bin(), "install", f"--path={path}"],
-                       check=True, capture_output=True, text=True)
+        subprocess.run(args, check=True, capture_output=True, text=True)
     except FileNotFoundError as e:
         raise RuntimeError("go-ios 'ios' binary not found (set IMIRROR_IOS_BIN).") from e
     except subprocess.CalledProcessError as e:
@@ -1538,9 +2097,9 @@ def _install_on_device(path: str) -> None:
 
 
 def _install_on_simulator(path: str) -> None:
-    """Install `path` on the booted simulator via `xcrun simctl install booted`."""
+    """Install `path` on the simulator via `xcrun simctl install <sim>`."""
     try:
-        subprocess.run(["xcrun", "simctl", "install", "booted", path],
+        subprocess.run(["xcrun", "simctl", "install", _sim_udid(), path],
                        check=True, capture_output=True, text=True)
     except FileNotFoundError as e:
         raise RuntimeError("`xcrun` not found — install the Xcode command-line tools.") from e
@@ -1557,7 +2116,20 @@ def _install_on_simulator(path: str) -> None:
 # These control the booted simulator directly, doing things WDA/XCUITest can't:
 # deliver push payloads, flip privacy permissions without tapping the system
 # dialog, and freeze the status bar for clean screenshots. simctl only ever talks
-# to simulators, so they require IMIRROR_TARGET=simulator and target `booted`.
+# to simulators, so they need a simulator target: its UDID from the device file,
+# or `booted` under the pinned IMIRROR_TARGET=simulator profile.
+
+def _require_sim() -> None:
+    """Raise unless the current target is a simulator (simctl can't reach a phone)."""
+    t = _cur_or_none()
+    if t is not None and t is not _LEGACY and not t.is_sim:
+        raise RuntimeError(
+            f"simctl tools need a simulator target, and {t.alias} is a physical "
+            "device. Pass device=<the simulator's alias>, or run the pinned "
+            "IMIRROR_TARGET=simulator profile.")
+    if not _is_sim():
+        raise RuntimeError("simctl tools require IMIRROR_TARGET=simulator.")
+
 
 def _simctl(*args: str, strip: bool = True) -> str:
     """Run `xcrun simctl <args>` and return stdout. Simulator-only.
@@ -1570,8 +2142,7 @@ def _simctl(*args: str, strip: bool = True) -> str:
     Pass `strip=False` for output where whitespace is meaningful, e.g.
     clipboard content read via `pbpaste`.
     """
-    if not _IS_SIM:
-        raise RuntimeError("simctl tools require IMIRROR_TARGET=simulator.")
+    _require_sim()
     try:
         r = subprocess.run(["xcrun", "simctl", *args],
                            check=True, capture_output=True, text=True)
@@ -1585,7 +2156,7 @@ def _simctl(*args: str, strip: bool = True) -> str:
 
 
 def _start_sim_recording(run_dir: str) -> None:
-    """Best-effort: start `xcrun simctl io booted recordVideo` for this run.
+    """Best-effort: start `xcrun simctl io <sim> recordVideo` for this run.
 
     Records into recording.mp4 inside `run_dir` until _stop_sim_recording sends
     SIGINT. Simulator-only, and never allowed to fail the run: xcrun missing,
@@ -1597,7 +2168,7 @@ def _start_sim_recording(run_dir: str) -> None:
     with _recorder_lock:
         try:
             proc = subprocess.Popen(
-                ["xcrun", "simctl", "io", "booted", "recordVideo",
+                ["xcrun", "simctl", "io", _sim_udid(), "recordVideo",
                  "--codec=h264", "--force", path],
                 stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
                 # DEVNULL, not PIPE: nothing ever reads this pipe, and a long
@@ -1657,7 +2228,7 @@ def _stop_sim_recording() -> tuple[str | None, str]:
 atexit.register(_stop_sim_recording)
 
 
-@mcp.tool()
+@_tool(prefer="simulator")
 def sim_push(bundle_id: str, payload_json: str) -> str:
     """(Simulator only) Deliver a push notification to `bundle_id`.
 
@@ -1674,7 +2245,7 @@ def sim_push(bundle_id: str, payload_json: str) -> str:
         f.write(payload_json)
         tmp = f.name
     try:
-        _simctl("push", "booted", bundle_id, tmp)
+        _simctl("push", _sim_udid(), bundle_id, tmp)
     finally:
         try:
             os.unlink(tmp)
@@ -1684,7 +2255,7 @@ def sim_push(bundle_id: str, payload_json: str) -> str:
     return f"pushed to {bundle_id}"
 
 
-@mcp.tool()
+@_tool(prefer="simulator")
 def sim_privacy(action: str, service: str, bundle_id: str = "") -> str:
     """(Simulator only) Grant, revoke, or reset a privacy permission without
     tapping the system consent dialog.
@@ -1696,7 +2267,7 @@ def sim_privacy(action: str, service: str, bundle_id: str = "") -> str:
     """
     if action not in ("grant", "revoke", "reset"):
         raise RuntimeError("action must be one of ['grant', 'revoke', 'reset'].")
-    args = ["privacy", "booted", action, service]
+    args = ["privacy", _sim_udid(), action, service]
     if bundle_id:
         args.append(bundle_id)
     _simctl(*args)
@@ -1704,7 +2275,7 @@ def sim_privacy(action: str, service: str, bundle_id: str = "") -> str:
     return f"{action} {service}" + (f" for {bundle_id}" if bundle_id else "")
 
 
-@mcp.tool()
+@_tool(prefer="simulator")
 def sim_status_bar(time: str = "9:41", clear: bool = False) -> str:
     """(Simulator only) Override the status bar for clean screenshots — full
     signal/wifi bars, 100% battery, and a fixed `time` (default 9:41).
@@ -1713,10 +2284,10 @@ def sim_status_bar(time: str = "9:41", clear: bool = False) -> str:
     IMIRROR_TARGET=simulator.
     """
     if clear:
-        _simctl("status_bar", "booted", "clear")
+        _simctl("status_bar", _sim_udid(), "clear")
         _record("sim_status_bar", "clear")
         return "status bar restored"
-    _simctl("status_bar", "booted", "override",
+    _simctl("status_bar", _sim_udid(), "override",
             "--time", time, "--batteryState", "charged", "--batteryLevel", "100",
             "--cellularBars", "4", "--wifiBars", "3", "--dataNetwork", "wifi")
     _record("sim_status_bar", f"override time={time}")
@@ -1725,7 +2296,7 @@ def sim_status_bar(time: str = "9:41", clear: bool = False) -> str:
 
 # ---- Test-run recording & report -----------------------------------------------
 
-@mcp.tool()
+@_tool(lock=False, optional=True)
 def ios_start_run(label: str = "test") -> str:
     """Begin recording a test run so a report can be generated at the end.
 
@@ -1737,6 +2308,10 @@ def ios_start_run(label: str = "test") -> str:
     `label` names the run (used in the directory and report title). Runs are stored
     under $IMIRROR_RUNS_DIR (default ~/.imirror/runs). Starting a run replaces any
     run already in progress.
+
+    With several phones, one run records them all: every step is tagged with the
+    phone it ran on. `device` only picks whose name/iOS heads the report (and,
+    for a simulator, which one is screen-recorded); omit it freely.
     """
     # Surface (don't silently swallow) an in-progress run being discarded — with
     # several agents sharing one server, a second start_run would otherwise wipe
@@ -1751,31 +2326,36 @@ def ios_start_run(label: str = "test") -> str:
     run_dir = os.path.join(base, f"{stamp}-{slug}")
     os.makedirs(run_dir, exist_ok=True)
     device = ios_ver = None
-    try:                                  # best-effort header info; don't fail the run
-        _, st = _req("GET", "/status")
-        v = st.get("value", {})
-        device, ios_ver = v.get("device"), v.get("os", {}).get("version")
-    except Exception:
-        pass
+    target = _current.get()               # None when no single phone could be picked
+    if target is not None:
+        try:                              # best-effort header info; don't fail the run
+            _, st = _req("GET", "/status")
+            v = st.get("value", {})
+            device, ios_ver = v.get("device"), v.get("os", {}).get("version")
+        except Exception:
+            pass
     # Hold the recorder lock across the whole stop -> reset -> start handoff so
     # a concurrent ios_start_run can't interleave and orphan a recorder handle
     # (one thread's reset overwriting another's just-set recorder with no
     # reference left to kill it). A replaced run must not leak the previous
     # run's recorder process, so stop it (discarding the clip) before
     # resetting state for the new run.
+    sim_target = target is not None and target.is_sim
     with _recorder_lock:
         _stop_sim_recording()
-        _run.update(active=True, dir=run_dir, label=label, started=time.time(),
-                    device=device, ios=ios_ver, steps=[], cap_noted=False,
-                    recorder=None, recording=None)
-        if _IS_SIM:
+        with _run_lock:
+            _run.update(active=True, dir=run_dir, label=label, started=time.time(),
+                        device=device, ios=ios_ver, steps=[], devices={},
+                        cap_noted=False, recorder=None, recording=None,
+                        sim_target=sim_target)
+        if sim_target:
             # Best-effort: a failed recorder start must never fail the run or
             # change what's returned here (see _start_sim_recording).
             _start_sim_recording(run_dir)
     return f"{warn}recording run '{label}' -> {run_dir}"
 
 
-@mcp.tool()
+@_tool(per_device=False)
 def ios_run_note(text: str, status: str = "info") -> str:
     """Add a checkpoint/annotation to the active run's timeline.
 
@@ -1793,7 +2373,7 @@ def ios_run_note(text: str, status: str = "info") -> str:
     return f"noted ({status}): {text}"
 
 
-@mcp.tool()
+@_tool(per_device=False)
 def ios_run_section(title: str) -> str:
     """Start a named section in the active run (e.g. a test area or scenario).
 
@@ -1810,7 +2390,7 @@ def ios_run_section(title: str) -> str:
     return f"section: {title}"
 
 
-@mcp.tool()
+@_tool(per_device=False)
 def ios_finish_run(video: str = "gif") -> str:
     """Finish the active run and write an HTML report.
 
@@ -1829,16 +2409,19 @@ def ios_finish_run(video: str = "gif") -> str:
     report.html (so a video-bearing report is a folder, not a single file);
     screenshots stay embedded in the HTML regardless.
     """
-    if not _run["active"]:
-        raise RuntimeError("No active run. Call ios_start_run first.")
     video = video.lower()
     if video not in {"none", "gif", "mp4"}:
         raise RuntimeError("video must be one of none / gif / mp4")
-    # Stop recording even if rendering/writing fails — otherwise later actions keep
-    # appending to a run the caller believes is finished. Steps stay in memory, so a
-    # failed write can still be retried out-of-band.
+    # Stop recording before rendering, and even if rendering/writing fails —
+    # otherwise another phone's calls could append steps mid-render, or later
+    # actions keep appending to a run the caller believes is finished. Steps stay
+    # in memory, so a failed write can still be retried out-of-band.
+    with _run_lock:
+        if not _run["active"]:
+            raise RuntimeError("No active run. Call ios_start_run first.")
+        _run["active"] = False
     try:
-        if _IS_SIM:
+        if _run.get("sim_target"):
             # Always stop the recorder (even for video="none") so it doesn't
             # keep running past the end of the run.
             rec_clip, rec_note = _stop_sim_recording()
@@ -1858,7 +2441,7 @@ def ios_finish_run(video: str = "gif") -> str:
     return path
 
 
-@mcp.tool()
+@_tool(read_only=True)
 @_recorded
 def ios_assert_visible(text: str, timeout_s: float = 5.0) -> str:
     """Assert an element with the given visible label/name/value is present.
@@ -1889,7 +2472,7 @@ def ios_assert_visible(text: str, timeout_s: float = 5.0) -> str:
         time.sleep(0.5)
 
 
-@mcp.tool()
+@_tool(read_only=True)
 @_recorded
 def ios_assert_not_visible(text: str, timeout_s: float = 3.0) -> str:
     """Assert an element with the given text is ABSENT (waits until it's gone).
@@ -2019,7 +2602,7 @@ def _validate_seq_step(i: int, step: Any) -> None:
                             kind=ErrorKind.VALIDATION)
 
 
-@mcp.tool()
+@_tool()
 @_recorded
 def ios_run_sequence(steps: list[dict]) -> str:
     """Run a batch of interaction steps in one call, stopping at the first failure.
@@ -2047,12 +2630,11 @@ def ios_run_sequence(steps: list[dict]) -> str:
     "status": "pass"|"fail", "detail" (on pass) | "error" (on fail)}, ...]}.
     `ok` is true only if every step ran and passed.
 
-    NOT atomic across concurrent agents: only individual gestures are
-    serialized (via the existing per-gesture lock), not the sequence as a
-    whole, so a multi-second wait_for/assert_* inside it can interleave with
-    another agent's action between steps. This is meant for single-agent
-    scripted flows, not for holding the device off-limits to others while it
-    runs.
+    `device` picks the phone for the WHOLE sequence; steps can't carry their
+    own. The sequence holds that phone for its full length, so other calls to
+    the same phone from this server wait until it finishes, while calls to
+    other phones carry on. It is still not atomic against a second MCP server
+    (another agent session) driving the same phone.
     """
     if not isinstance(steps, list) or not steps:
         raise MCPToolError("steps must be a non-empty list", kind=ErrorKind.VALIDATION)
@@ -2220,9 +2802,11 @@ def _render_step(s: dict, started: float) -> str:
         if parts:
             verdict_html = f'<div class="verdict">{" · ".join(parts)}</div>'
     img = _screenshot_img(s["screenshot"], f'step {s["i"]}') if s["screenshot"] else ""
+    dev = s.get("device")
+    chip = f'<span class="dev">{html.escape(dev)}</span>' if dev else ""
     return (
         f'<div class="step" id="step-{s["i"]}">'
-        f'<div class="meta"><span class="i">#{s["i"]}</span>'
+        f'<div class="meta"><span class="i">#{s["i"]}</span>{chip}'
         f'<span class="act">{html.escape(s["action"])}</span>'
         f'<span class="off">+{off:.1f}s</span>{badge}</div>'
         f'<div class="detail">{html.escape(s["detail"])}</div>{verdict_html}{img}</div>'
@@ -2316,9 +2900,12 @@ def _render_report(ended: float, clip: str | None = None, clip_note: str = "") -
                       + "".join(items) + "</ol></section>")
 
     title = html.escape(_run["label"] or "test")
+    devices = _run.get("devices") or {}
     meta = " · ".join(filter(None, [
-        f"device: {html.escape(_run['device'])}" if _run["device"] else "",
-        f"iOS {html.escape(_run['ios'])}" if _run["ios"] else "",
+        ("devices: " + ", ".join(html.escape(d) for d in devices.values()))
+        if len(devices) > 1 else "",
+        f"device: {html.escape(_run['device'])}" if _run["device"] and len(devices) <= 1 else "",
+        f"iOS {html.escape(_run['ios'])}" if _run["ios"] and len(devices) <= 1 else "",
         time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(started)),
         f"{ended - started:.1f}s",
         f"{action_steps} steps · {shots} screenshots · {fails} failures",
@@ -2456,6 +3043,8 @@ _REPORT_CSS = """
   .i { font-weight:700; color:#9ca3af; }
   .act { font-weight:600; color:inherit; text-transform:uppercase; letter-spacing:.04em;
          font-size:12px; }
+  .dev { font-size:11px; font-weight:700; padding:1px 8px; border-radius:6px;
+         background:#6366f122; color:var(--accent); }
   .off { margin-left:auto; font-variant-numeric:tabular-nums; }
   .detail { margin:6px 0; font-family:ui-monospace, SFMono-Regular, Menlo, monospace;
             font-size:13px; word-break:break-word; }
@@ -2487,7 +3076,7 @@ def _autowda_bring_up() -> None:
     instead. Runs at serve time, not import time, so importing this module
     never spawns anything and the loopback guard above still runs first.
     """
-    global WDA
+    global WDA, _PINNED
     if not os.environ.get("IMIRROR_AUTOWDA") or _IS_SIM:
         return
     bringup = wda_bringup.WDABringup(
@@ -2497,6 +3086,9 @@ def _autowda_bring_up() -> None:
     )
     try:
         WDA = bringup.ensure_up()
+        # The bring-up owns exactly one phone: drive only it, never a device file.
+        _LEGACY.wda = WDA
+        _PINNED = True
     except wda_bringup.WDABringupError as e:
         print(f"wda_bringup: failed to bring up WebDriverAgent: {e}", file=sys.stderr)
         raise SystemExit(1)

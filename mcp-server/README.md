@@ -15,6 +15,7 @@ its self-managed transport (userspace tunnel + runwda + forward + relay).
 | Tool | What it does |
 |------|--------------|
 | `ios_status` | WDA ready? + iOS version / device name |
+| `ios_devices` | every device this server can drive (alias, UDID, port, ready?) and which one is the default |
 | `ios_window_size` | logical screen size (points) for the current orientation |
 | `ios_screenshot` | full-res device screenshot (PNG, or JPEG on a device via `IMIRROR_SCREENSHOT_QUALITY`) — no macOS Screen Recording perm needed |
 | `ios_tap(x, y)` | tap at a point (points, top-left origin) |
@@ -34,6 +35,46 @@ its self-managed transport (userspace tunnel + runwda + forward + relay).
 | `sim_push(bundle_id, payload_json)` | *(simulator only)* deliver a push notification from an APNs payload |
 | `sim_privacy(action, service, bundle_id)` | *(simulator only)* grant/revoke/reset a permission without the consent dialog |
 | `sim_status_bar(time, clear)` | *(simulator only)* freeze the status bar (full bars, 100%, fixed time) for clean screenshots |
+
+Every device tool also takes an optional **`device`** argument — see
+[Several devices](#several-devices). The run-report tools and `ios_devices` don't.
+
+## Several devices
+
+The iMirror app runs WebDriverAgent on every iPhone attached by USB, each on its
+own loopback port, and lists them (plus an enabled Simulator, as `sim`) in
+`~/Library/Application Support/iMirror/devices.json`. This server reads that file
+(re-reading it when it changes), so one server drives them all:
+
+```
+ios_devices                                  -> phone1 (:8100), phone2 (:8110), sim (:8201)
+ios_find_and_tap text="Settings" device="phone2"
+ios_screenshot device="00008140"             # a UDID, or a unique UDID prefix/suffix (4+ chars)
+ios_run_sequence steps=[…] device="phone1"   # one device for the whole sequence
+```
+
+- **Omitting `device`** is fine with one phone attached (an enabled Simulator
+  doesn't count; the `sim_*` tools default to the Simulator). With several
+  phones it fails with the list of devices rather than guess — set
+  `IMIRROR_DEFAULT_DEVICE=<alias or UDID>` in the server's environment to give
+  omitted calls a default instead.
+- **Parallel across devices, in order per device.** Each call runs on its own
+  worker thread and holds only its device's lock: a 10 s `ios_wait_for` on
+  phone1 doesn't delay phone2, while two calls to phone1 still run one after
+  another (WDA has one XCUITest queue per phone). Claude Code only sends tool
+  calls from one message concurrently when the tools are marked read-only, so
+  screenshots, source reads, waits and asserts on two phones overlap; taps and
+  other changes from one agent run one after another (parallel changes need
+  separate agents).
+- **One recorded run spans every device.** Each step (and screenshot file) is
+  tagged with its device's alias, and the report shows a chip per step.
+- **Modes.** Set `IMIRROR_WDA` and the server is pinned to that one target,
+  exactly as before (the `imirror-sim` registration does this). Without it the
+  server uses the device file, and falls back to `127.0.0.1:8100` when there is
+  no live file (an older iMirror app, or the app isn't running). `ios_devices`
+  reports which mode it is in. `IMIRROR_DEVICES_FILE` overrides the file's path.
+- The file is only trusted while the app that wrote it is running, and only
+  loopback entries are used — WDA has no auth on the wire.
 
 ## Setup
 
