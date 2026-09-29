@@ -1,0 +1,43 @@
+{
+  "app_version" : "0.6.0",
+  "devices" : [
+    {
+      "alias" : "phone1",
+      "connection" : "USB",
+      "ios_version" : "26.6",
+      "kind" : "device",
+      "mjpeg_port" : 9110,
+      "product_type" : "iPhone17,5",
+      "slot" : 0,
+      "state" : "ready",
+      "udid" : "00008140-0006423002D3401C",
+      "wda_url" : "http://127.0.0.1:8100"
+    },
+    {
+      "alias" : "phone2",
+      "connection" : "USB",
+      "detail" : "waiting for WebDriverAgent",
+      "ios_version" : "26.6",
+      "kind" : "device",
+      "mjpeg_port" : 9120,
+      "product_type" : "iPhone18,3",
+      "slot" : 1,
+      "state" : "starting",
+      "udid" : "00008150-001928E01404401C",
+      "wda_url" : "http://127.0.0.1:8110"
+    },
+    {
+      "alias" : "sim",
+      "ios_version" : "26.0",
+      "kind" : "simulator",
+      "product_type" : "iPhone 17 Pro",
+      "state" : "ready",
+      "udid" : "5B3C1F2A-0000-4000-8000-00000000A1B2",
+      "wda_url" : "http://127.0.0.1:8201"
+    }
+  ],
+  "goios" : "/Applications/iMirror.app/Contents/Resources/ios",
+  "owner_pid" : 4242,
+  "schema" : 1,
+  "updated_at" : "2026-09-28T21:30:00Z"
+}

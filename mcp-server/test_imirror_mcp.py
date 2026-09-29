@@ -287,7 +287,7 @@ def test_http_reconnects_after_failure(mod, monkeypatch):
     mod._drop_conn()
     with pytest.raises(ConnectionResetError):
         mod._http("GET", "/x", None, 5)
-    assert FakeConn.instances[0].closed and getattr(mod._conn_local, "c", None) is None
+    assert FakeConn.instances[0].closed and mod.WDA not in mod._conns()
     # next call transparently opens a new connection and succeeds
     assert mod._http("GET", "/x", None, 5) == (200, b"{}")
     assert len(FakeConn.instances) == 2
