@@ -314,3 +314,16 @@ def test_a_non_json_reply_to_the_json_probe_falls_back_to_xml(m, fake, monkeypat
     monkeypatch.setattr(m, "_req_tree", not_json)
     assert 'label="OK"' in m.ios_source()
     assert m._LEGACY.json_source is False
+
+
+# ---- which server answered -----------------------------------------------------
+
+def test_status_and_devices_name_the_server_and_its_file(m, fake):
+    """A session can then spot a server running from a stale or dev tree."""
+    import os
+    want = {"server_version": m.__version__, "script_path": os.path.realpath(m.__file__)}
+    status = json.loads(m.ios_status())
+    devices = json.loads(m.ios_devices())
+    assert {k: status.get(k) for k in want} == want
+    assert {k: devices.get(k) for k in want} == want
+    assert want["script_path"].endswith("/imirror_mcp.py")

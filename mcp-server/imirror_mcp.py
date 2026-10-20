@@ -1569,7 +1569,7 @@ def ios_status() -> str:
     """Check whether WebDriverAgent is up and ready to accept commands.
 
     Returns a short JSON summary (ready flag, iOS version, device name, and this
-    MCP server's version). Call this first if other tools fail — a not-ready/
+    MCP server's version and file). Call this first if other tools fail — a not-ready/
     unreachable result means the iMirror app isn't running or its health dot isn't
     green yet.
     """
@@ -1580,12 +1580,18 @@ def ios_status() -> str:
         "message": v.get("message"),
         "ios": v.get("os", {}).get("version"),
         "device": v.get("device"),
-        "server_version": __version__,
+        **_server_identity(),
     }
     t = _cur()
     if t is not _LEGACY:                 # list mode: say which phone answered
         out.update(alias=t.alias, udid=t.udid, kind=t.kind)
     return json.dumps(out)
+
+
+def _server_identity() -> dict[str, str]:
+    """Which server answered: a session can then spot one running from a
+    stale checkout or a dev tree instead of the installed copy."""
+    return {"server_version": __version__, "script_path": os.path.realpath(__file__)}
 
 
 _PROBE_S = 2.0
@@ -1613,12 +1619,12 @@ def _probe_status(t: _Target) -> dict[str, Any]:
 def ios_devices() -> str:
     """List the devices this server can drive, and whether each one answers.
 
-    Returns JSON {"mode", "default", "devices": [{"alias", "udid", "kind",
-    "product_type", "ios", "wda", "app_state", "wda_ready", "is_default",
-    "session"}]}. `session` counts how this server got its WDA sessions
-    (created, adopted from another client, lost): losses mean another
-    client on this phone. Pass a device's `alias` (or its UDID) as `device`
-    to any other tool.
+    Returns JSON {"mode", "default", "server_version", "script_path",
+    "devices": [{"alias", "udid", "kind", "product_type", "ios", "wda",
+    "app_state", "wda_ready", "is_default", "session"}]}. `session` counts
+    how this server got its WDA sessions (created, adopted from another
+    client, lost): losses mean another client on this phone. Pass a device's
+    `alias` (or its UDID) as `device` to any other tool.
     `mode` is "list" when the iMirror app is publishing its phones, "pinned"
     when IMIRROR_WDA fixes one target, and "fallback" when neither (then only
     127.0.0.1:8100 is known). `default` is the device a call without `device`
@@ -1642,7 +1648,8 @@ def ios_devices() -> str:
             "session": {"cached": bool(t.session["id"]), **t.session_stats},
             **({"error": p["error"]} if "error" in p else {}),
         })
-    out: dict[str, Any] = {"mode": mode, "default": default, "devices": devices}
+    out: dict[str, Any] = {"mode": mode, "default": default, **_server_identity(),
+                           "devices": devices}
     if mode == "fallback":
         out["note"] = f"not using an iMirror device file: {_REGISTRY.problem}"
     return json.dumps(out)

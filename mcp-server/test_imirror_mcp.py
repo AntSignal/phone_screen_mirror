@@ -365,7 +365,8 @@ def test_status_summarizes(mod, wda):
         "os": {"version": "17.4"}, "device": "iPhone"}}))
     out = json.loads(mod.ios_status())
     assert out == {"ready": True, "message": "ok", "ios": "17.4", "device": "iPhone",
-                   "server_version": mod.__version__}
+                   "server_version": mod.__version__,
+                   "script_path": os.path.realpath(mod.__file__)}
 
 
 def test_source_xml_format_truncates_large_output(mod, wda):
