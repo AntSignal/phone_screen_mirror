@@ -283,7 +283,8 @@ def _pid_alive(pid: Any, uniqueid: int | None = None) -> bool:
     alone says yes to a zombie, and to a pid the system has given to a new
     process. The app records its kernel uniqueid, never reused within a boot,
     as owner_uniqueid; a file without one gets the pid checks only."""
-    if not isinstance(pid, int) or isinstance(pid, bool) or pid <= 0:
+    # pid_t is 32-bit; os.kill raises OverflowError past that.
+    if not isinstance(pid, int) or isinstance(pid, bool) or not 0 < pid < 2 ** 31:
         return False
     try:
         os.kill(pid, 0)

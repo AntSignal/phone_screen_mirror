@@ -349,10 +349,13 @@ def test_valid_file_means_list_mode(reg):
     assert mode == "list" and [t.alias for t in targets] == ["phone1", "phone2"]
 
 
-@pytest.mark.parametrize("bad", ["dead-owner", "bad-json", "wrong-schema", "missing"])
+@pytest.mark.parametrize("bad", ["dead-owner", "huge-owner", "bad-json", "wrong-schema",
+                                 "missing"])
 def test_untrustworthy_file_falls_back_to_8100(reg, bad):
     if bad == "dead-owner":
         reg.write(TWO_PHONES, owner_pid=dead_pid())
+    elif bad == "huge-owner":                   # os.kill raises OverflowError
+        reg.write(TWO_PHONES, owner_pid=2 ** 40)
     elif bad == "bad-json":
         reg.write(TWO_PHONES, raw="{not json")
     elif bad == "wrong-schema":
