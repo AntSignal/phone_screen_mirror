@@ -192,6 +192,8 @@ class _Target:
     # How this server got its sessions, shown by ios_devices.
     session_stats: dict[str, int] = dataclasses.field(
         default_factory=lambda: {"created": 0, "adopted": 0, "lost": 0})
+    # Whether this WDA serves /source?format=json; None until tried.
+    json_source: bool | None = None
     product_type: str | None = None
     ios_version: str | None = None
     state: str | None = None
@@ -406,6 +408,7 @@ class _Registry:
             t.wda = wda
             t.session["id"] = None
             t.session_losses.clear()
+            t.json_source = None             # may be another WDA build now
             t.window.update(size=None, t=0.0)
         t.alias, t.kind = alias, kind
 
@@ -1468,18 +1471,27 @@ def _norm_source_json(d: dict) -> dict[str, Any] | None:
 
 
 def _fetch_source_json_tree() -> dict[str, Any] | None:
-    """Probe WDA's JSON source once. Returns a normalized root node, or None if
-    this WDA build doesn't support it (non-2xx, missing/non-dict `value`, or the
-    request itself blows up) so the caller falls back to XML. Never raises."""
+    """Read WDA's JSON source. Returns a normalized root node, or None when
+    this WDA build doesn't serve it, so the caller falls back to XML.
+
+    A stalled or unreachable WDA raises: falling back to XML then only waits
+    out the same stall a second time. A 4xx or a non-JSON or non-tree reply
+    marks the build unsupported, so later reads skip straight to XML."""
+    t = _cur()
+    if t.json_source is False:
+        return None
     try:
         code, j = _req_tree("/source?format=json")
-    except Exception:
-        return None
-    if code >= 400:
+    except ValueError:                       # a 2xx body that is not JSON
+        t.json_source = False
         return None
     value = j.get("value")
-    if not isinstance(value, dict):
+    if code >= 500:
+        return None                          # maybe passing; try JSON again later
+    if code >= 400 or not isinstance(value, dict):
+        t.json_source = False
         return None
+    t.json_source = True
     return _norm_source_json(value)
 
 

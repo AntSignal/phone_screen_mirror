@@ -466,6 +466,15 @@ def test_rewrite_keeps_sessions_and_a_port_change_drops_them(reg):
     assert reg.m._resolve("phone1").wda == "http://127.0.0.1:8120"
 
 
+def test_a_port_change_forgets_what_the_old_wda_supported(reg):
+    t = reg.m._resolve("phone1")
+    t.json_source = False
+    reg.write([dict(TWO_PHONES[0], state="down"), TWO_PHONES[1]])
+    assert reg.m._resolve("phone1").json_source is False      # same WDA
+    reg.write([dict(TWO_PHONES[0], wda_url="http://127.0.0.1:8120"), TWO_PHONES[1]])
+    assert reg.m._resolve("phone1").json_source is None
+
+
 def test_pinned_mode_ignores_the_file_and_rejects_other_devices(monkeypatch, tmp_path):
     path = str(tmp_path / "devices.json")
     write_devices(path, TWO_PHONES)
