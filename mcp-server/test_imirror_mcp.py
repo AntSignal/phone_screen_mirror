@@ -65,6 +65,10 @@ class FakeWDA:
         # _ensure_session always fires this boilerplate; succeed it by default.
         if path.endswith("/appium/settings"):
             return 200, {"value": {}}
+        # _ensure_session reads /status before it creates; by default no
+        # session is active on the phone, so it creates one.
+        if path == "/status":
+            return 200, {"value": {"ready": True}, "sessionId": None}
         if any(path.endswith(s) for s in self.allowed):
             return 200, {"value": {}}
         # Anything else unscripted is a test bug or a silently renamed route —
@@ -320,6 +324,19 @@ def test_session_post_recreates_on_stale_404(mod, wda):
     mod._session_post("/actions", {"actions": []})
     # session got cleared and recreated, and the new id is cached
     assert mod._session["id"] == "s2"
+
+
+def test_session_lost_on_both_attempts_raises_session_contested(mod, wda):
+    """A session that dies again right after being replaced means another
+    client keeps creating them. Say so instead of fighting it."""
+    wda.script("/session", (200, {"value": {"sessionId": "s1"}}),
+               (200, {"value": {"sessionId": "s2"}}))
+    wda.script("/actions", (404, INVALID_SESSION), (404, INVALID_SESSION))
+    with pytest.raises(mod.MCPToolError) as e:
+        mod.ios_tap(1, 1)
+    assert e.value.error_code == "SESSION_CONTESTED"
+    assert "another client on this phone" in str(e.value)
+    assert sum(1 for _, p, _ in wda.calls if p == "/session") == 2
 
 
 def test_session_post_recreates_on_an_older_builds_bare_404(mod, wda):
@@ -773,16 +790,25 @@ def test_screenshot_device_never_calls_simctl(mod, wda, monkeypatch):
 
 def test_screenshot_first_call_applies_quality(mod, wda):
     """Fable risk #1 regression guard: quality must be applied even when a
-    screenshot is the very first tool call of a session."""
+    screenshot is the very first tool call of a session. It goes through the
+    session already on the phone: creating one would kill another client's."""
     import base64
     assert mod._session["id"] is None
-    wda.script("/session", (200, {"value": {"sessionId": "s"}}))
+    wda.script("/status", (200, {"value": {"ready": True}, "sessionId": "theirs"}))
     png = b"\x89PNG\r\n\x1a\nfake"
     wda.script("/screenshot", (200, {"value": base64.b64encode(png).decode()}))
     mod.ios_screenshot()
-    assert any(p == "/session" for m, p, _ in wda.calls)
-    bodies = [b for m, p, b in wda.calls if p.endswith("/appium/settings")]
+    assert not any(p == "/session" for m, p, _ in wda.calls)
+    bodies = [b for m, p, b in wda.calls if p == "/session/theirs/appium/settings"]
     assert any("screenshotQuality" in b["settings"] for b in bodies)
+
+
+def test_screenshot_with_no_session_on_the_phone_creates_none(mod, wda):
+    import base64
+    png = b"\x89PNG\r\n\x1a\nfake"
+    wda.script("/screenshot", (200, {"value": base64.b64encode(png).decode()}))
+    assert mod.ios_screenshot().data == png
+    assert [p for _, p, _ in wda.calls] == ["/status", "/screenshot"]
 
 
 # ---- gestures ------------------------------------------------------------------
@@ -1775,6 +1801,8 @@ def test_gesture_timeout_does_not_retry(mod, monkeypatch):
     action_calls = []
 
     def fake_http(method, path, data, timeout):
+        if path == "/status":
+            return 200, b'{"value": {"ready": true}, "sessionId": null}'
         if path.endswith("/session"):
             return 200, b'{"value": {"sessionId": "s1"}}'
         if path.endswith("/appium/settings"):

@@ -186,6 +186,11 @@ class _Target:
     # always did) while calls to different phones run side by side. Re-entrant
     # so ios_run_sequence's steps can run inside the sequence's own hold.
     call_lock: Any = dataclasses.field(default_factory=threading.RLock)
+    # When WDA last said this server's session was gone (see _lost_session).
+    session_losses: list[float] = dataclasses.field(default_factory=list)
+    # How this server got its sessions, shown by ios_devices.
+    session_stats: dict[str, int] = dataclasses.field(
+        default_factory=lambda: {"created": 0, "adopted": 0, "lost": 0})
     product_type: str | None = None
     ios_version: str | None = None
     state: str | None = None
@@ -327,6 +332,7 @@ class _Registry:
             # nothing on the new endpoint.
             t.wda = wda
             t.session["id"] = None
+            t.session_losses.clear()
             t.window.update(size=None, t=0.0)
         t.alias, t.kind = alias, kind
 
@@ -911,9 +917,68 @@ def _screenshot_quality() -> int:
 
 
 def _ensure_session() -> str:
-    session = _cur().session
-    if session["id"]:
-        return session["id"]  # type: ignore[return-value]
+    """This phone's WDA session: the cached one, else the one already active
+    on the phone (adopted), else a new one.
+
+    WDA keeps one session per phone, and POST /session kills whichever one
+    exists. A server that created a session whenever it had none broke every
+    other client on the phone, the iMirror app's own mirror included.
+    Adopting costs one GET /status, and clients sharing a session all keep
+    working."""
+    t = _cur()
+    sid = t.session["id"]
+    if sid:
+        return sid
+    active = _active_session_id()
+    if active:
+        return _adopt_session(t, active, "status")
+    return _create_session(t)
+
+
+def _active_session_id() -> str | None:
+    """The session WDA reports as active in GET /status, or None."""
+    code, j = _req("GET", "/status", timeout=_TIMEOUT_PROBE)
+    return _body_session_id(j) if code < 400 else None
+
+
+def _body_session_id(j: Any) -> str | None:
+    """The active session WDA names in a reply. Every reply carries it at
+    the top level, null when there is none (FBResponsePayload.m); a create
+    also returns it as value.sessionId."""
+    if not isinstance(j, dict):
+        return None
+    sid = j.get("sessionId")
+    if not sid and isinstance(j.get("value"), dict):
+        sid = j["value"].get("sessionId")
+    return sid if isinstance(sid, str) and sid else None
+
+
+def _may_adopt_foreign(t: _Target, why: str) -> bool:
+    """May this call join a WDA session that another client made on `t`?
+
+    `why` is "status" when this server had no session and found one active
+    (the normal case: the iMirror app's mirror keeps one), or "lost" when
+    another client replaced this server's session mid-use. The device lease
+    is meant to allow "lost" only while this caller holds the phone, so an
+    agent that does not hold it never drives inside someone else's session
+    unnoticed. Until then: always yes, because creating one kills theirs."""
+    return True
+
+
+def _adopt_session(t: _Target, sid: str, why: str) -> str:
+    """Use session `sid`, which another client created, from now on."""
+    if not _may_adopt_foreign(t, why):
+        raise MCPToolError(
+            f"Another client on this phone owns {_label(t)}'s WebDriverAgent "
+            "session, and this call may not take it over. Nothing was sent.",
+            kind=ErrorKind.WDA_HTTP, code="SESSION_STOLEN")
+    t.session["id"] = sid
+    t.session_stats["adopted"] += 1
+    _apply_session_settings(sid)          # settings are global; re-apply anyway
+    return sid
+
+
+def _create_session(t: _Target) -> str:
     # shouldWaitForQuiescence:false slashes gesture latency — measured on-device, a
     # swipe's /actions drops from ~1300ms to ~10-200ms (XCUITest otherwise blocks each
     # gesture until the UI settles). Use settle_ms on scroll/swipe when a following
@@ -924,11 +989,60 @@ def _ensure_session() -> str:
     sid = (j.get("value") or {}).get("sessionId") or j.get("sessionId")
     if not sid:
         raise RuntimeError(f"WDA session create failed (HTTP {code}): {j}")
-    session["id"] = sid
+    t.session["id"] = sid
+    t.session_stats["created"] += 1
+    _apply_session_settings(sid)
+    return sid
+
+
+# Two lost sessions this close together mean something keeps replacing ours.
+_SESSION_CONTEST_WINDOW_S = 60.0
+
+
+def _lost_session(t: _Target, j: dict[str, Any], sid: str) -> str:
+    """WDA said session `sid` is gone. Return the session to retry with.
+
+    The reply's top-level sessionId says what replaced it: null means WDA
+    restarted, so check /status and create if still none; another id means
+    another client made a session, so adopt it. A second loss within a
+    minute means something keeps doing that, and recreating would only start
+    a fight over the phone, so raise SESSION_CONTESTED instead."""
+    active = _body_session_id(j)
+    if _count_lost_session(t, sid) >= 2:
+        raise _session_contested(t, active)
+    if active and active != sid:
+        return _adopt_session(t, active, "lost")
+    return _ensure_session()
+
+
+def _count_lost_session(t: _Target, sid: str) -> int:
+    """Forget session `sid` and return how many were lost in the window."""
+    if t.session["id"] == sid:
+        t.session["id"] = None
+    now = time.monotonic()
+    t.session_losses[:] = [x for x in t.session_losses
+                           if now - x < _SESSION_CONTEST_WINDOW_S] + [now]
+    t.session_stats["lost"] += 1
+    return len(t.session_losses)
+
+
+def _session_contested(t: _Target, active: str | None) -> MCPToolError:
+    now_on = f" (WDA's session is now {active})" if active else ""
+    return MCPToolError(
+        f"WebDriverAgent on {_label(t)} dropped this server's session twice "
+        f"within {_SESSION_CONTEST_WINDOW_S:.0f}s{now_on}: another client on "
+        "this phone keeps creating sessions. That is usually another agent's "
+        "MCP server or an old iMirror server, or iMirror itself while a system "
+        "alert is up. The action was not run. Take ios_screenshot: if an alert "
+        "is showing, tap it by coordinates; otherwise check ios_devices, and "
+        "do not retry in a loop.", kind=ErrorKind.WDA_HTTP, code="SESSION_CONTESTED")
+
+
+def _apply_session_settings(sid: str) -> None:
     # Disable XCUITest's idle/animation wait — the big latency win (a swipe over
     # animating content drops ~13s -> ~1s, static lists ~1.3s -> near-instant).
-    # Best-effort; the capability above is ignored by this WDA build, but this
-    # per-session settings route is honored.
+    # Best-effort; this WDA build ignores the shouldWaitForQuiescence capability,
+    # but honours this per-session settings route.
     try:
         _req("POST", f"/session/{sid}/appium/settings",
              {"settings": {"waitForIdleTimeout": 0, "animationCoolOffTimeout": 0}}, timeout=_TIMEOUT_PROBE)
@@ -942,7 +1056,6 @@ def _ensure_session() -> str:
              {"settings": {"screenshotQuality": _screenshot_quality()}}, timeout=_TIMEOUT_PROBE)
     except Exception:
         pass
-    return sid
 
 
 def _wda_error(j: Any) -> str | None:
@@ -989,12 +1102,19 @@ def _session_call(method: str, subpath: str, body: dict | None,
     if code != 404:
         return code, j
     err = _wda_error(j)
-    if err is not None and err != "invalid session id":
+    if err == "invalid session id":
+        sid = _lost_session(t, j, sid)
+    elif err is None:
+        # Older WDA builds send a bare 404: recreate once.
+        t.session["id"] = None
+        sid = _ensure_session()
+    else:
         return code, j                      # a miss, a stale element, an unknown route
-    # Session gone, or an old WDA sent a bare 404: recreate once.
-    t.session["id"] = None
-    sid = _ensure_session()
-    return _req(method, f"/session/{sid}{subpath}", body, timeout=timeout)
+    code, j = _req(method, f"/session/{sid}{subpath}", body, timeout=timeout)
+    if code == 404 and _wda_error(j) == "invalid session id":
+        _count_lost_session(t, sid)         # lost again within this one call
+        raise _session_contested(t, _body_session_id(j))
+    return code, j
 
 
 def _session_post(subpath: str, body: dict) -> dict[str, Any]:
@@ -1047,11 +1167,19 @@ def _win_size() -> tuple[float, float]:
     cached = window["size"]
     if cached and now - window["t"] < 30:
         return cached
-    j = _session_get("/window/size")
-    v = j.get("value", j)
+    v = _window_size()
     size = (float(v["width"]), float(v["height"]))
     window.update(size=size, t=now)
     return size
+
+
+def _window_size() -> dict[str, Any]:
+    """GET /window/size on WDA's sessionless route (FBElementCommands.m), so
+    reading the size never creates a session or takes someone else's."""
+    code, j = _req("GET", "/window/size")
+    if code >= 400:
+        raise _wda_http_error(code, j, "/window/size")
+    return j.get("value", j)
 
 
 def _scroll_geom(direction: str, distance_pct: float,
@@ -1394,8 +1522,11 @@ def ios_devices() -> str:
     """List the devices this server can drive, and whether each one answers.
 
     Returns JSON {"mode", "default", "devices": [{"alias", "udid", "kind",
-    "product_type", "ios", "wda", "app_state", "wda_ready", "is_default"}]}.
-    Pass a device's `alias` (or its UDID) as `device` to any other tool.
+    "product_type", "ios", "wda", "app_state", "wda_ready", "is_default",
+    "session"}]}. `session` counts how this server got its WDA sessions
+    (created, adopted from another client, lost): losses mean another
+    client on this phone. Pass a device's `alias` (or its UDID) as `device`
+    to any other tool.
     `mode` is "list" when the iMirror app is publishing its phones, "pinned"
     when IMIRROR_WDA fixes one target, and "fallback" when neither (then only
     127.0.0.1:8100 is known). `default` is the device a call without `device`
@@ -1415,6 +1546,8 @@ def ios_devices() -> str:
             "product_type": t.product_type, "ios": t.ios_version or p.get("ios"),
             "wda": t.wda, "app_state": t.state, "wda_ready": p["wda_ready"],
             "is_default": t.alias == default,
+            # Many adoptions or losses mean another client shares the phone.
+            "session": {"cached": bool(t.session["id"]), **t.session_stats},
             **({"error": p["error"]} if "error" in p else {}),
         })
     out: dict[str, Any] = {"mode": mode, "default": default, "devices": devices}
@@ -1431,8 +1564,7 @@ def ios_window_size() -> str:
     The width/height swap when the device is in landscape, so call this before
     computing coordinates if the orientation may have changed.
     """
-    j = _session_get("/window/size")
-    return json.dumps(j.get("value", j))
+    return json.dumps(_window_size())
 
 
 def _img_kind(data: bytes) -> tuple[str, str]:
@@ -1469,12 +1601,14 @@ def _img_kind(data: bytes) -> tuple[str, str]:
 def _screenshot_bytes_wda() -> bytes:
     """Capture a screenshot over WDA. Used directly on a device, and as the
     simulator's fallback when the simctl fast path fails."""
-    # Ensure a session exists first so the screenshotQuality settings POST (in
-    # _ensure_session) has run even when a screenshot is the very first tool call
-    # of a session — otherwise the sessionless /screenshot route below returns a
-    # full PNG because quality settings were never applied. Cheap/cached after
-    # the first call.
-    _ensure_session()
+    # screenshotQuality is a session setting. Apply it through the phone's
+    # active session when this server has none yet, but never create one for
+    # a screenshot: that would kill whichever session another client uses.
+    t = _cur()
+    if not t.session["id"]:
+        active = _active_session_id()
+        if active and _may_adopt_foreign(t, "status"):
+            _adopt_session(t, active, "status")
     _, j = _req("GET", "/screenshot")
     b64 = j.get("value")
     if not b64:
