@@ -158,8 +158,8 @@ _IS_SIM = TARGET == "simulator"
 # ---- Targets: which phone a call drives -----------------------------------------
 #
 # A _Target is one WDA endpoint plus everything that must NOT be shared between
-# phones: the WDA session id, the cached window size, the gesture lock, and a
-# per-phone call lock. Three modes decide where targets come from:
+# phones: the WDA session id, the cached window size, and a per-phone call
+# lock. Three modes decide where targets come from:
 #
 #   pinned   — IMIRROR_WDA is set. Exactly one target (_LEGACY), exactly the
 #              pre-multi-device behaviour. Keeps the `imirror-sim` registration
@@ -180,12 +180,12 @@ class _Target:
         default_factory=lambda: {"id": None})
     window: dict[str, Any] = dataclasses.field(
         default_factory=lambda: {"size": None, "t": 0.0})
-    # Serialises /actions posts on this phone. WDA has one XCUITest queue per
-    # phone; two overlapping gestures stall it and can wedge the wire.
-    gesture_lock: Any = dataclasses.field(default_factory=threading.Lock)
     # Held for a whole tool call, so calls to ONE phone run in order (as they
     # always did) while calls to different phones run side by side. Re-entrant
-    # so ios_run_sequence's steps can run inside the sequence's own hold.
+    # so ios_run_sequence's steps can run inside the sequence's own hold. This
+    # is also what keeps two gestures from overlapping on one phone's single
+    # XCUITest queue, but only within this process: nothing orders calls from
+    # another MCP server until the device lease exists.
     call_lock: Any = dataclasses.field(default_factory=threading.RLock)
     # When WDA said this server's session was gone.
     session_losses: list[float] = dataclasses.field(default_factory=list)
@@ -1229,10 +1229,6 @@ def _pointer(steps: list[dict]) -> dict:
                          "parameters": {"pointerType": "touch"}, "actions": steps}]}
 
 
-# Gesture (/actions) posts are serialised per phone by _Target.gesture_lock:
-# WDA has a single XCUITest queue per phone, and two overlapping gestures stall
-# it and can wedge the wire. Different phones' gestures don't wait on each other.
-
 # Serialise the simulator recorder handoff (start/stop) across threads. Two
 # racing ios_start_run calls could otherwise interleave their _run["recorder"]
 # mutations and orphan a recordVideo child with no reference left to kill it.
@@ -1242,13 +1238,9 @@ _recorder_lock = threading.RLock()
 
 
 def _gesture(steps: list[dict]) -> None:
-    lock = _cur().gesture_lock
-    if not lock.acquire(timeout=5):
-        raise RuntimeError("WDA gesture lock timeout — another gesture is stuck")
-    try:
-        _session_post("/actions", _pointer(steps))
-    finally:
-        lock.release()
+    """Send one pointer gesture. The caller's call_lock keeps it from
+    overlapping another gesture on this phone from this process."""
+    _session_post("/actions", _pointer(steps))
 
 
 def _win_size() -> tuple[float, float]:
@@ -1893,8 +1885,7 @@ def ios_await_idle(timeout_s: float = 5.0, min_stable_ms: int = 600) -> str:
     A genuine transport failure (WDA unreachable/wedged) still raises out of
     this call — only "didn't settle in time" is swallowed into a verdict.
 
-    Read-only: does not take the gesture lock, so it's safe to call alongside
-    other read tools. Each poll is a full compact-tree read (the same heavy
+    Read-only, so it's safe to call alongside other read tools. Each poll is a full compact-tree read (the same heavy
     /source call ios_source makes), so a long timeout_s here means real
     device round-trips — call it deliberately, not in a tight loop.
     """
