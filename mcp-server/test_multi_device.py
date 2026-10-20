@@ -367,6 +367,30 @@ def test_untrustworthy_file_falls_back_to_8100(reg, bad):
     assert targets == [reg.m._LEGACY] and reg.m._LEGACY.wda == "http://127.0.0.1:8100"
 
 
+def test_a_pin_without_a_device_file_refuses_the_8100_fallback(reg, wda, monkeypatch):
+    """run.sh pins each agent's server to one phone. Without a live device
+    file the server only knows :8100, which may be another phone."""
+    monkeypatch.setenv("IMIRROR_DEFAULT_DEVICE", PHONE_17)
+    os.remove(reg.path)
+    with pytest.raises(reg.m.MCPToolError) as e:
+        reg.m.ios_tap(1, 1)
+    assert e.value.error_code == "DEVICE_FILE_INVALID"
+    assert "no device file" in str(e.value) and "127.0.0.1:8100" in str(e.value)
+    assert wda.calls == []
+    monkeypatch.setattr(reg.m, "_probe_status", lambda t: {"wda_ready": True})
+    out = json.loads(reg.m.ios_devices())       # still answers, with no default
+    assert out["mode"] == "fallback" and out["default"] is None
+
+
+@pytest.mark.parametrize("pin", ["default", PHONE_17])
+def test_a_pin_that_names_the_fallback_target_still_drives_it(reg, wda, monkeypatch, pin):
+    monkeypatch.setenv("IMIRROR_DEFAULT_DEVICE", pin)
+    monkeypatch.setattr(reg.m._LEGACY, "udid", PHONE_17)   # as IMIRROR_UDID sets it
+    os.remove(reg.path)
+    reg.m.ios_tap(1, 1)
+    assert wda.aliases_for("/actions") == ["default"]
+
+
 def test_owner_dying_after_the_file_was_read_is_noticed(reg, monkeypatch):
     assert reg.m._targets()[0] == "list"
     monkeypatch.setattr(reg.m, "_pid_alive", lambda pid, uniqueid=None: False)

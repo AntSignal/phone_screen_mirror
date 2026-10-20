@@ -499,11 +499,22 @@ def _resolve(query: str = "", prefer: str | None = None) -> _Target:
     prefer the simulator); else IMIRROR_DEFAULT_DEVICE; else the only physical
     phone (a Simulator switched on beside it doesn't count, so enabling one
     doesn't break calls that name no device); else fail listing the choices —
-    silently driving the wrong phone is worse than asking."""
+    silently driving the wrong phone is worse than asking. For the same
+    reason, fallback mode refuses when IMIRROR_DEFAULT_DEVICE names a phone
+    other than its single :8100 target."""
     mode, targets = _targets()
     q = (query or "").strip()
     if mode != "list":
         t = targets[0]
+        env = os.environ.get("IMIRROR_DEFAULT_DEVICE", "").strip()
+        if not q and mode == "fallback" and env and not _match_one(env, t):
+            # run.sh pins each agent to one phone. Here :8100 may be another.
+            raise MCPToolError(
+                f"IMIRROR_DEFAULT_DEVICE={env!r} pins this server to one phone, but "
+                f"it is not reading iMirror's device file ({_REGISTRY.problem}). "
+                f"Refusing to drive {t.wda}, which may be another phone. Is the "
+                "iMirror app running? ios_devices shows the mode.",
+                kind=ErrorKind.UNREACHABLE, code="DEVICE_FILE_INVALID")
         if not q or _match_one(q, t):
             return t
         why = ("pinned to one target by IMIRROR_WDA" if mode == "pinned"
