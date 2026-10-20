@@ -1839,6 +1839,7 @@ class Locker:
         self._orphaned = False
         self._hb_thread: Optional[threading.Thread] = None
         self._hb_wake = threading.Event()
+        self._hb_stop = threading.Event()
         self._boot = ""
         if settings is None:
             has_claude = False
@@ -2067,17 +2068,25 @@ class Locker:
                 self._hb_thread.start()
         self._hb_wake.set()
 
+    def close(self) -> None:
+        """Stop the heartbeat thread. A server keeps one Locker for life;
+        a test suite makes hundreds, and each would leave a thread behind."""
+        self._hb_stop.set()
+        self._hb_wake.set()
+
     def _heartbeat(self) -> None:
         """Renew-only: it never grants. Every few seconds while a call is in
         flight it re-checks each hold and records any that were lost."""
-        while True:
+        while not self._hb_stop.is_set():
             with self._mutex:
                 live = [kl for kl, n in self._inflight.items() if n > 0]
             if not live:
                 self._hb_wake.wait()
                 self._hb_wake.clear()
                 continue
-            time.sleep(self.heartbeat_s)
+            # An Event, not time.sleep: tests patch time.sleep.
+            if self._hb_stop.wait(self.heartbeat_s):
+                return
             for key, label in live:
                 with contextlib.suppress(StateError, CorruptState):
                     self._verify(key, label)

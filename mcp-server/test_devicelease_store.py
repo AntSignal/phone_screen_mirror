@@ -622,6 +622,23 @@ def test_heartbeat_stops_a_call_when_the_user_frees_the_device():
     assert not h.active
 
 
+def test_the_heartbeat_never_calls_time_sleep_and_close_stops_it(monkeypatch):
+    """The MCP suite patches time.sleep in dozens of tests; a heartbeat that
+    called it spun and polluted their sleep logs. close() ends the thread."""
+    real_sleep = time.sleep
+    locker = dl.Locker(client="mcp", via="test", heartbeat_s=0.05)
+    slept = []
+    monkeypatch.setattr(time, "sleep", lambda s: slept.append(s))
+    with locker.hold(K1):
+        first = locker._belief[(K1, "")]["verified"]
+        real_sleep(0.3)
+        assert locker._belief[(K1, "")]["verified"] > first, "the heartbeat ran"
+    assert slept == []
+    locker.close()
+    locker._hb_thread.join(timeout=2)
+    assert not locker._hb_thread.is_alive()
+
+
 def test_check_reverifies_when_the_heartbeat_is_starved(monkeypatch, sleeper):
     monkeypatch.setattr(dl.Locker, "_start_heartbeat", lambda self: None)
     locker = dl.Locker(client="mcp", via="test", heartbeat_s=0.05)
