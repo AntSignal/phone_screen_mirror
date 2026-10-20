@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Device-free tests for scripts/run.sh, scripts/package.sh and
+# Device-free tests for scripts/run.sh, scripts/package.sh and the audits in
 # scripts/lib/imirror-procs.sh. `swift test` runs this file (ScriptTests).
 #
 # The scripts run from a throwaway copy of the repo layout, and every tool
@@ -208,6 +208,55 @@ new_case
 run_script package.sh
 check "package.sh with nothing running succeeds" [ "$CODE" = 0 ]
 check "package.sh launches nothing it didn't quit" hasnt "$CALLS" "open"
+
+# ---- audits ----
+
+source "$REPO/scripts/lib/imirror-procs.sh"
+SUP="/Users/u/Library/Application Support/iMirror"
+
+OUT="$(imirror_audit_mcp_servers "$SUP" <<EOF
+  101 /Library/Frameworks/Python.framework/Versions/3.13/Resources/Python.app/Contents/MacOS/Python $SUP/mcp/current/imirror_mcp.py
+  102 /Library/Frameworks/Python.framework/Versions/3.13/Resources/Python.app/Contents/MacOS/Python /Users/u/Documents/Github/imirror/mcp-server/imirror_mcp.py
+  103 /usr/bin/python3 -m pytest mcp-server/test_imirror_mcp.py
+  104 vim imirror_mcp.py
+EOF
+)"
+check "a dev-tree server is flagged with its pid" has "$OUT" "WARNING: MCP server pid 102"
+check "the frozen server is not flagged" hasnt "$OUT" "pid 101"
+check "pytest and editors are not servers" has "$OUT" "2 MCP server(s) running; 1 not under $SUP/mcp/"
+check "flagged servers are counted per script" has "$OUT" "  1 running /Users/u/Documents/Github/imirror/mcp-server/imirror_mcp.py"
+
+OUT="$(imirror_audit_app_instances 500 <<'EOF'
+  500 /Users/u/Documents/Github/imirror-antsignal/build/iMirror.app/Contents/MacOS/iMirror
+  600 /Users/u/Documents/Github/imirror/build/iMirror.app/Contents/MacOS/iMirror
+  700 /Users/u/Documents/Github/imirror-antsignal/build/iMirror.app/Contents/Resources/ios
+EOF
+)"
+check "the owner app is named" has "$OUT" "iMirror pid 500 owns devices.json"
+check "a second app is flagged" has "$OUT" "WARNING: another iMirror app, pid 600"
+check "go-ios children are not apps" hasnt "$OUT" "700"
+
+OUT="$(imirror_audit_app_instances "" <<<'  500 /x/iMirror.app/Contents/MacOS/iMirror')"
+check "one app and no devices.json is not a warning" hasnt "$OUT" "WARNING"
+
+OUT="$(imirror_audit_slot_listeners <<'EOF'
+COMMAND   PID  USER   FD   TYPE  DEVICE SIZE/OFF NODE NAME
+iMirror 61591 manaf   20u  IPv4 0x01         0t0  TCP 127.0.0.1:8100 (LISTEN)
+ios     98082 manaf    8u  IPv6 0x02         0t0  TCP *:8111 (LISTEN)
+ios     98093 manaf    9u  IPv6 0x03         0t0  TCP *:9120 (LISTEN)
+ios     98095 manaf    9u  IPv4 0x04         0t0  TCP 127.0.0.1:60105 (LISTEN)
+foo         1 manaf    9u  IPv6 0x05         0t0  TCP [::1]:8110 (LISTEN)
+bar         2 manaf    9u  IPv4 0x06         0t0  TCP 0.0.0.0:8121 (LISTEN)
+baz         3 manaf    9u  IPv4 0x07         0t0  TCP 127.0.0.1:8102 (LISTEN)
+EOF
+)"
+check "a wildcard forward is flagged" has "$OUT" "WARNING: *:8111 (ios pid 98082)"
+check "a wildcard MJPEG port is flagged" has "$OUT" "WARNING: *:9120"
+check "0.0.0.0 is flagged" has "$OUT" "WARNING: 0.0.0.0:8121"
+check "the loopback relay is fine" has "$OUT" "ok       127.0.0.1:8100"
+check "IPv6 loopback is not a warning" hasnt "$OUT" "WARNING: [::1]"
+check "non-slot ports are ignored" hasnt "$OUT" "60105"
+check "the summary counts" has "$OUT" "5 slot listener(s), 3 not on loopback"
 
 echo "$PASSES passed, $FAILS failed"
 [[ "$FAILS" == 0 ]]

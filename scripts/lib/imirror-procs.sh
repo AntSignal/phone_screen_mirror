@@ -1,5 +1,5 @@
-# Shared by run.sh and package.sh: find and quit iMirror processes. Source
-# it; it defines functions only.
+# Shared by run.sh, package.sh and diagnose.sh: find, quit and audit iMirror
+# processes. Source it; it defines functions only.
 #
 # Processes are matched by their exact executable path, never by bundle id:
 # the fork and the old upstream app are both com.local.imirror, so anything
@@ -111,4 +111,63 @@ imirror_launch_bundle() {
         echo "Check that Automation is on in the new window." >&2
     fi
     return 1
+}
+
+# ---- audits for diagnose.sh; each reads command output on stdin ----
+
+# stdin: `ps -axo pid=,args=`. $1: the iMirror Application Support dir.
+# Flags MCP servers not run from the frozen install in $1/mcp/: a dev
+# checkout or the old upstream app, which ignore device leases.
+imirror_audit_mcp_servers() {
+    awk -v want="$1/mcp/" '
+        { pid = $1; line = $0; sub(/^[[:space:]]*[0-9]+[[:space:]]+/, "", line) }
+        tolower(line) ~ /python/ && line ~ /(^|[ \/])imirror_mcp\.py( |$)/ {
+            total++
+            if (index(line, want) == 0) {
+                other++
+                printf "WARNING: MCP server pid %s is not the frozen install: %s\n", pid, line
+                script = line; sub(/^[^ ]+ +/, "", script); by[script]++
+            }
+        }
+        END {
+            for (s in by) printf "  %d running %s\n", by[s], s
+            printf "%d MCP server(s) running; %d not under %s\n", total, other, want
+        }'
+}
+
+# stdin: `ps -axo pid=,comm=`. $1: owner_pid from devices.json, or empty.
+# Two apps fight over the same phones; only the owner should exist.
+imirror_audit_app_instances() {
+    awk -v owner="$1" '
+        { pid = $1; c = $0; sub(/^[[:space:]]*[0-9]+[[:space:]]+/, "", c) }
+        c ~ /\/iMirror\.app\/Contents\/MacOS\/iMirror$/ { n++; pids[n] = pid; paths[n] = c }
+        END {
+            for (i = 1; i <= n; i++) {
+                if (owner != "" && pids[i] == owner)
+                    printf "iMirror pid %s owns devices.json: %s\n", pids[i], paths[i]
+                else if (owner != "" || n > 1)
+                    printf "WARNING: another iMirror app, pid %s: %s\n", pids[i], paths[i]
+                else
+                    printf "iMirror pid %s (no devices.json owner): %s\n", pids[i], paths[i]
+            }
+            if (n == 0) print "(no iMirror app running)"
+        }'
+}
+
+# stdin: `lsof -nP -iTCP -sTCP:LISTEN`. Slot ports are 81x0 (relay), 81x1
+# (forward) and 91x0 (MJPEG) for x = 0..9. WDA has no auth, so anything but
+# 127.0.0.1 lets the network drive the phone or watch its screen.
+imirror_audit_slot_listeners() {
+    awk '
+        $1 == "COMMAND" { next }
+        {
+            name = $9; port = name; sub(/^.*:/, "", port)
+            host = substr(name, 1, length(name) - length(port) - 1)
+            if (port !~ /^(81[0-9][01]|91[0-9]0)$/) next
+            n++
+            if (host == "127.0.0.1") printf "ok       %s (%s pid %s)\n", name, $1, $2
+            else if (host == "[::1]") printf "ok       %s (%s pid %s, IPv6 loopback)\n", name, $1, $2
+            else { bad++; printf "WARNING: %s (%s pid %s) is reachable from the network\n", name, $1, $2 }
+        }
+        END { if (n == 0) print "(no listeners on slot ports)"; else printf "%d slot listener(s), %d not on loopback\n", n, bad }'
 }

@@ -1,6 +1,6 @@
 // Runs scripts/tests/test-app-scripts.sh, so `swift test` also gates the
-// running-bundle guard in run.sh / package.sh. The script stubs every tool
-// that could touch a real iMirror (see its header).
+// running-bundle guard in run.sh / package.sh and diagnose.sh's audits. The
+// script stubs every tool that could touch a real iMirror (see its header).
 
 import Foundation
 import XCTest

@@ -11,8 +11,21 @@
 set -uo pipefail
 
 OUT="${1:-$HOME/Desktop/imirror-diagnostics.txt}"
-APP="${IMIRROR_APP:-/Applications/iMirror.app}"
 SUPPORT="$HOME/Library/Application Support/iMirror"
+DEVICES="${IMIRROR_DEVICES_FILE:-$SUPPORT/devices.json}"
+HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
+# Process lookups and the audits in section 4.
+source "$HERE/lib/imirror-procs.sh"
+
+# Audit the app that is actually running (devices.json's owner), then this
+# checkout's build, then /Applications. A dev build is rarely in /Applications.
+OWNER_PID="$(imirror_owner_pid)"
+OWNER_EXE="$( [[ -n "$OWNER_PID" ]] && ps -o comm= -p "$OWNER_PID" 2>/dev/null || true)"
+if [[ -n "${IMIRROR_APP:-}" ]]; then APP="$IMIRROR_APP"
+elif [[ "$OWNER_EXE" == */Contents/MacOS/iMirror ]]; then APP="${OWNER_EXE%/Contents/MacOS/iMirror}"
+elif [[ -d "$HERE/../build/iMirror.app" ]]; then APP="$(cd "$HERE/../build/iMirror.app" && pwd -P)"
+else APP="/Applications/iMirror.app"
+fi
 
 exec > >(tee "$OUT") 2>&1
 
@@ -56,12 +69,15 @@ sqlite3 "$HOME/Library/Application Support/com.apple.TCC/TCC.db" "select service
 echo "  (auth_value: 0=denied 2=allowed; 'unable to open' => give Terminal Full Disk Access, or just check System Settings > Privacy > Camera)"
 
 section "4. SUBSYSTEM B — control (go-ios chain)"
+echo "--- iMirror apps (a second one fights the owner for every phone) ---"
+ps -axo pid=,comm= | imirror_audit_app_instances "$OWNER_PID"
+echo "--- MCP servers (only the frozen install under iMirror/mcp/ obeys device leases) ---"
+ps -axo pid=,args= | imirror_audit_mcp_servers "$SUPPORT"
 echo "--- stray/orphaned go-ios children (a leftover tunnel blocks a fresh one) ---"
 pgrep -fl "ios tunnel|ios runwda|ios forward" 2>/dev/null || echo "(none running)"
 echo "--- who holds the tunnel agent port 60105? ---"
 lsof -nP -iTCP:60105 2>/dev/null || echo "(nobody on 60105)"
 echo "--- device file: every phone the app runs, and its ports ---"
-DEVICES="${IMIRROR_DEVICES_FILE:-$SUPPORT/devices.json}"
 if [[ -f "$DEVICES" ]]; then
   cat "$DEVICES"
   echo
@@ -71,7 +87,8 @@ fi
 echo "--- tunnel agent: which phones have an established tunnel? ---"
 curl -sS --max-time 3 http://127.0.0.1:60105/tunnels 2>&1 | head -5 || echo "(agent not answering)"
 echo "--- listeners on each phone's ports (relay 8100+10n, forward 8101+10n, MJPEG 9110+10n) ---"
-lsof -nP -iTCP -sTCP:LISTEN 2>/dev/null | awk 'NR==1 || $9 ~ /:(81[0-7][01]|91[1-8]0)$/' || true
+echo "    (anything not on 127.0.0.1 lets the network drive the phone: WDA has no auth)"
+lsof -nP -iTCP -sTCP:LISTEN 2>/dev/null | imirror_audit_slot_listeners
 echo "--- is each phone's WDA reachable through its relay? ---"
 for port in $( (grep -oE '"wda_url" : "http://127\.0\.0\.1:[0-9]+' "$DEVICES" 2>/dev/null || true) \
                | grep -oE '[0-9]+$'); do
@@ -96,10 +113,10 @@ section "6. App log (NSLog -> unified logging)"
 log show --predicate 'process == "iMirror"' --last 45m --info 2>/dev/null | tail -80 || echo "(no log entries)"
 
 section "7. Next step if the cause is still unclear"
-cat <<'EOF'
+cat <<EOF
 Quit iMirror, then run it from Terminal with child logging on:
 
-    IMIRROR_DEBUG=1 /Applications/iMirror.app/Contents/MacOS/iMirror
+    IMIRROR_DEBUG=1 "$APP/Contents/MacOS/iMirror"
 
 Reproduce the failure (turn Automation on, wait ~60s), quit, then re-run this
 script. Step 5 will then contain the tunnel/runwda/forward logs, which say
