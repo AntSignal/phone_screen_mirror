@@ -322,6 +322,16 @@ def test_session_post_recreates_on_stale_404(mod, wda):
     assert mod._session["id"] == "s2"
 
 
+def test_session_post_recreates_on_an_older_builds_bare_404(mod, wda):
+    """Older WDA builds answer a dead session with a bare 404 body, not a W3C
+    error. They still get the old recreate-once, so they still recover."""
+    wda.script("/session", (200, {"value": {"sessionId": "s1"}}),
+               (200, {"value": {"sessionId": "s2"}}))
+    wda.script("/actions", (404, {"value": "no such session"}), (200, {"value": {}}))
+    mod._session_post("/actions", {"actions": []})
+    assert mod._session["id"] == "s2"
+
+
 def test_session_post_raises_on_hard_error(mod, wda):
     wda.script("/session", (200, {"value": {"sessionId": "s1"}}))
     wda.script("/actions", (500, {"value": "boom"}))

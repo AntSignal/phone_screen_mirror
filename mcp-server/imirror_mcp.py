@@ -97,6 +97,10 @@ class MCPToolError(RuntimeError):
     is additive, not a breaking change to the exception contract.
     """
 
+    # The W3C error name from WDA's reply, e.g. "stale element reference",
+    # when the failure came from one (see _wda_http_error).
+    wda_error: str | None = None
+
     def __init__(self, message: str, *, kind: str, code: str | None = None):
         if kind not in _ERROR_KINDS:
             raise ValueError(f"unknown MCPToolError kind: {kind!r}")
@@ -942,29 +946,71 @@ def _ensure_session() -> str:
     return sid
 
 
-def _session_post(subpath: str, body: dict, _retry: bool = True) -> dict[str, Any]:
-    """POST to /session/<id><subpath>; recreate the session once on 404."""
+def _wda_error(j: Any) -> str | None:
+    """The W3C error name in a WDA error reply, e.g. "no such element".
+
+    WDA answers every failure as {"value": {"error", "message", "traceback"},
+    "sessionId": <the active session, or null>} (FBResponsePayload.m), and
+    uses 404 for four different things: no such element, stale element
+    reference, unknown command and invalid session id. None means the body
+    has another shape: an older WDA build, or a body that was not JSON."""
+    v = j.get("value") if isinstance(j, dict) else None
+    err = v.get("error") if isinstance(v, dict) else None
+    return err if isinstance(err, str) and err else None
+
+
+def _wda_http_error(code: int, j: Any, where: str) -> MCPToolError:
+    """The error for a WDA reply this server cannot use. Quotes WDA's error
+    and message but not its traceback, which is a whole stack dump."""
+    err = _wda_error(j)
+    if err is not None:
+        msg = j["value"].get("message")
+        detail = f"{err}: {msg}" if isinstance(msg, str) and msg else err
+    else:
+        detail = str(j)[:300]
+    # WDA's own "timeout" (408) means slow, so poll loops ride it out.
+    kind = ErrorKind.TIMEOUT if err == "timeout" else ErrorKind.WDA_HTTP
+    e = MCPToolError(f"WDA error (HTTP {code}) on {where}: {detail}",
+                     kind=kind, code=f"WDA_HTTP_{code}")
+    e.wda_error = err
+    return e
+
+
+def _session_call(method: str, subpath: str, body: dict | None,
+                  timeout: float) -> tuple[int, dict[str, Any]]:
+    """Send one request to /session/<id><subpath>, replacing a dead session
+    once, and return WDA's (status, body) for the caller to read.
+
+    Only "invalid session id" means the session is gone. Resetting on any
+    404, as this used to, turned every element miss into a new session,
+    which kills whichever session another client on the phone was using."""
+    t = _cur()
     sid = _ensure_session()
-    code, j = _req("POST", f"/session/{sid}{subpath}", body)
-    if code == 404 and _retry:               # stale session (WDA restarted)
-        _cur().session["id"] = None
-        return _session_post(subpath, body, _retry=False)
+    code, j = _req(method, f"/session/{sid}{subpath}", body, timeout=timeout)
+    if code != 404:
+        return code, j
+    err = _wda_error(j)
+    if err is not None and err != "invalid session id":
+        return code, j                      # a miss, a stale element, an unknown route
+    # The session is gone, or an older WDA build sent a bare 404: recreate once.
+    t.session["id"] = None
+    sid = _ensure_session()
+    return _req(method, f"/session/{sid}{subpath}", body, timeout=timeout)
+
+
+def _session_post(subpath: str, body: dict) -> dict[str, Any]:
+    """POST to /session/<id><subpath>; raise on any WDA error."""
+    code, j = _session_call("POST", subpath, body, _TIMEOUT_INTERACT)
     if code >= 400:
-        raise MCPToolError(f"WDA error (HTTP {code}) on {subpath}: {j}",
-                            kind=ErrorKind.WDA_HTTP, code=f"WDA_HTTP_{code}")
+        raise _wda_http_error(code, j, subpath)
     return j
 
 
-def _session_get(subpath: str, _retry: bool = True) -> dict[str, Any]:
-    """GET /session/<id><subpath>; recreate the session once on 404."""
-    sid = _ensure_session()
-    code, j = _req("GET", f"/session/{sid}{subpath}")
-    if code == 404 and _retry:               # stale session (WDA restarted)
-        _cur().session["id"] = None
-        return _session_get(subpath, _retry=False)
+def _session_get(subpath: str) -> dict[str, Any]:
+    """GET /session/<id><subpath>; raise on any WDA error."""
+    code, j = _session_call("GET", subpath, None, _TIMEOUT_INTERACT)
     if code >= 400:
-        raise MCPToolError(f"WDA error (HTTP {code}) on {subpath}: {j}",
-                            kind=ErrorKind.WDA_HTTP, code=f"WDA_HTTP_{code}")
+        raise _wda_http_error(code, j, subpath)
     return j
 
 
@@ -1044,10 +1090,10 @@ def _scroll_once(direction: str, distance_pct: float, x_pct: float,
     return fx, fy, tx, ty, dist
 
 
-def _find_element(text: str, visible_only: bool = False, _retry: bool = True) -> str | None:
+def _find_element(text: str, visible_only: bool = False) -> str | None:
     """Return the element id of the first element whose label/name/value matches
-    `text`, or None if no such element is on screen. Recreates the session once
-    on a stale 404.
+    `text`, or None if no such element is on screen. WDA's 404 "no such
+    element" is that miss; any other 4xx raises.
 
     `visible_only` ANDs `visible == 1` into the predicate so only an on-screen
     match counts — WDA returns the first predicate match, which is reading
@@ -1058,7 +1104,6 @@ def _find_element(text: str, visible_only: bool = False, _retry: bool = True) ->
     per poll, a real-device perf regression. Default False keeps today's
     behavior for ios_find_and_tap / ios_scroll_to / the asserts.
     """
-    sid = _ensure_session()
     # Escape backslashes BEFORE quotes: input ending in \' would otherwise become
     # \\' (escaped backslash + live quote) and break out of the predicate literal.
     safe = text.replace("\\", "\\\\").replace("'", "\\'")
@@ -1068,14 +1113,18 @@ def _find_element(text: str, visible_only: bool = False, _retry: bool = True) ->
     # PROBE tier: poll loops (ios_wait_for, ios_find_and_tap, ios_scroll_to, the
     # asserts) call this many times per second, so a wedged WDA should surface
     # fast rather than each lookup eating the INTERACT tier.
-    code, j = _req("POST", f"/session/{sid}/element",
-                   {"using": "predicate string", "value": predicate},
-                   timeout=_TIMEOUT_PROBE)
-    if code == 404 and _retry:
-        _cur().session["id"] = None
-        return _find_element(text, visible_only=visible_only, _retry=False)
-    return (j.get("value") or {}).get("ELEMENT") or \
-           (j.get("value") or {}).get("element-6066-11e4-a52e-4f735466cecf")
+    code, j = _session_call("POST", "/element",
+                            {"using": "predicate string", "value": predicate},
+                            _TIMEOUT_PROBE)
+    if code == 404 and _wda_error(j) in ("no such element", None):
+        return None          # None: an older build's bare 404, after one recreate
+    if 400 <= code < 500:
+        raise _wda_http_error(code, j, "/element")
+    # A 5xx stays a miss, so poll loops keep polling.
+    v = j.get("value")
+    if not isinstance(v, dict):
+        return None
+    return v.get("ELEMENT") or v.get("element-6066-11e4-a52e-4f735466cecf")
 
 
 def _find_element_or_timeout(text: str, visible_only: bool = False) -> tuple[str | None, MCPToolError | None]:
@@ -1829,6 +1878,33 @@ def ios_press_button(name: str = "home") -> str:
     return f"pressed {name}"
 
 
+def _click_element(eid: str, text: str) -> None:
+    """Click element `eid`, found by `text`, re-finding it once if it went stale.
+
+    The screen can change between the find and the click (an animation, a
+    list reload, or a session swap, since element ids belong to one session),
+    and WDA then answers 404 "stale element reference". Any other failure
+    raises: returning "tapped" after a failed click would mislead."""
+    try:
+        _session_post(f"/element/{eid}/click", {})
+        return
+    except MCPToolError as e:
+        if e.wda_error != "stale element reference":
+            raise
+    again = _find_element(text)
+    if again:
+        try:
+            _session_post(f"/element/{again}/click", {})
+            return
+        except MCPToolError as e:
+            if e.wda_error != "stale element reference":
+                raise
+    raise MCPToolError(f"Element '{text}' went stale before it could be tapped "
+                       "(the screen kept changing). Wait for it to settle "
+                       "(ios_await_idle), then try again.",
+                       kind=ErrorKind.NOT_FOUND, code="STALE_ELEMENT")
+
+
 @_tool()
 @_recorded
 def ios_find_and_tap(text: str, retries: int = 0, retry_delay_s: float = 0.5) -> str:
@@ -1850,9 +1926,7 @@ def ios_find_and_tap(text: str, retries: int = 0, retry_delay_s: float = 0.5) ->
         else:
             any_clean = True
             if eid:
-                # The click leg goes through _session_post so a stale-session 404 retries
-                # and a WDA error raises — returning "tapped" on a failed click would mislead.
-                _session_post(f"/element/{eid}/click", {})
+                _click_element(eid, text)
                 _record("find_and_tap", text)
                 return f"tapped element '{text}'"
         if attempt >= retries:

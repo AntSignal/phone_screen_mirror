@@ -70,3 +70,72 @@ def test_req_tree_ride_out_survives_the_probes_short_socket(m, fake, monkeypatch
     code, j = m._req_tree("/source")
     assert code == 200 and "XCUIElementTypeApplication" in j["value"]
     assert fake.paths("GET") == ["/source", "/status", "/source"]
+
+
+# ---- mcp-core-1: read WDA's W3C 404s instead of resetting on every one --------
+
+def test_a_miss_is_a_clean_miss_with_no_new_session(m, fake):
+    """WDA answers a find that matches nothing with 404 "no such element".
+    That is a miss, not a dead session: recreating there killed every other
+    client's session on each poll."""
+    assert "PASS" in m.ios_assert_not_visible("Nope", timeout_s=0)
+    with pytest.raises(m.MCPToolError) as e:
+        m.ios_wait_for("Nope", timeout_s=0.6)
+    assert e.value.error_kind == m.ErrorKind.NOT_FOUND
+    assert fake.count("POST", "/session") == 1
+
+
+def test_a_stale_click_re_finds_once_and_clicks_the_new_element(m, fake):
+    fake.find_ids["OK"] = ["e1", "e2"]
+    fake.stale.add("e1")
+    assert m.ios_find_and_tap("OK") == "tapped element 'OK'"
+    sid = fake.active
+    clicks = [p for p in fake.paths("POST") if p.endswith("/click")]
+    assert clicks == [f"/session/{sid}/element/e1/click", f"/session/{sid}/element/e2/click"]
+    assert fake.count("POST", "/session") == 1
+
+
+def test_an_element_stale_twice_is_reported_not_retried(m, fake):
+    fake.find_ids["OK"] = ["e1", "e2"]
+    fake.stale.update({"e1", "e2"})
+    with pytest.raises(m.MCPToolError) as e:
+        m.ios_find_and_tap("OK")
+    assert e.value.error_kind == m.ErrorKind.NOT_FOUND
+    assert "stale" in str(e.value)
+    assert len([p for p in fake.paths("POST") if p.endswith("/click")]) == 2
+
+
+def test_wda_restarting_still_recreates_the_session(m, fake):
+    m.ios_tap(1, 1)
+    fake.restart()                              # its next reply: invalid session id
+    m.ios_tap(2, 2)
+    assert fake.count("POST", "/session") == 2
+    assert fake.count("POST", f"/session/{fake.active}/actions") == 1
+
+
+def test_an_unknown_command_raises_without_touching_the_session(m, fake):
+    m.ios_tap(1, 1)
+    with pytest.raises(m.MCPToolError) as e:
+        m._session_post("/wda/foo", {})
+    assert e.value.error_code == "WDA_HTTP_404"
+    assert "unknown command" in str(e.value)
+    assert "WebDriverAgentLib" not in str(e.value)   # no stack dump
+    assert fake.count("POST", "/session") == 1
+
+
+def test_a_bad_selector_fails_the_wait_at_once(m, fake):
+    """Any other 4xx is a real error. It used to read as "not found" and
+    burn the whole wait."""
+    fake.fail_next("POST", "/element", 400, "invalid selector", "bad predicate")
+    with pytest.raises(m.MCPToolError) as e:
+        m.ios_wait_for("OK", timeout_s=5)
+    assert e.value.error_code == "WDA_HTTP_400"
+    assert "invalid selector: bad predicate" in str(e.value)
+
+
+def test_a_wda_timeout_on_a_find_keeps_the_poll_going(m, fake):
+    """WDA's own 408 "timeout" is slowness: poll loops ride it out like a
+    socket timeout instead of failing the wait."""
+    fake.find_ids["OK"] = ["e1"]
+    fake.fail_next("POST", "/element", 408, "timeout", "snapshot timed out")
+    assert "found 'OK' after 2 check(s)" == m.ios_wait_for("OK", timeout_s=5)

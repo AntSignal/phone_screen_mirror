@@ -68,6 +68,8 @@ class FakeWDAServer:
         # CocoaHTTPServer drops an idle keep-alive connection.
         self.close_after: int | None = None
         self.json_source = True                # False: format=json is a 400
+        # (method, path suffix) -> W3C errors to answer instead, in turn.
+        self.failures: dict[tuple[str, str], list[tuple[int, str, str]]] = {}
         self._httpd: ThreadingHTTPServer | None = None
 
     # ---- lifecycle ----------------------------------------------------------
@@ -101,6 +103,13 @@ class FakeWDAServer:
             self.settings = {}
             return self.active
 
+    def fail_next(self, method: str, suffix: str, status: int, error: str,
+                  message: str = "") -> None:
+        """Answer the next request whose path ends with `suffix` with this
+        W3C error. A session route checks its session first, as WDA does."""
+        with self.lock:
+            self.failures.setdefault((method, suffix), []).append((status, error, message))
+
     def restart(self) -> None:
         """WDA restarted: no session at all."""
         with self.lock:
@@ -126,9 +135,21 @@ class FakeWDAServer:
                                   "traceback": TRACEBACK},
                         "sessionId": self.active}
 
+    def _scripted_failure(self, method: str, path: str) -> tuple[int, dict] | None:
+        for (m, suffix), queue in self.failures.items():
+            if m == method and path.endswith(suffix) and queue:
+                status, error, message = queue.pop(0)
+                return self._err(status, error, message)
+        return None
+
     def _route(self, method: str, raw_path: str, body: Any) -> tuple[int, dict]:
         parts = urlsplit(raw_path)
         path, query = parts.path, parse_qs(parts.query)
+        session_route = re.match(r"^/session/([^/]+)(/.*)?$", path)
+        if not (session_route and session_route.group(1) != self.active):
+            failure = self._scripted_failure(method, path)
+            if failure is not None:
+                return failure
         if method == "GET" and path == "/status":
             return self._ok({
                 "ready": True, "message": "WebDriverAgent is ready to accept commands",
@@ -147,11 +168,10 @@ class FakeWDAServer:
             self.settings = {}                 # resetSessionSettings
             return self._ok({"sessionId": self.active,
                              "capabilities": {"device": "iphone", "sdkVersion": "26.6"}})
-        m = re.match(r"^/session/([^/]+)(/.*)?$", path)
-        if m:
-            if m.group(1) != self.active:      # FBRoute.decorateRequest
+        if session_route:
+            if session_route.group(1) != self.active:   # FBRoute.decorateRequest
                 return self._err(404, "invalid session id", "Session does not exist")
-            return self._session_route(method, m.group(2) or "", body)
+            return self._session_route(method, session_route.group(2) or "", body)
         if method == "GET" and path == "/window/size":
             return self._ok(dict(self.window))
         if method == "GET" and path == "/screenshot":
