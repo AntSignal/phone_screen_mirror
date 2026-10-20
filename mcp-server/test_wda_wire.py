@@ -72,6 +72,23 @@ def test_req_tree_ride_out_survives_the_probes_short_socket(m, fake, monkeypatch
     assert fake.paths("GET") == ["/source", "/status", "/source"]
 
 
+def test_a_socket_wda_closed_while_idle_is_replaced_quietly(m, fake):
+    """CocoaHTTPServer drops a kept-alive socket after 30 s idle without
+    saying so; the next request on it must reconnect, not fail."""
+    m._http("GET", "/status", None, 2.0)
+    fake.close_after = 1                        # the next reply, then hang up
+    assert m._req("GET", "/status")[0] == 200
+    assert m._req("GET", "/status")[0] == 200
+    assert fake.connections == 2
+
+
+def test_a_read_cut_off_mid_reply_is_retried(m, fake):
+    fake.drops["/source"] = 1
+    code, j = m._req("GET", "/source")
+    assert code == 200 and "XCUIElementTypeApplication" in j["value"]
+    assert fake.paths("GET") == ["/source", "/source"]
+
+
 # ---- mcp-core-1: read WDA's W3C 404s instead of resetting on every one --------
 
 def test_a_miss_is_a_clean_miss_with_no_new_session(m, fake):
