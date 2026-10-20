@@ -41,3 +41,32 @@ def test_a_tap_goes_over_one_kept_alive_connection(m, fake):
     m.ios_tap(30, 40)
     assert fake.count("POST", f"/session/{fake.active}/actions") == 2
     assert fake.connections == 1
+
+
+# ---- mcp-core-2: a reused socket must take each request's timeout -------------
+
+def test_a_reused_socket_gets_the_longer_timeout_it_was_asked_for(m, fake):
+    m._http("GET", "/status", None, 0.2)
+    fake.delays["/source"] = [0.6]
+    status, _ = m._http("GET", "/source", None, 2.0)
+    assert status == 200
+    assert fake.connections == 1               # same socket, new timeout
+
+
+def test_a_reused_socket_gets_the_shorter_timeout_too(m, fake):
+    m._http("GET", "/status", None, 2.0)
+    fake.delays["/source"] = [0.6]
+    with pytest.raises(TimeoutError):
+        m._http("GET", "/source", None, 0.2)
+
+
+def test_req_tree_ride_out_survives_the_probes_short_socket(m, fake, monkeypatch):
+    """The first /source times out and drops its socket; the /status probe
+    opens a new one at the PROBE tier; the retry reuses that socket and must
+    wait the TREE tier, not the probe's."""
+    monkeypatch.setattr(m, "_TIMEOUT_TREE", 0.5)
+    monkeypatch.setattr(m, "_TIMEOUT_PROBE", 0.2)
+    fake.delays["/source"] = [0.9, 0.3]
+    code, j = m._req_tree("/source")
+    assert code == 200 and "XCUIElementTypeApplication" in j["value"]
+    assert fake.paths("GET") == ["/source", "/status", "/source"]

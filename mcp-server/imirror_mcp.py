@@ -801,7 +801,13 @@ def _http(method: str, path: str, data: bytes | None,
         c = http.client.HTTPConnection(host, port, timeout=timeout)
         conns[base] = c
     try:
+        # connect() reads c.timeout only when it opens a socket. A reused
+        # keep-alive socket keeps its first timeout unless it is set here,
+        # so the PROBE/INTERACT/TREE tiers would silently not apply.
         c.timeout = timeout
+        sock = getattr(c, "sock", None)
+        if sock is not None:
+            sock.settimeout(timeout)
         c.request(method, path, body=data,
                   headers={"Content-Type": "application/json"})
         r = c.getresponse()
