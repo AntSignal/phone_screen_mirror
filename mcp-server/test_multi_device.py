@@ -43,12 +43,14 @@ PHONE_AND_SIM = [entry(PHONE_16E, "phone1", port=8100),
                  entry(SIM, "sim", kind="simulator", port=8201)]
 
 
-def write_devices(path, devices, owner_pid=None, schema=1, raw: str | None = None) -> None:
+def write_devices(path, devices, owner_pid=None, schema=1, raw: str | None = None,
+                  **top) -> None:
     """Write the device file the way the app does: a whole new file swapped in
-    atomically, so the server sees a new inode/mtime on every rewrite."""
+    atomically, so the server sees a new inode/mtime on every rewrite. `top`
+    adds top-level fields, such as owner_uniqueid."""
     doc = {"schema": schema, "owner_pid": os.getpid() if owner_pid is None else owner_pid,
            "app_version": "test", "updated_at": "2026-09-28T00:00:00Z",
-           "goios": "", "devices": devices}
+           "goios": "", "devices": devices, **top}
     tmp = f"{path}.tmp"
     with open(tmp, "w", encoding="utf-8") as f:
         f.write(raw if raw is not None else json.dumps(doc))
@@ -135,6 +137,19 @@ def dead_pid() -> int:
     p = subprocess.Popen(["true"])
     p.wait()
     return p.pid
+
+
+def own_uniqueid() -> int:
+    """This process's kernel uniqueid, read here without the server's code:
+    proc_pidinfo(PROC_PIDUNIQIDENTIFIERINFO=17) fills 56 bytes, with the
+    64-bit p_uniqueid at offset 16, after the executable's 16-byte UUID."""
+    import ctypes
+    lib = ctypes.CDLL("/usr/lib/libSystem.B.dylib", use_errno=True)
+    buf = (ctypes.c_uint8 * 56)()
+    n = lib.proc_pidinfo(ctypes.c_int(os.getpid()), ctypes.c_int(17), ctypes.c_uint64(0),
+                         buf, ctypes.c_int(56))
+    assert n == 56
+    return int.from_bytes(bytes(buf[16:24]), sys.byteorder)
 
 
 # ---- the `device` argument in the tool schema -------------------------------------
@@ -351,8 +366,52 @@ def test_untrustworthy_file_falls_back_to_8100(reg, bad):
 
 def test_owner_dying_after_the_file_was_read_is_noticed(reg, monkeypatch):
     assert reg.m._targets()[0] == "list"
-    monkeypatch.setattr(reg.m, "_pid_alive", lambda pid: False)
+    monkeypatch.setattr(reg.m, "_pid_alive", lambda pid, uniqueid=None: False)
     assert reg.m._targets()[0] == "fallback"
+
+
+def test_a_zombie_owner_counts_as_gone(reg):
+    """kill(pid, 0) succeeds on a zombie: an app that died unreaped would
+    otherwise keep its stale ports trusted."""
+    p = subprocess.Popen(["true"])
+    try:
+        while os.waitid(os.P_PID, p.pid, os.WEXITED | os.WNOHANG | os.WNOWAIT) is None:
+            time.sleep(0.01)                    # exited, not yet reaped
+        reg.write(TWO_PHONES, owner_pid=p.pid)
+        assert reg.m._targets()[0] == "fallback"
+    finally:
+        p.wait()
+
+
+def test_an_owner_uniqueid_that_matches_is_trusted(reg):
+    reg.write(TWO_PHONES, owner_uniqueid=own_uniqueid())
+    assert reg.m._targets()[0] == "list"
+
+
+def test_an_owner_uniqueid_that_differs_means_the_pid_was_reused(reg):
+    """The app crashed and the system gave its pid to another process: the
+    pid is alive, but it is not the app that wrote the file."""
+    reg.write(TWO_PHONES, owner_uniqueid=own_uniqueid() + 1)
+    assert reg.m._targets()[0] == "fallback"
+    assert "gone" in reg.m._REGISTRY.problem
+
+
+@pytest.mark.parametrize("bad", ["123", 0, -1, True, 1.5])
+def test_a_malformed_owner_uniqueid_is_not_trusted(reg, bad):
+    reg.write(TWO_PHONES, owner_uniqueid=bad)
+    assert reg.m._targets()[0] == "fallback"
+    assert "owner_uniqueid" in reg.m._REGISTRY.problem
+
+
+def test_the_unchanged_file_recheck_uses_the_uniqueid_too(reg, monkeypatch):
+    uniq = own_uniqueid()
+    reg.write(TWO_PHONES, owner_uniqueid=uniq)
+    assert reg.m._targets()[0] == "list"
+    seen = []
+    monkeypatch.setattr(reg.m, "_pid_alive",
+                        lambda pid, uniqueid=None: seen.append((pid, uniqueid)) or False)
+    assert reg.m._targets()[0] == "fallback"
+    assert seen == [(os.getpid(), uniq)]
 
 
 def test_non_loopback_entry_is_dropped(reg):

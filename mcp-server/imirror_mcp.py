@@ -29,6 +29,7 @@ import atexit
 import base64
 import concurrent.futures
 import contextvars
+import ctypes
 import dataclasses
 import functools
 import html
@@ -224,17 +225,79 @@ def _devices_file() -> str:
     return os.environ.get("IMIRROR_DEVICES_FILE") or _DEVICES_FILE_DEFAULT
 
 
-def _pid_alive(pid: Any) -> bool:
-    """True if `pid` is a live process we could signal. A dead owner means the
-    iMirror app crashed without deleting its device file, so the ports it lists
-    are stale and must not be driven."""
+# proc_pidinfo flavours from <sys/proc_info.h>. The uniqueid one is in the
+# private header, but its layout is checked on macOS 26 by the tests.
+_PROC_PIDT_SHORTBSDINFO = 13
+_PROC_PIDUNIQIDENTIFIERINFO = 17
+_SZOMB = 5                                # p_stat of a zombie
+
+
+class _ProcBSDShortInfo(ctypes.Structure):
+    _fields_ = [("pbsi_pid", ctypes.c_uint32), ("pbsi_ppid", ctypes.c_uint32),
+                ("pbsi_pgid", ctypes.c_uint32), ("pbsi_status", ctypes.c_uint32),
+                ("pbsi_comm", ctypes.c_char * 16), ("pbsi_flags", ctypes.c_uint32),
+                ("pbsi_uid", ctypes.c_uint32), ("pbsi_gid", ctypes.c_uint32),
+                ("pbsi_ruid", ctypes.c_uint32), ("pbsi_rgid", ctypes.c_uint32),
+                ("pbsi_svuid", ctypes.c_uint32), ("pbsi_svgid", ctypes.c_uint32),
+                ("pbsi_rfu", ctypes.c_uint32)]
+
+
+class _ProcUniqIdentifierInfo(ctypes.Structure):
+    _fields_ = [("p_uuid", ctypes.c_uint8 * 16), ("p_uniqueid", ctypes.c_uint64),
+                ("p_puniqueid", ctypes.c_uint64), ("p_idversion", ctypes.c_int32),
+                ("p_orig_ppidversion", ctypes.c_int32), ("p_reserve2", ctypes.c_uint64),
+                ("p_reserve3", ctypes.c_uint64)]
+
+
+_proc_pidinfo_fn: list[Any] = []          # loaded once; [None] off macOS
+
+
+def _proc_info(pid: int, flavor: int, struct: Any) -> Any | None:
+    """One proc_pidinfo read of `pid`, or None when it fails: the process is
+    gone, or a zombie (macOS answers ESRCH for one), or this is not macOS."""
+    if not _proc_pidinfo_fn:
+        fn = None
+        if sys.platform == "darwin":
+            try:
+                fn = ctypes.CDLL("/usr/lib/libSystem.B.dylib", use_errno=True).proc_pidinfo
+                fn.argtypes = [ctypes.c_int, ctypes.c_int, ctypes.c_uint64,
+                               ctypes.c_void_p, ctypes.c_int]
+                fn.restype = ctypes.c_int
+            except (OSError, AttributeError):
+                fn = None
+        _proc_pidinfo_fn.append(fn)
+    fn = _proc_pidinfo_fn[0]
+    if fn is None:
+        return None
+    buf = struct()
+    n = fn(pid, flavor, 0, ctypes.byref(buf), ctypes.sizeof(buf))
+    return buf if n == ctypes.sizeof(buf) else None
+
+
+def _pid_alive(pid: Any, uniqueid: int | None = None) -> bool:
+    """True if `pid` is a live process we could signal and, when `uniqueid`
+    is given, the very process that wrote the device file.
+
+    A dead owner means the iMirror app crashed without deleting its device
+    file, so the ports it lists are stale and must not be driven. kill(pid, 0)
+    alone says yes to a zombie, and to a pid the system has given to a new
+    process. The app records its kernel uniqueid, never reused within a boot,
+    as owner_uniqueid; a file without one gets the pid checks only."""
     if not isinstance(pid, int) or isinstance(pid, bool) or pid <= 0:
         return False
     try:
         os.kill(pid, 0)
     except OSError:
         return False
-    return True
+    info = _proc_info(pid, _PROC_PIDT_SHORTBSDINFO, _ProcBSDShortInfo)
+    if info is None:
+        return _proc_pidinfo_fn[0] is None    # off macOS, kill() is all we have
+    if info.pbsi_status == _SZOMB:
+        return False
+    if uniqueid is None:
+        return True
+    ids = _proc_info(pid, _PROC_PIDUNIQIDENTIFIERINFO, _ProcUniqIdentifierInfo)
+    return ids is not None and ids.p_uniqueid == uniqueid
 
 
 class _Registry:
@@ -252,6 +315,7 @@ class _Registry:
         self._by_udid: dict[str, _Target] = {}
         self._order: list[str] = []
         self._owner: int | None = None
+        self._owner_uniqueid: int | None = None
         self.goios: str | None = None
         self.problem = "no device file yet"
 
@@ -266,6 +330,7 @@ class _Registry:
 
     def _invalidate(self, problem: str) -> None:
         self._owner = None
+        self._owner_uniqueid = None
         self._order = []
         self.goios = None
         self.problem = problem
@@ -281,7 +346,8 @@ class _Registry:
         sig = (path, st.st_mtime_ns, st.st_size, st.st_ino)
         if sig == self._sig:
             # Unchanged file — but the app may have died since we parsed it.
-            if self._owner is not None and not _pid_alive(self._owner):
+            if self._owner is not None and not _pid_alive(self._owner,
+                                                          self._owner_uniqueid):
                 self._invalidate("the iMirror app that wrote the device file is gone")
             return
         self._sig = sig
@@ -298,7 +364,12 @@ class _Registry:
             self._invalidate("device file has an unknown schema")
             return
         owner = doc.get("owner_pid")
-        if not _pid_alive(owner):
+        uniq = doc.get("owner_uniqueid")      # absent in older app builds
+        if uniq is not None and (not isinstance(uniq, int) or isinstance(uniq, bool)
+                                 or uniq <= 0):
+            self._invalidate("device file has a malformed owner_uniqueid")
+            return
+        if not _pid_alive(owner, uniq):
             self._invalidate("the iMirror app that wrote the device file is gone")
             return
         order: list[str] = []
@@ -307,6 +378,7 @@ class _Registry:
             if t is not None and t.key not in order:
                 order.append(t.key)
         self._owner = owner
+        self._owner_uniqueid = uniq
         self._order = order
         goios = doc.get("goios")
         self.goios = goios if isinstance(goios, str) and goios else None
