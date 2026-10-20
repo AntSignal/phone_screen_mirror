@@ -43,6 +43,13 @@ def test_a_tap_goes_over_one_kept_alive_connection(m, fake):
     assert fake.connections == 1
 
 
+def test_a_call_through_mcp_runs_on_a_worker_thread_over_real_sockets(m, fake):
+    import anyio
+    fake.find_ids["OK"] = ["e1"]
+    anyio.run(m.mcp.call_tool, "ios_find_and_tap", {"text": "OK"})
+    assert fake.count("POST", f"/session/{fake.active}/element/e1/click") == 1
+
+
 # ---- mcp-core-2: a reused socket must take each request's timeout -------------
 
 def test_a_reused_socket_gets_the_longer_timeout_it_was_asked_for(m, fake):
