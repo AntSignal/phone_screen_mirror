@@ -102,7 +102,9 @@ class RoutedWDA:
         for (a, suffix), status in list(self.fail_once.items()):
             if a == alias and path.endswith(suffix):
                 del self.fail_once[(a, suffix)]
-                return status, {"value": "no such session"}
+                error = "invalid session id" if status == 404 else "unknown error"
+                return status, {"value": {"error": error, "message": "Session does not exist",
+                                          "traceback": ""}, "sessionId": None}
         if path == "/session":
             return 200, {"value": {"sessionId": f"{alias}-s{next(self.ids)}"}}
         if path == "/status":

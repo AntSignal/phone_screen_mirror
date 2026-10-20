@@ -26,6 +26,14 @@ def mod(monkeypatch):
     return m
 
 
+# WDA's real reply when the session in the URL no longer exists
+# (FBCommandStatus.m, FBResponsePayload.m): a W3C error object, plus the
+# session that IS active at the top level (null: none).
+INVALID_SESSION = {"value": {"error": "invalid session id",
+                             "message": "Session does not exist", "traceback": ""},
+                   "sessionId": None}
+
+
 class FakeWDA:
     """Records requests and replies from a scripted (status, body) queue per route key."""
 
@@ -123,8 +131,10 @@ def test_req_parses_json_body(mod, monkeypatch):
 def test_req_returns_error_code_and_body(mod, monkeypatch):
     """4xx/5xx come back as a normal response (not an exception) so callers like
     _session_post can see the code and recreate a stale session."""
-    monkeypatch.setattr(mod, "_http", lambda *a: (404, b'{"value": "no session"}'))
-    assert mod._req("POST", "/session/s/actions", {}) == (404, {"value": "no session"})
+    body = {"value": {"error": "invalid session id", "message": "Session does not exist",
+                      "traceback": ""}, "sessionId": None}
+    monkeypatch.setattr(mod, "_http", lambda *a: (404, json.dumps(body).encode()))
+    assert mod._req("POST", "/session/s/actions", {}) == (404, body)
 
 
 def test_req_wraps_non_json_error_body(mod, monkeypatch):
@@ -306,7 +316,7 @@ def test_ensure_session_creates_once(mod, wda):
 def test_session_post_recreates_on_stale_404(mod, wda):
     wda.script("/session", (200, {"value": {"sessionId": "s1"}}),
                (200, {"value": {"sessionId": "s2"}}))
-    wda.script("/actions", (404, {"value": "no session"}), (200, {"value": {}}))
+    wda.script("/actions", (404, INVALID_SESSION), (200, {"value": {}}))
     mod._session_post("/actions", {"actions": []})
     # session got cleared and recreated, and the new id is cached
     assert mod._session["id"] == "s2"
