@@ -117,6 +117,21 @@ final class MCPFrozenInstallerTests: XCTestCase {
         XCTAssertEqual(i.currentDirName(), second)
     }
 
+    /// Device and sim installs can stage the same copy at once.
+    func testConcurrentStagesOfOneCopyAllSucceed() throws {
+        let i = installer()
+        let files = try i.serverFiles(in: src)
+        let name = i.dirName(for: files)
+        let lock = NSLock()
+        var ok = [Bool](repeating: false, count: 8)
+        DispatchQueue.concurrentPerform(iterations: ok.count) { k in
+            let staged = (try? i.stage(files, as: name)) != nil
+            lock.lock(); ok[k] = staged; lock.unlock()
+        }
+        XCTAssertEqual(ok, Array(repeating: true, count: 8))
+        XCTAssertEqual(try i.serverFiles(in: copyDir(name)), files)
+    }
+
     // MARK: smoke test
 
     func testFailedImportLeavesCurrentAlone() throws {

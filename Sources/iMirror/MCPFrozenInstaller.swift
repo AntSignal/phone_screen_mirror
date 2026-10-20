@@ -122,6 +122,8 @@ struct MCPFrozenInstaller {
             try fm.moveItem(at: staging, to: dest)
         } catch {
             try? fm.removeItem(at: staging)
+            // A second install (device and sim at once) may have won the race.
+            if (try? serverFiles(in: dest)) == files { return dest }
             throw error
         }
         return dest
