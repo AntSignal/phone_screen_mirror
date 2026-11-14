@@ -200,10 +200,11 @@ final class DeviceController {
     }
 
     /// The shared tunnel was just restarted for everyone: this chain was
-    /// rebuilt too, so a give-up here no longer holds.
+    /// rebuilt too, so a give-up here no longer holds and the grace
+    /// clock starts again.
     func tunnelRestarted() {
         log(.restart, detail: "shared tunnel restarted")
-        if ladder.hardStopped { ladder.forceRetry(now: ProcessInfo.processInfo.systemUptime) }
+        ladder.noteTunnelRestart(now: ProcessInfo.processInfo.systemUptime)
     }
 
     // MARK: Device file

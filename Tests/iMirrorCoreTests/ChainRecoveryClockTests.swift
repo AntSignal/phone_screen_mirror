@@ -75,4 +75,27 @@ final class ChainRecoveryClockTests: XCTestCase {
         XCTAssertEqual(ladder.wedgeSince, 1_000)
         XCTAssertEqual(ladder.stage, 1)
     }
+
+    /// Another phone's tunnel restart also restarted this phone's chain.
+    /// Its old clock used to restart that chain again mid-boot.
+    func testATunnelRestartForAnotherPhoneStartsAFreshClock() {
+        var ladder = ChainLadderState()
+        ladder.onConnected()
+        ladder.onDown(now: 0)
+        ladder.noteTunnelRestart(now: 25)
+        XCTAssertEqual(ladder.tick(now: 31, othersHealthy: false, tunnelHasDevice: true), .wait)
+        XCTAssertEqual(ladder.tick(now: 114, othersHealthy: false, tunnelHasDevice: true), .wait)
+        XCTAssertEqual(ladder.tick(now: 115, othersHealthy: false, tunnelHasDevice: true),
+                       .restartTunnelAndChains)
+    }
+
+    /// A given-up phone still retries at once when the tunnel restarts.
+    func testATunnelRestartRetriesAGivenUpPhone() {
+        var ladder = ChainLadderState()
+        ladder.hardStop(now: 0)
+        ladder.noteTunnelRestart(now: 10)
+        XCTAssertFalse(ladder.hardStopped)
+        XCTAssertEqual(ladder.stage, 1)
+        XCTAssertEqual(ladder.wedgeSince, 10)
+    }
 }
