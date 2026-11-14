@@ -23,7 +23,7 @@ struct ClaudeCodeAdapter: MCPClientAdapter {
         guard let claude = resolveCLI() else { return .notInstalled }
         let r = run(claude, ["mcp", "get", profile.serverName])
         guard r.code == 0, r.out.contains(profile.serverName) else { return .notInstalled }
-        // Anything but the frozen copy is stale, a dev checkout included.
+        // Only the frozen copy is current, never a dev checkout.
         var stale = !r.out.contains(MCPPaths.registeredScriptURL().path)
         for (k, v) in profile.env where !r.out.contains("\(k)=\(v)") { stale = true }
         return stale ? .stale : .installed

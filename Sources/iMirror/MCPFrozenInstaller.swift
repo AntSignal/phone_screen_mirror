@@ -85,7 +85,7 @@ struct MCPFrozenInstaller {
 
         progress("Checking the new copy…")
         if let why = smokeTest(dir, hasLease: hasLease) {
-            // The fault may be the venv, so the next try reinstalls deps.
+            // Maybe the venv is at fault: reinstall deps next time.
             try? fm.removeItem(at: layout.requirementsHashFile)
             let kept = currentDirName().map { "still runs \($0)" } ?? "has nothing installed"
             return Outcome(ok: false, message: "Didn't install \(name): \(why). The MCP install \(kept).")
@@ -122,7 +122,7 @@ struct MCPFrozenInstaller {
             try fm.moveItem(at: staging, to: dest)
         } catch {
             try? fm.removeItem(at: staging)
-            // A second install (device and sim at once) may have won the race.
+            // A concurrent install (device + sim) may have won.
             if (try? serverFiles(in: dest)) == files { return dest }
             throw error
         }
@@ -178,7 +178,7 @@ struct MCPFrozenInstaller {
         let link = layout.currentLink
         if let attrs = try? fm.attributesOfItem(atPath: link.path),
            attrs[.type] as? FileAttributeType != .typeSymbolicLink {
-            // rename(2) can't replace a real directory; keep it, out of the way.
+            // rename(2) can't replace a real dir; move it aside.
             let aside = layout.mcpRoot.appendingPathComponent("current.replaced-\(Int(now().timeIntervalSince1970))")
             try fm.moveItem(at: link, to: aside)
         }

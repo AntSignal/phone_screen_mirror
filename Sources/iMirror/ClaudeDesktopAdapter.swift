@@ -32,7 +32,7 @@ struct ClaudeDesktopAdapter: MCPClientAdapter {
     func status(_ profile: MCPProfile) -> MCPClientStatus {
         guard let data = try? Data(contentsOf: configURL),
               let entry = MCPConfig.entry(data, name: profile.serverName) else { return .notInstalled }
-        // Same rule as Claude Code: only the frozen copy counts as current.
+        // As in Claude Code: only the frozen copy is current.
         var stale = entry.command != MCPPaths.venvPython.path
             || entry.args.first != MCPPaths.registeredScriptURL().path
         if MCPConfig.entryEnv(data, name: profile.serverName) != profile.env { stale = true }

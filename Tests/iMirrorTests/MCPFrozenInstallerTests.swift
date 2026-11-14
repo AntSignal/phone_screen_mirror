@@ -195,7 +195,7 @@ final class MCPFrozenInstallerTests: XCTestCase {
         XCTAssertEqual(r.code, 0, r.out)
         XCTAssertEqual(MCPFrozenInstall.leaseProtocol(fromVersionOutput: r.out), 1)
 
-        // A later copy without it removes the launcher rather than leave it dangling.
+        // A copy without it removes the launcher.
         try fm.removeItem(at: src.appendingPathComponent("devicelease.py"))
         XCTAssertTrue(i.install(from: src).ok)
         XCTAssertFalse(fm.fileExists(atPath: layout.leaseLauncher.path))
@@ -240,7 +240,7 @@ final class MCPFrozenInstallerTests: XCTestCase {
             XCTAssertTrue(i.install(from: src).ok)
             names.append(try XCTUnwrap(i.currentDirName()))
         }
-        // Age them a day apart, oldest first, then roll `current` back to the oldest.
+        // Age them a day apart; point current at the oldest.
         let t0 = Date()
         for (k, name) in names.enumerated() {
             try fm.setAttributes([.modificationDate: t0 - Double(5 - k) * 86400],
