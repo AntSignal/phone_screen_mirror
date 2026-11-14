@@ -121,12 +121,19 @@ public struct ChainLadderState: Equatable, Sendable {
     /// When this outage's grace clock started. Nil = nothing to measure yet.
     public private(set) var wedgeSince: TimeInterval?
     public private(set) var stage = 0
-    /// Set on give-up: no automatic retries until the user asks (forceRetry).
+    /// Set on give-up. A phone that never connected waits for the user
+    /// (forceRetry); one that did retries itself after `autoRetrySec`.
     public private(set) var hardStopped = false
+    public private(set) var hardStoppedAt: TimeInterval?
     /// Once WDA has been up, an outage is a mid-session wedge: it gets the
     /// short grace, and its clock starts when health drops (a hung runwda
     /// never respawns, so nothing else would start it).
     public private(set) var hadSuccessfulConnection = false
+
+    /// How long a give-up lasts for a phone that has worked before. Its outage
+    /// is usually a USB reset or a crashed runner, both gone by then, and an
+    /// agent driving it has nobody to tap retry.
+    public static let autoRetrySec: TimeInterval = 120
 
     public init() {}
 
@@ -135,6 +142,7 @@ public struct ChainLadderState: Equatable, Sendable {
         wedgeSince = nil
         stage = 0
         hardStopped = false
+        hardStoppedAt = nil
         hadSuccessfulConnection = true
     }
 
@@ -154,24 +162,37 @@ public struct ChainLadderState: Equatable, Sendable {
         wedgeSince = nil
         stage = 0
         hardStopped = false
+        hardStoppedAt = nil
     }
 
     /// The user tapped retry after a give-up.
     public mutating func forceRetry(now: TimeInterval) {
         hardStopped = false
+        hardStoppedAt = nil
         stage = 0
         wedgeSince = now
     }
 
-    /// Something outside the ladder (the MJPEG watchdog) restarted the chain.
+    /// Something outside the ladder (a USB-reset restart, the MJPEG
+    /// watchdog) restarted the chain. The new runner needs the full boot
+    /// grace; stage 0's 30 s would restart it again mid-boot.
     public mutating func noteOutsideRestart() { stage = max(stage, 1) }
 
-    public mutating func hardStop() { hardStopped = true }
+    public mutating func hardStop(now: TimeInterval) {
+        hardStopped = true
+        hardStoppedAt = now
+    }
 
     /// Decide what to do now. Call only while this phone's health is down.
     public mutating func tick(now: TimeInterval, othersHealthy: Bool,
                               tunnelHasDevice: Bool) -> DeviceRecoveryAction {
-        guard !hardStopped, let since = wedgeSince else { return .wait }
+        if hardStopped {
+            guard hadSuccessfulConnection, let stoppedAt = hardStoppedAt,
+                  now - stoppedAt >= Self.autoRetrySec else { return .wait }
+            forceRetry(now: now)
+            return .restartDeviceChain
+        }
+        guard let since = wedgeSince else { return .wait }
         let grace = chainRecoveryGraceSec(stage: stage, postConnectionOutage: hadSuccessfulConnection)
         let action = nextDeviceRecoveryAction(downForSec: now - since, graceSec: grace, stage: stage,
                                               othersHealthy: othersHealthy,
@@ -180,7 +201,7 @@ public struct ChainLadderState: Equatable, Sendable {
         case .wait: break
         case .restartDeviceChain: stage = 1
         case .restartTunnelAndChains: stage = 2
-        case .giveUp: hardStopped = true
+        case .giveUp: hardStop(now: now)
         }
         return action
     }
