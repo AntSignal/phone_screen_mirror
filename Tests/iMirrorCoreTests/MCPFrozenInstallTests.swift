@@ -22,7 +22,7 @@ final class MCPFrozenInstallTests: XCTestCase {
         XCTAssertEqual(MCPFrozenInstall.contentHash(a).count, 64)
         XCTAssertNotEqual(MCPFrozenInstall.contentHash(a),
                           MCPFrozenInstall.contentHash(["a.py": Data("x".utf8), "b.py": Data("z".utf8)]))
-        // A byte moved across a file boundary is a different set.
+        // Moving a byte between files changes the hash.
         XCTAssertNotEqual(MCPFrozenInstall.contentHash(["a.py": Data("xy".utf8), "b.py": Data()]),
                           MCPFrozenInstall.contentHash(["a.py": Data("x".utf8), "b.py": Data("y".utf8)]))
         // So is a renamed file.
@@ -87,7 +87,7 @@ final class MCPFrozenInstallTests: XCTestCase {
             ("1.0.0-00000007", 10.0), ("not-a-copy", 100.0),
         ].map { MCPFrozenInstall.InstalledCopy(name: $0.0, installedAt: now - $0.1 * day) }
         let pruned = MCPFrozenInstall.copiesToPrune(copies, current: "1.0.0-00000002", now: now)
-        // 7, 6, 5 are the newest; 2 is current; the rest are old.
+        // Newest three: 7, 6, 5. Current: 2. Rest: old.
         XCTAssertEqual(Set(pruned), ["1.0.0-00000001", "1.0.0-00000003", "1.0.0-00000004"])
     }
 
