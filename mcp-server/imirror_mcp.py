@@ -187,7 +187,7 @@ class _Target:
     # always did) while calls to different phones run side by side. Re-entrant
     # so ios_run_sequence's steps can run inside the sequence's own hold.
     call_lock: Any = dataclasses.field(default_factory=threading.RLock)
-    # When WDA last said this server's session was gone (see _lost_session).
+    # When WDA said this server's session was gone.
     session_losses: list[float] = dataclasses.field(default_factory=list)
     # How this server got its sessions, shown by ios_devices.
     session_stats: dict[str, int] = dataclasses.field(
@@ -508,7 +508,7 @@ def _resolve(query: str = "", prefer: str | None = None) -> _Target:
         t = targets[0]
         env = os.environ.get("IMIRROR_DEFAULT_DEVICE", "").strip()
         if not q and mode == "fallback" and env and not _match_one(env, t):
-            # run.sh pins each agent to one phone. Here :8100 may be another.
+            # A pinned agent must not drive whatever answers :8100.
             raise MCPToolError(
                 f"IMIRROR_DEFAULT_DEVICE={env!r} pins this server to one phone, but "
                 f"it is not reading iMirror's device file ({_REGISTRY.problem}). "
@@ -1079,7 +1079,7 @@ def _create_session(t: _Target) -> str:
     return sid
 
 
-# Two lost sessions this close together mean something keeps replacing ours.
+# Two losses this close together: something keeps replacing ours.
 _SESSION_CONTEST_WINDOW_S = 60.0
 
 
