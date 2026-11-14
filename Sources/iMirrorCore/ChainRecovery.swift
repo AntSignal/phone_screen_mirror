@@ -224,6 +224,14 @@ public struct ChainLadderState: Equatable, Sendable {
         return autoRetryBackoffSec[i]
     }
 
+    /// After a give-up, the ladder may restart the shared tunnel only while
+    /// no other phone is up. Otherwise a phone that keeps failing where the
+    /// tunnel can't reach it would cost a working phone its WDA every few
+    /// minutes, for good. The first climb, before any give-up, still may.
+    public static func retryMayRestartTunnel(giveUps: Int, othersHealthy: Bool) -> Bool {
+        giveUps == 0 || !othersHealthy
+    }
+
     /// When the ladder will retry by itself; nil unless it has given up.
     public var nextAutoRetryAt: TimeInterval? {
         guard hardStopped, let at = hardStoppedAt else { return nil }
@@ -293,9 +301,13 @@ public struct ChainLadderState: Equatable, Sendable {
         }
         guard let since = wedgeSince else { return .wait }
         let grace = chainRecoveryGraceSec(stage: stage, postConnectionOutage: hadSuccessfulConnection)
-        let action = nextDeviceRecoveryAction(downForSec: now - since, graceSec: grace, stage: stage,
+        var action = nextDeviceRecoveryAction(downForSec: now - since, graceSec: grace, stage: stage,
                                               othersHealthy: othersHealthy,
                                               tunnelHasDevice: tunnelHasDevice)
+        if action == .restartTunnelAndChains,
+           !Self.retryMayRestartTunnel(giveUps: giveUps, othersHealthy: othersHealthy) {
+            action = .giveUp
+        }
         switch action {
         case .wait: break
         case .restartDeviceChain: stage = 1

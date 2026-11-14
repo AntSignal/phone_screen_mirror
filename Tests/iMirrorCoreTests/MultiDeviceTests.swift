@@ -343,6 +343,32 @@ final class DeviceRecoveryTests: XCTestCase {
         XCTAssertEqual(ladder.tick(now: 390, othersHealthy: false, tunnelHasDevice: true), .autoRetry)
     }
 
+    /// A phone the tunnel can't reach used to restart the shared tunnel on
+    /// every auto retry, knocking a working phone's WDA down for good.
+    func testAnAutoRetryNeverRestartsTheTunnelUnderAWorkingPhone() {
+        var ladder = ChainLadderState()
+        ladder.onRunwdaStarted(now: 0)
+        // The first climb may still restart the tunnel.
+        XCTAssertEqual(ladder.tick(now: 90, othersHealthy: true, tunnelHasDevice: false), .restartTunnelAndChains)
+        ladder.onRunwdaStarted(now: 100)
+        XCTAssertEqual(ladder.tick(now: 190, othersHealthy: true, tunnelHasDevice: false), .giveUp)
+        XCTAssertEqual(ladder.tick(now: 310, othersHealthy: true, tunnelHasDevice: false), .autoRetry)
+        XCTAssertFalse(ChainLadderState.retryMayRestartTunnel(giveUps: ladder.giveUps, othersHealthy: true))
+        ladder.onRunwdaStarted(now: 315)
+        XCTAssertEqual(ladder.tick(now: 405, othersHealthy: true, tunnelHasDevice: false), .giveUp)
+        XCTAssertEqual(ladder.giveUps, 2)
+    }
+
+    func testAnAutoRetryMayRestartTheTunnelWhenNoOtherPhoneIsUp() {
+        XCTAssertTrue(ChainLadderState.retryMayRestartTunnel(giveUps: 0, othersHealthy: true))
+        XCTAssertTrue(ChainLadderState.retryMayRestartTunnel(giveUps: 3, othersHealthy: false))
+        var ladder = ChainLadderState()
+        ladder.hardStop(now: 0)
+        XCTAssertEqual(ladder.tick(now: 120, othersHealthy: false, tunnelHasDevice: false), .autoRetry)
+        ladder.onRunwdaStarted(now: 125)
+        XCTAssertEqual(ladder.tick(now: 215, othersHealthy: false, tunnelHasDevice: false), .restartTunnelAndChains)
+    }
+
     func testTheBackoffTable() {
         XCTAssertEqual(ChainLadderState.autoRetryDelay(afterGiveUps: 1), 120)
         XCTAssertEqual(ChainLadderState.autoRetryDelay(afterGiveUps: 2), 300)

@@ -268,7 +268,8 @@ final class DeviceController {
         case .autoRetry:
             unrecoverable = false
             status("Retrying WebDriverAgent on \(alias)…")
-            restartOwnOrTunnel()
+            restartOwnOrTunnel(tunnelAllowed: ChainLadderState.retryMayRestartTunnel(
+                giveUps: ladder.giveUps, othersHealthy: othersHealthy()))
         case .restartDeviceChain:
             // Don't reseed the clock here: onRunwdaStarted does once the new
             // runwda spawns, and a chain that never gets that far still ages
@@ -291,8 +292,8 @@ final class DeviceController {
         }
     }
 
-    private func restartOwnOrTunnel() {
-        if tunnelHasDevice() || !requestTunnelRestart() { chain?.restart() }
+    private func restartOwnOrTunnel(tunnelAllowed: Bool = true) {
+        if tunnelHasDevice() || !tunnelAllowed || !requestTunnelRestart() { chain?.restart() }
         onChange?()
     }
 

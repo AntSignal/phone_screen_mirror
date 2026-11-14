@@ -251,7 +251,8 @@ failed health probes in a row, and a probe that times out while other requests
 failed. If WDA stays down, a ladder restarts that phone's own chain first, then
 the shared tunnel. If it still won't come up, the app stops the chain and
 retries by itself after 2 min, then 5 min, then every 10 min; tapping the WDA
-dot retries at once. A separate MJPEG no-frame watchdog covers the case where
+dot retries at once. Those retries never restart the shared tunnel while
+another phone is working. A separate MJPEG no-frame watchdog covers the case where
 WDA is healthy but no video frames arrive: it bounces the MJPEG forward (at
 most once a minute) and never restarts a WDA that still answers `/status`. Before each bring-up the
 app also sweeps any stray go-ios children left by a previously crashed
