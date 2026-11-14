@@ -139,14 +139,23 @@ final class DeviceController {
     }
 
     /// Settings → Restart: this phone's chain only.
-    func restartChain() {
-        log(.restart, detail: "user restart")
+    func restartChain(detail: String = "user restart") {
+        log(.restart, detail: detail)
         forgetRunwdaClass()
         ladder.forceRetry(now: ProcessInfo.processInfo.systemUptime)
         unrecoverable = false
         status("Restarting \(alias)'s connection…")
         chain?.restart()
         onChange?()
+    }
+
+    /// A client's restart request (B1c), already through the cooldown. Acts
+    /// like Settings → Restart: this phone's chain only, never the shared
+    /// tunnel, so one session can't take every phone down. Never types a passcode.
+    func restartRequested(_ outcome: RestartRequestOutcome) {
+        log(.request, detail: outcome.rawValue)
+        guard outcome == .accepted else { return }
+        restartChain(detail: "request")
     }
 
     func bounceMJPEGForward() { chain?.bounceMJPEGForward() }
