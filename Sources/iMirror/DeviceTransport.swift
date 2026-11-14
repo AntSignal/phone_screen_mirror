@@ -321,6 +321,10 @@ final class DeviceChain {
 
     /// Requests waiting on this phone's WDA through its relay.
     var relayInFlight: Int { relay.inFlight }
+    var relayRequestsSeen: Int { relay.requestsSeen }
+    /// Readiness checks sent through the relay; they are not client traffic.
+    var readinessRequestsSent: Int { holdLock.lock(); defer { holdLock.unlock() }; return readinessSent }
+    private var readinessSent = 0
 
     /// Tunnel route → runner check/install → runwda + forwards. The install and
     /// `apps --list` go through the tunnel on iOS 17+, so they must wait for it.
@@ -376,6 +380,7 @@ final class DeviceChain {
 
     private func wdaReadyThroughRelay() -> Bool {
         guard let url = URL(string: "\(slot.relayURL)/status") else { return false }
+        holdLock.lock(); readinessSent += 1; holdLock.unlock()
         let (code, data) = loopbackGET(url, session: readinessSession, timeout: 2)
         guard let code, (200..<300).contains(code), let data,
               let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else { return false }

@@ -25,6 +25,8 @@ final class ChainManager {
     private lazy var requests = RestartRequestWatcher(
         dir: registry.url.deletingLastPathComponent().appendingPathComponent("requests", isDirectory: true))
     private var requestGate = RestartRequestGate()
+    private let sleepAssertion = SleepAssertion()
+    private var powerTimer: Timer?
 
     /// Attached phones with a chain, by slot.
     private(set) var controllers: [DeviceController] = []
@@ -77,16 +79,30 @@ final class ChainManager {
         watchPower()
     }
 
-    /// Log Mac sleep and wake per phone. B1d will act on them; for now they
-    /// only explain the outage that follows a lid close.
+    /// Sleep marks every phone mac_asleep; wake restarts every chain at
+    /// once, since sleep dropped their USB.
     private func watchPower() {
         let nc = NSWorkspace.shared.notificationCenter
         nc.addObserver(forName: NSWorkspace.willSleepNotification, object: nil, queue: .main) { [weak self] _ in
-            self?.controllers.forEach { $0.logPower(.sleep) }
+            guard let self else { return }
+            self.controllers.forEach { $0.macWillSleep() }
+            // Write now: the Mac may sleep within 0.25 s.
+            if self.running, self.canSelfManage { self.registry.write(self.snapshot()) }
         }
         nc.addObserver(forName: NSWorkspace.didWakeNotification, object: nil, queue: .main) { [weak self] _ in
-            self?.controllers.forEach { $0.logPower(.wake) }
+            self?.controllers.forEach { $0.macDidWake() }
+            self?.updateSleepAssertion()
         }
+    }
+
+    /// Hold the Mac awake only while a client drives a phone or one is
+    /// recovering (iMirrorCore/PowerPolicy.swift).
+    private func updateSleepAssertion() {
+        let now = ProcessInfo.processInfo.systemUptime
+        let lastTraffic = controllers.compactMap { $0.sampleTraffic(now: now) }.max()
+        let recovering = controllers.contains { SleepPolicy.isRecovering($0.reason) }
+        sleepAssertion.set(SleepPolicy.keepAwake(automationOn: running, lastTrafficAt: lastTraffic,
+                                                 recovering: recovering, now: now))
     }
 
     /// True if the go-ios binary was found, so the app runs WDA itself. If
@@ -126,6 +142,9 @@ final class ChainManager {
                 self.tunnel?.start()
                 self.watchUSB()
                 self.watchRequests()
+                let power = Timer(timeInterval: 15, repeats: true) { [weak self] _ in self?.updateSleepAssertion() }
+                RunLoop.main.add(power, forMode: .common)
+                self.powerTimer = power
                 self.poll()
                 let t = Timer(timeInterval: 3, repeats: true) { [weak self] _ in self?.poll() }
                 RunLoop.main.add(t, forMode: .common)
@@ -142,6 +161,9 @@ final class ChainManager {
         pollTimer = nil
         usbWatcher.stop()
         requests.stop()
+        powerTimer?.invalidate()
+        powerTimer = nil
+        sleepAssertion.set(false)
         for c in controllers { c.stop() }
         controllers = []
         problems = [:]

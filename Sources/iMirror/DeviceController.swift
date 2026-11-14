@@ -34,8 +34,9 @@ final class DeviceController {
     private(set) var lastError: String?
     /// A USB reset restarted the chain and WDA has not answered since.
     private var usbResetPending = false
-    /// Set by the sleep/wake hooks (B1d); published as mac_asleep.
-    var macAsleep = false { didSet { if macAsleep != oldValue { onChange?() } } }
+    /// Between the Mac's willSleep and didWake; published as mac_asleep.
+    private(set) var macAsleep = false { didSet { if macAsleep != oldValue { onChange?() } } }
+    private var traffic = RelayTrafficMeter()
     private var published = PublishedState()
     /// What runwda last said needs a person; cleared once WDA answers.
     private(set) var runwdaClass: RunwdaLogClass?
@@ -243,8 +244,30 @@ final class DeviceController {
             chainEpoch: chain?.epoch, lastError: lastError, nextRetryAt: retryAt)
     }
 
-    /// Mac-wide sleep or wake, logged per phone so every line has one.
-    func logPower(_ kind: DeviceEventKind) { log(kind) }
+    // MARK: Mac sleep and wake (rules in iMirrorCore/PowerPolicy.swift)
+
+    /// The Mac is going to sleep: its USB goes with it.
+    func macWillSleep() {
+        log(.sleep)
+        macAsleep = true
+    }
+
+    /// Sleep dropped USB, so this chain is dead even if a probe hasn't
+    /// failed yet. Rebuild now rather than wait out the ladder's grace.
+    func macDidWake() {
+        log(.wake)
+        macAsleep = false
+        guard running else { return }
+        restartChain(detail: "mac woke")
+    }
+
+    /// Uptime of the last client request through this phone's relay.
+    func sampleTraffic(now: TimeInterval) -> TimeInterval? {
+        guard let chain else { return nil }
+        traffic.sample(relayRequests: chain.relayRequestsSeen,
+                       ownRequests: wda.requestsSent + chain.readinessRequestsSent, now: now)
+        return traffic.lastTrafficAt
+    }
 
     private func log(_ kind: DeviceEventKind, from: String? = nil, to: String? = nil,
                      reason: DeviceReason? = nil, detail: String? = nil, expected: Bool? = nil) {

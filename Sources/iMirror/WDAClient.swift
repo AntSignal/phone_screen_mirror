@@ -261,9 +261,16 @@ final class WDAClient {
 
     // MARK: HTTP core (fresh connection per request)
 
+    private let sentLock = NSLock()
+    private var _requestsSent = 0
+    /// Requests this client has sent. Counted before sending, so the relay
+    /// never sees one of ours that isn't counted yet (RelayTrafficMeter).
+    var requestsSent: Int { sentLock.lock(); defer { sentLock.unlock() }; return _requestsSent }
+
     private func send(_ method: String, _ path: String, _ body: [String: Any]?,
                       timeout: TimeInterval = 8,
                       completion: @escaping (Int?, [String: Any]?, Error?) -> Void) {
+        sentLock.lock(); _requestsSent += 1; sentLock.unlock()
         var req = URLRequest(url: base.appendingPathComponent(path))
         req.httpMethod = method
         if let body {

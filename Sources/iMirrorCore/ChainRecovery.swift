@@ -140,8 +140,10 @@ public struct InFlightRequests: Equatable, Sendable {
     public init() {}
 
     public var count: Int { waiting.count }
+    /// Requests ever started; the sleep policy tells clients' from ours.
+    public private(set) var started = 0
 
-    public mutating func clientSent(_ id: Int) { waiting.insert(id) }
+    public mutating func clientSent(_ id: Int) { if waiting.insert(id).inserted { started += 1 } }
     public mutating func backendSent(_ id: Int) { waiting.remove(id) }
     public mutating func closed(_ id: Int) { waiting.remove(id) }
 }
