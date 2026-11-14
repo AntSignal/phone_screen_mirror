@@ -165,6 +165,20 @@ final class ManagedProcessTests: XCTestCase {
         wait(for: [expectation], timeout: 3)
     }
 
+    /// A runner respawn resets the phone's USB like our first start does,
+    /// so the USB reset rules must hear about respawns too.
+    func testOnSpawnFiresForEveryRespawn() {
+        let process = ManagedProcess(binary: URL(fileURLWithPath: "/bin/sh"), args: ["-c", "exit 0"],
+                                     label: "test-onspawn", restartDelay: 0.05, workDir: tempDir)
+        mp = process
+        let spawned = expectation(description: "first spawn and two respawns")
+        spawned.expectedFulfillmentCount = 3
+        spawned.assertForOverFulfill = false
+        process.onSpawn = { spawned.fulfill() }
+        process.start()
+        wait(for: [spawned], timeout: 5)
+    }
+
     // MARK: - helpers
 
     private func waitForPid(_ process: ManagedProcess, timeout: TimeInterval = 2) -> pid_t? {

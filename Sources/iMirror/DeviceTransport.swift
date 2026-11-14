@@ -131,6 +131,8 @@ final class TunnelSupervisor {
     private let bin: URL
     private let workDir: URL
     private var tunnel: ManagedProcess?
+    /// Any queue, after each tunnel spawn: every phone's USB resets.
+    var onSpawn: (() -> Void)?
     private let session: URLSession = {
         let cfg = URLSessionConfiguration.ephemeral
         cfg.waitsForConnectivity = false
@@ -146,6 +148,7 @@ final class TunnelSupervisor {
         guard tunnel == nil else { return }
         let t = ManagedProcess(binary: bin, args: GoIOS.tunnelArgs, label: "tunnel",
                                restartDelay: 15, workDir: workDir)
+        t.onSpawn = onSpawn
         tunnel = t
         t.start()
     }
@@ -210,6 +213,9 @@ final class DeviceChain {
     /// Main thread, once per bring-up: runwda has just been spawned — the point
     /// the recovery ladder's boot grace starts counting from.
     var onRunwdaStarted: (() -> Void)?
+    /// Main thread. We started or stopped this phone's runner, which resets
+    /// its USB; that reset is ours, not a fault (USBResetWatch).
+    var onOwnUSBChange: (() -> Void)?
 
     // Bumped by every start/stop/restart; a delayed bring-up step aborts if it
     // moved, so a stop landing mid-bring-up can't spawn orphans afterwards.
@@ -239,6 +245,7 @@ final class DeviceChain {
             catch { NSLog("iMirror: relay :\(slot.relayPort) failed: \(error.localizedDescription)") }
         }
         generation += 1
+        onOwnUSBChange?()
         bringUp(generation: generation)
     }
 
@@ -252,6 +259,7 @@ final class DeviceChain {
     /// Stop the children but keep the relay listening (the give-up state).
     func stopChildren() {
         generation += 1
+        onOwnUSBChange?()
         forward?.stop(); mjpegForward?.stop(); wda?.stop()
         forward = nil; mjpegForward = nil; wda = nil
     }
@@ -307,6 +315,10 @@ final class DeviceChain {
             readyWithin: 40, readinessPollInterval: 2)
         wda.onGaveUp = { [weak self] _ in
             DispatchQueue.main.async { self?.onWDAUnrecoverable?() }
+        }
+        // Respawns too: each runner start resets the phone's USB.
+        wda.onSpawn = { [weak self] in
+            DispatchQueue.main.async { self?.onOwnUSBChange?() }
         }
         self.wda = wda
         wda.start()

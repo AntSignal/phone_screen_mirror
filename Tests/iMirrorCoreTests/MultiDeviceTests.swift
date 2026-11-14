@@ -321,6 +321,113 @@ final class DeviceRecoveryTests: XCTestCase {
     }
 }
 
+/// 496aaeb restarted a chain on every reset, including the ones our own
+/// tunnel and runner starts cause, which could loop.
+final class USBResetWatchTests: XCTestCase {
+    /// A phone whose WDA answered, last touched by us at t=0.
+    private func upPhone() -> USBResetWatch {
+        var w = USBResetWatch()
+        w.noteOwnUSBChange(now: 0)
+        XCTAssertFalse(w.onProbe(answered: true, now: 30))
+        return w
+    }
+
+    func testAResetSoonAfterOurOwnStartIsIgnored() {
+        var w = upPhone()
+        w.noteOwnUSBChange(now: 100)                 // e.g. the tunnel respawned
+        XCTAssertFalse(w.onProbe(answered: true, now: 101))
+        XCTAssertFalse(w.onDetached(now: 104))       // 4 s later: ours
+        XCTAssertFalse(w.onReattached(now: 105))
+        XCTAssertFalse(w.onProbe(answered: false, now: 108))
+        XCTAssertFalse(w.suspect)
+    }
+
+    func testAResetWhileStillBootingIsLeftToTheLadder() {
+        var w = USBResetWatch()
+        w.noteOwnUSBChange(now: 0)                   // runwda spawned
+        XCTAssertFalse(w.onDetached(now: 25))        // WDA never answered yet
+        XCTAssertFalse(w.onProbe(answered: false, now: 30))
+    }
+
+    func testAResetWithWDAStillAnsweringRestartsNothing() {
+        var w = upPhone()
+        XCTAssertTrue(w.onDetached(now: 100))
+        XCTAssertTrue(w.onReattached(now: 101))      // probe now
+        XCTAssertFalse(w.onProbe(answered: true, now: 103))
+        XCTAssertFalse(w.suspect)
+        XCTAssertFalse(w.onProbe(answered: false, now: 106))
+    }
+
+    func testAResetThatKilledWDARestartsOnceTheProbeFails() {
+        var w = upPhone()
+        w.onDetached(now: 100)
+        _ = w.onReattached(now: 101)
+        XCTAssertTrue(w.onProbe(answered: false, now: 103))
+        XCTAssertFalse(w.suspect)
+        XCTAssertEqual(w.lastOwnChangeAt, 103)       // the restart is ours
+    }
+
+    func testAProbeWhileThePhoneIsAwayDecidesNothing() {
+        var w = upPhone()
+        w.onDetached(now: 100)
+        XCTAssertFalse(w.onProbe(answered: false, now: 102))
+        XCTAssertTrue(w.suspect)
+        // Gone too long to wait for: the next failure decides.
+        XCTAssertTrue(w.onProbe(answered: false, now: 115))
+    }
+
+    func testTheResetPairCountsAsOne() {
+        var w = upPhone()
+        w.onDetached(now: 100)
+        _ = w.onReattached(now: 101)
+        w.onDetached(now: 103)                       // second half of the pair
+        XCTAssertEqual(w.absentSince, 103)
+        XCTAssertFalse(w.onProbe(answered: false, now: 103.5))
+        _ = w.onReattached(now: 104)
+        XCTAssertTrue(w.onProbe(answered: false, now: 106))
+    }
+
+    func testTheRestartsOwnResetDoesNotLoop() {
+        var w = upPhone()
+        w.onDetached(now: 100)
+        _ = w.onReattached(now: 101)
+        XCTAssertTrue(w.onProbe(answered: false, now: 103))
+        // The restart's runner start resets USB again.
+        w.noteOwnUSBChange(now: 110)
+        XCTAssertFalse(w.onDetached(now: 114))
+        XCTAssertFalse(w.onProbe(answered: false, now: 117))
+    }
+
+    func testAtMostOneResetRestartPer30Seconds() {
+        var w = upPhone()
+        w.onDetached(now: 100)
+        _ = w.onReattached(now: 101)
+        XCTAssertTrue(w.onProbe(answered: false, now: 102))
+        XCTAssertFalse(w.onProbe(answered: true, now: 120))   // came back up
+        XCTAssertTrue(w.onDetached(now: 125))
+        _ = w.onReattached(now: 126)
+        XCTAssertFalse(w.onProbe(answered: false, now: 128))  // cooldown
+        XCTAssertTrue(w.suspect)                              // still pending
+        XCTAssertTrue(w.onProbe(answered: false, now: 132))
+    }
+
+    func testOurOwnStopClearsASuspect() {
+        var w = upPhone()
+        w.onDetached(now: 100)
+        w.noteOwnUSBChange(now: 101)                 // e.g. the ladder gave up
+        XCTAssertFalse(w.suspect)
+        XCTAssertFalse(w.onProbe(answered: false, now: 120))
+    }
+
+    func testUSBSerialMapsToTheUDID() {
+        XCTAssertTrue(usbSerial("000081400006423002D3401C", matchesUDID: phone16e))
+        XCTAssertFalse(usbSerial("000081400006423002D3401C", matchesUDID: phone17))
+        let legacy = "a1b2c3d4e5f60718293a4b5c6d7e8f9012345678"
+        XCTAssertTrue(usbSerial(legacy, matchesUDID: legacy.uppercased()))
+        XCTAssertFalse(usbSerial("", matchesUDID: ""))
+    }
+}
+
 final class ActiveSessionTests: XCTestCase {
     func testReadsTheTopLevelSessionId() {
         XCTAssertEqual(WDAParse.activeSessionId(["sessionId": "S1", "value": ["ready": true]]), "S1")

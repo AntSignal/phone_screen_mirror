@@ -85,6 +85,9 @@ final class ManagedProcess {
     /// Transport surface a terminal "this device/OS may not support WDA" state
     /// instead of the channel silently looping on red.
     var onGaveUp: ((String) -> Void)?
+    /// Called on any queue after every spawn, respawns included. Set it
+    /// before start(). A runner or tunnel start resets the phone's USB.
+    var onSpawn: (() -> Void)?
 
     // Readiness deadline: a wedged `runwda` never exits, so the exit-triggered
     // respawn above never fires for it. If a readiness check is supplied, poll it
@@ -295,6 +298,7 @@ final class ManagedProcess {
             readySeen = false
             lock.unlock()
             NSLog("iMirror: started \(label) (pid \(p.processIdentifier))")
+            onSpawn?()
             if let readinessCheck, readyWithin > 0 {
                 scheduleReadinessPoll(process: p, generation: myGeneration,
                                       start: ProcessInfo.processInfo.systemUptime, check: readinessCheck)

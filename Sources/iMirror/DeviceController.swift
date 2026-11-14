@@ -31,6 +31,7 @@ final class DeviceController {
     /// The last thing worth telling a user about this phone.
     private(set) var detail: String?
     private(set) var ladder = ChainLadderState()
+    private var resetWatch = USBResetWatch()
 
     private var probing = false
     private var creatingSession = false
@@ -67,6 +68,7 @@ final class DeviceController {
             self?.ladder.onRunwdaStarted(now: ProcessInfo.processInfo.systemUptime)
         }
         chain?.onRunnerInstall = { [weak self] event in self?.runnerInstall(event) }
+        chain?.onOwnUSBChange = { [weak self] in self?.noteOwnUSBChange() }
         chain?.onWDAUnrecoverable = { [weak self] in
             guard let self, self.running, self.health == .down else { return }
             self.unrecoverable = true
@@ -135,10 +137,31 @@ final class DeviceController {
         chain?.restart()
     }
 
-    /// The phone dropped off USB for a moment, and its forwards died with it.
-    /// Rebuild now instead of waiting out the watchdog's grace.
-    func restartAfterUSBReset() {
-        guard running else { return }
+    // MARK: USB resets (rules in iMirrorCore/USBReset.swift)
+
+    /// We changed this phone's USB session (the shared tunnel started).
+    func noteOwnUSBChange() {
+        resetWatch.noteOwnUSBChange(now: ProcessInfo.processInfo.systemUptime)
+    }
+
+    /// IOKit or the poll saw the phone leave USB.
+    func usbDetached() {
+        guard running, chain != nil else { return }
+        if resetWatch.onDetached(now: ProcessInfo.processInfo.systemUptime) {
+            NSLog("iMirror: \(alias) left USB — checking WebDriverAgent once it is back")
+        }
+    }
+
+    /// The phone is back. If its reset is suspect, probe soon: the probe
+    /// decides whether the reset killed the forwards.
+    func usbReattached() {
+        guard running, resetWatch.onReattached(now: ProcessInfo.processInfo.systemUptime) else { return }
+        // usbmux needs a moment to list the phone again.
+        DispatchQueue.main.asyncAfter(deadline: .now() + 2) { [weak self] in self?.probeNow() }
+    }
+
+    /// A reset killed WDA: rebuild now instead of waiting out the ladder's grace.
+    private func restartAfterUSBReset() {
         status("\(alias)'s USB connection reset — reconnecting…")
         chain?.restart()
         onChange?()
@@ -187,6 +210,11 @@ final class DeviceController {
             case .alive: self.setHealth(.connected)
             case .down: self.setHealth(.down)
             case .needsSession: self.createSession()
+            }
+            if self.chain != nil, self.resetWatch.onProbe(answered: result != .down,
+                                                          now: ProcessInfo.processInfo.systemUptime) {
+                self.restartAfterUSBReset()
+                return
             }
             self.runWatchdog()
         }

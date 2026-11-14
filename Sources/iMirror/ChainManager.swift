@@ -20,6 +20,7 @@ final class ChainManager {
     private let workDir: URL
     private let tunnel: TunnelSupervisor?
     private let registry = DeviceRegistryWriter()
+    private let usbWatcher = USBDeviceWatcher()
 
     /// Attached phones with a chain, by slot.
     private(set) var controllers: [DeviceController] = []
@@ -65,6 +66,10 @@ final class ChainManager {
         } else {
             table = SlotTable()
         }
+        // Tunnel starts reset every phone's USB; those resets are ours.
+        tunnel?.onSpawn = { [weak self] in
+            DispatchQueue.main.async { self?.controllers.forEach { $0.noteOwnUSBChange() } }
+        }
     }
 
     /// True if the go-ios binary was found, so the app runs WDA itself. If
@@ -102,6 +107,7 @@ final class ChainManager {
             DispatchQueue.main.async {
                 guard let self, self.running else { return }
                 self.tunnel?.start()
+                self.watchUSB()
                 self.poll()
                 let t = Timer(timeInterval: 3, repeats: true) { [weak self] _ in self?.poll() }
                 RunLoop.main.add(t, forMode: .common)
@@ -116,6 +122,7 @@ final class ChainManager {
         running = false
         pollTimer?.invalidate()
         pollTimer = nil
+        usbWatcher.stop()
         for c in controllers { c.stop() }
         controllers = []
         problems = [:]
@@ -154,6 +161,7 @@ final class ChainManager {
         // Gone phones: two misses in a row, so one flaky poll doesn't bounce a chain.
         for c in controllers where present[c.udid] == nil {
             missingPolls[c.udid, default: 0] += 1
+            if missingPolls[c.udid] == 1 { c.usbDetached() }   // the fallback signal
             if missingPolls[c.udid, default: 0] >= 2 {
                 NSLog("iMirror: \(c.alias) (\(c.udid)) detached — stopping its chain")
                 c.stop()
@@ -170,9 +178,9 @@ final class ChainManager {
             missingPolls[udid] = nil
             if let c = controller(udid) {
                 c.attached = device                   // e.g. an iOS update
-                // Gone for one poll, then back: its USB reset (the 16e does
-                // this under load), which kills the chain's forwards.
-                if missedAPoll { c.restartAfterUSBReset() }
+                // Gone for one poll, then back: a USB reset (the 16e does
+                // this under load), which may have killed the forwards.
+                if missedAPoll { c.usbReattached() }
                 continue
             }
             // New (or still-blocked) phone: try to give it its slot.
@@ -205,6 +213,17 @@ final class ChainManager {
             onDevicesChanged?()
             scheduleWrite()
         }
+    }
+
+    /// IOKit's view of resets: faster than the poll, which stays as a fallback.
+    private func watchUSB() {
+        usbWatcher.onDetached = { [weak self] serial in self?.usbController(serial)?.usbDetached() }
+        usbWatcher.onAttached = { [weak self] serial in self?.usbController(serial)?.usbReattached() }
+        usbWatcher.start()
+    }
+
+    private func usbController(_ serial: String) -> DeviceController? {
+        controllers.first { usbSerial(serial, matchesUDID: $0.udid) }
     }
 
     private func makeController(_ device: AttachedDevice, slot: PortSlot, alias: String,
