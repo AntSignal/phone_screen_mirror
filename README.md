@@ -125,8 +125,8 @@ exact commits and scan results:
 
 ```bash
 mkdir -p tools && cd tools
-git clone --depth 1 --branch v1.1.0 https://github.com/danielpaulus/go-ios
-git clone --depth 1 --branch v9.9.0 https://github.com/appium/WebDriverAgent
+git clone --depth 1 --branch v1.3.2 https://github.com/danielpaulus/go-ios
+git clone --depth 1 --branch v16.14.2 https://github.com/appium/WebDriverAgent
 
 # (optional but recommended) scan before building:
 osv-scanner scan source -r --no-ignore --include-git-root go-ios
@@ -134,7 +134,8 @@ osv-scanner scan source -r --no-ignore --include-git-root WebDriverAgent
 
 # build the go-ios CLI from source as a universal2 (arm64 + x86_64) binary,
 # patching vulnerable transitive deps — one helper that runs on both Intel and
-# Apple Silicon, so the packaged DMG does too:
+# Apple Silicon, so the packaged DMG does too. It refuses any go-ios revision
+# but the audited v1.3.2:
 cd ..            # back to repo root
 ./scripts/build-go-ios.sh
 ```
@@ -162,7 +163,14 @@ Then install WebDriverAgent on the device once (Xcode):
    re-sign). So it installs as a first-class "iMirror" app under your own identity
    rather than `com.facebook.*`. Run it with your paid Team:
    `DEVELOPMENT_TEAM=<TEAMID> ./scripts/build-wda.sh`, then install with
-   `tools/go-ios/bin/ios install --path=build/WebDriverAgent.ipa`. See the
+   `tools/go-ios/bin/ios install --udid=<UDID> --path=build/WebDriverAgent.ipa`.
+   The re-sign uses the certificate Xcode signed with (or `WDA_SIGN_IDENTITY=<sha1>`),
+   and the script stops unless the runner and its `.xctest` both report
+   `TeamIdentifier=$DEVELOPMENT_TEAM`, so a Mac with two "Apple Development"
+   identities can no longer produce an ipa iOS refuses (0xe8008015). It also
+   stamps the WDA release (from `package.json`) into the runner's
+   `CFBundleShortVersionString`, and patches WDA so typed text is redacted
+   (`scripts/lib/wda-patches.sh`; `sim-wda-up.sh` applies the same patch). See the
    [rebrand design](docs/2026-07-03-rebrand-wda-and-improvements-design.md) for the
    why/how. (The macOS app's `runwda` is already wired to launch the branded id.)
 
@@ -357,8 +365,13 @@ Supply-chain risk is treated as a first-class constraint:
   transitive deps patched, and **built from source** (no prebuilt-binary trust).
 - **No `curl | sh`, no unsigned binaries.** Anything executable is subject to
   macOS Gatekeeper / notarization.
-- WebDriverAgent has no auth on the wire, so it is reached over **loopback only**;
-  the go-ios host identity (`selfIdentity.plist`) is gitignored.
+- WebDriverAgent has no auth on the wire, so it is reached over **loopback only**:
+  `scripts/build-go-ios.sh` patches go-ios's `forward` to bind 127.0.0.1 (upstream
+  binds 0.0.0.0) and refuses to build if the patch did not apply. The go-ios host
+  identity (`selfIdentity.plist`) is gitignored.
+- WebDriverAgent's text typing names its XCTest event after the typed text and
+  does not redact it, so a typed passcode would enter testmanagerd's event
+  record. The build scripts patch it to a fixed name with redaction on.
 
 ## MCP server (drive the phone from Claude)
 

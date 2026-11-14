@@ -92,6 +92,8 @@ if [[ -d "$ROOT/tools/WebDriverAgent" ]]; then
     # staged copy). rsync ships with macOS.
     rsync -a --exclude='.git' "$ROOT/tools/WebDriverAgent/" "$APP/Contents/Resources/tools/WebDriverAgent/"
     cp "$ROOT/scripts/sim-wda-up.sh"      "$APP/Contents/Resources/scripts/"
+    mkdir -p "$APP/Contents/Resources/scripts/lib"
+    cp "$ROOT/scripts/lib/wda-patches.sh" "$APP/Contents/Resources/scripts/lib/"
     cp "$ROOT/scripts/make_ios_icon.swift" "$APP/Contents/Resources/scripts/"
 fi
 
