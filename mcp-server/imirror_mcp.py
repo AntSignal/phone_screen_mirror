@@ -61,9 +61,7 @@ from mcp.server.fastmcp import FastMCP, Image
 from mcp.types import ToolAnnotations
 from pydantic import Field
 
-# Inside the signed app these siblings sit in the sealed Resources folder.
-# A __pycache__ written there breaks the seal, and the app no longer
-# verifies. So import them without writing bytecode.
+# A __pycache__ in the signed bundle breaks its seal.
 _saved_dont_write_bytecode = sys.dont_write_bytecode
 sys.dont_write_bytecode = True
 try:
@@ -1196,8 +1194,7 @@ def _nothing_sent(e: BaseException) -> bool:
     return isinstance(e, ConnectionRefusedError) or getattr(e, "imirror_unsent", False)
 
 
-# POSTs that change nothing on the phone, so sending one twice is safe.
-# Keep it exact: a click route next to these must not match.
+# POSTs safe to send twice. Exact: neighbours must not match.
 _REPLAY_SAFE_POST = re.compile(
     r"/session|/session/[^/]+/(?:elements?|wda/apps/state|wda/getPasteboard"
     r"|appium/settings)")
@@ -1225,8 +1222,7 @@ def _req(method: str, path: str, body: dict | None = None,
     # WDA's CocoaHTTPServer occasionally drops a connection mid-exchange
     # (RemoteDisconnected / reset), and keep-alive means we may hand back a
     # server-closed socket — retry such transient failures a couple times.
-    # A change is retried only if none of it left: a tap whose reply
-    # was lost may already have happened, and a second one taps twice.
+    # Resend a change only if none of it left.
     safe = _replay_safe(method, path)
     last_exc: Exception | None = None
     for attempt in range(3):
@@ -1714,8 +1710,7 @@ def _find_element_or_timeout(text: str, visible_only: bool = False) -> tuple[str
 # but info-dense tree, and a byte cap would truncate mid-element. The full
 # payload is always parsed first; only the rendered output is capped.
 _SOURCE_MAX_ELEMENTS = 400
-# Also cap characters: one huge label (a web page's text) could still
-# make a reply bigger than an agent can read.
+# A huge label (web page text) can still flood replies.
 _SOURCE_MAX_FIELD_CHARS = 240
 _SOURCE_MAX_TEXT_CHARS = 20000
 _SOURCE_TEXT_FIELDS = (("label", "label"), ("name", "name"),
@@ -1905,7 +1900,7 @@ def _render_source_text(root: dict[str, Any]) -> str:
     lines = ["# tap point = (x + w/2, y + h/2) in normalized [0,1] coords, "
              "multiply by window size"]
     total = len(elements)
-    # Room for the longest notice, so the total stays under the cap.
+    # Leave room for the notice, keeping output under the cap.
     notice = (f"… ({total} elements dropped; field values truncated; "
               "use ios_source(format='xml') for more detail.)")
     used = len(lines[0])
@@ -1952,7 +1947,7 @@ def ios_status() -> str:
         **_server_identity(),
     }
     t = _cur()
-    # Which endpoint answered, so a wrong pin or port shows here.
+    # Which endpoint answered, so a wrong pin shows here.
     out.update(target=t.kind, wda_endpoint=t.wda, selected_udid=t.udid)
     if t is not _LEGACY:                 # list mode: say which phone answered
         out.update(alias=t.alias, udid=t.udid, kind=t.kind)

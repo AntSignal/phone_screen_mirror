@@ -3056,8 +3056,7 @@ def test_importing_the_server_writes_no_bytecode_next_to_it(tmp_path):
         shutil.copy(os.path.join(here, name), tmp_path / name)
     env = {k: v for k, v in os.environ.items() if k != "PYTHONDONTWRITEBYTECODE"}
     env.update(IMIRROR_WDA="http://127.0.0.1:8100")
-    # The app runs the file as a script, which caches nothing for itself;
-    # only its imports could write bytecode.
+    # Run as a script, like the app: only imports cache.
     load = "import runpy; runpy.run_path('imirror_mcp.py', run_name='check')"
     subprocess.run([sys.executable, "-c", load], cwd=tmp_path, env=env,
                    check=True, capture_output=True, timeout=60)
