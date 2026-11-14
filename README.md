@@ -413,7 +413,9 @@ walkthrough.
 **Headless automation.** The MCP server can also bring WebDriverAgent up on its
 own, without the Mac app: set `IMIRROR_AUTOWDA=1` and it runs the same go-ios
 tunnel / runwda / forward chain and talks to WDA directly. Useful for driving
-the phone from an agent without launching the GUI.
+the phone from an agent without launching the GUI. A bring-up that fails stops
+the children it started, and only those: it never sweeps other go-ios processes,
+so the app's other phones are left alone.
 
 **iOS Simulators (optional).** No phone handy, or testing a simulator build?
 Enable one or more simulators and iMirror boots each and brings WebDriverAgent up

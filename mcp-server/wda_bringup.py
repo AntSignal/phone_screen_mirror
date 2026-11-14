@@ -110,33 +110,43 @@ class WDABringup:
             self._up = True
             return self.base_url
 
-        self._start_tunnel()
-        self._poll_until(self._tunnel_ready, timeout,
-                          "timed out waiting for the go-ios userspace tunnel to come up")
+        try:
+            self._start_tunnel()
+            self._poll_until(self._tunnel_ready, timeout,
+                              "timed out waiting for the go-ios userspace tunnel to come up")
 
-        if not self._runner_present():
-            if not self._wda_ipa:
-                raise WDABringupError(
-                    "WebDriverAgentRunner is not installed; install it or set "
-                    "IMIRROR_WDA_IPA to a WebDriverAgent.ipa so it can be "
-                    "installed automatically.")
-            self._install_runner()
             if not self._runner_present():
-                raise WDABringupError(
-                    "WebDriverAgentRunner install did not take; check the "
-                    "ipa's code signature and try again.")
+                if not self._wda_ipa:
+                    raise WDABringupError(
+                        "WebDriverAgentRunner is not installed; install it or set "
+                        "IMIRROR_WDA_IPA to a WebDriverAgent.ipa so it can be "
+                        "installed automatically.")
+                self._install_runner()
+                if not self._runner_present():
+                    raise WDABringupError(
+                        "WebDriverAgentRunner install did not take; check the "
+                        "ipa's code signature and try again.")
 
-        self._start_runwda()
-        self._start_forward()
-        self._poll_until(self._status_ready, timeout,
-                          "timed out waiting for WebDriverAgent to report ready")
+            self._start_runwda()
+            self._start_forward()
+            self._poll_until(self._status_ready, timeout,
+                              "timed out waiting for WebDriverAgent to report ready")
 
-        self._register_teardown()
+            self._register_teardown()
+        except BaseException:
+            # A failed bring-up used to leave its tunnel and runwda running.
+            # Stop only the children this instance started (upstream fed3fb9).
+            self.shutdown()
+            raise
         self._up = True
         return self.base_url
 
     def shutdown(self) -> None:
-        """Terminate every long-running child process this instance started."""
+        """Terminate every long-running child process this instance started.
+
+        Only those: it used to `pkill -f "<ios> (tunnel|runwda|forward)"`,
+        which also killed the iMirror app's chains for every other phone.
+        """
         for proc in self._children:
             if proc.poll() is None:
                 proc.terminate()
@@ -148,7 +158,6 @@ class WDABringup:
             if proc.poll() is None:
                 proc.kill()
         self._children = []
-        self._sweep_stray_processes()
         self._up = False
 
     # -- tunnel -----------------------------------------------------------
@@ -184,7 +193,8 @@ class WDABringup:
 
     def _install_runner(self) -> None:
         self._log(f"WebDriverAgentRunner missing; installing {self._wda_ipa}")
-        args = [self._ios_bin, "install", f"--path={self._wda_ipa}"]
+        # Without --udid, go-ios installs on its first listed phone.
+        args = [self._ios_bin, "install", f"--path={self._wda_ipa}"] + self._udid_args()
         self._run_and_capture(args)
 
     def _run_and_capture(self, args: list[str]) -> str:
@@ -239,17 +249,6 @@ class WDABringup:
                 raise WDABringupError(timeout_message)
             self._sleep(_POLL_INTERVAL)
             elapsed += _POLL_INTERVAL
-
-    def _sweep_stray_processes(self) -> None:
-        """Best-effort cleanup of any go-ios child left behind, mirroring
-        Transport.swift's sweepStrayProcesses. Fire-and-forget: never blocks
-        shutdown and never raises."""
-        pattern = f"{self._ios_bin} (tunnel|runwda|forward)"
-        try:
-            self._popen(["pkill", "-f", pattern],
-                        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        except Exception:
-            pass
 
     # -- teardown registration ------------------------------------------------
 
