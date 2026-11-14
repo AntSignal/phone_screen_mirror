@@ -652,6 +652,7 @@ def _wedged_hint() -> str:
 
 _RIDE_OUT_S = 30.0               # longest wait for a restarting chain
 _RIDE_OUT_POLL_S = 1.0           # devices.json is a stat when unchanged
+_NOTICE_S = 5.0                  # the app probes WDA every 3 s
 _RECOVERING_MARKS = frozenset({"starting", "installing", "recovering", "booting",
                                "usb_reset", "wda_wedged", "tunnel_down"})
 _PASSCODE_REASONS = frozenset({"needs_passcode", "locked"})
@@ -687,10 +688,11 @@ def _app_entry(t: _Target) -> _Target | None:
     return next((x for x in targets if t.udid and x.udid == t.udid), None)
 
 
-def _wait_for_chain(t: _Target, budget: float) -> tuple[_Target | None, str]:
-    """Poll the device file until the chain is no longer recovering, or
-    `budget` seconds pass. Returns the entry and its phase ("gone" when the
-    file stops listing the phone)."""
+def _wait_for_chain(t: _Target, budget: float,
+                    waiting: Any = None) -> tuple[_Target | None, str]:
+    """Poll the device file while `waiting(entry, phase)` is true (default:
+    the chain is recovering), for at most `budget` seconds. Returns the
+    entry and its phase ("gone" when the file stops listing the phone)."""
     deadline = time.monotonic() + budget
     while True:
         app = _app_entry(t)
@@ -698,7 +700,8 @@ def _wait_for_chain(t: _Target, budget: float) -> tuple[_Target | None, str]:
             return None, "gone"
         phase = _chain_phase(app.state, app.reason)
         left = deadline - time.monotonic()
-        if phase != "recovering" or left <= 0:
+        still = waiting(app, phase) if waiting else phase == "recovering"
+        if not still or left <= 0:
             return app, phase
         time.sleep(min(_RIDE_OUT_POLL_S, left))
 
@@ -768,14 +771,16 @@ def _ride_out(t: _Target, err: MCPToolError, start_epoch: int | None,
     If the app says the chain is restarting, wait up to _RIDE_OUT_S for it.
     Then `retry` (given only for calls that change nothing) runs once.
     Otherwise this raises a precise error. A phone the app calls ready,
-    whose chain did not restart during the call, gets `err` back unchanged."""
-    app = _app_entry(t)
-    if app is None:
-        raise err
-    phase = _chain_phase(app.state, app.reason)
-    restarted = (start_epoch is not None and app.chain_epoch is not None
-                 and app.chain_epoch != start_epoch)
-    if phase == "ready" and not restarted:
+    whose chain did not restart during the call, gets `err` back unchanged
+    once _NOTICE_S has passed without the app noticing anything."""
+    def unnoticed(app: _Target, phase: str) -> bool:
+        restarted = (start_epoch is not None and app.chain_epoch is not None
+                     and app.chain_epoch != start_epoch)
+        return phase == "ready" and not restarted
+    if _app_entry(t) is None:
+        raise err                   # no live device file: nothing to wait for
+    app, phase = _wait_for_chain(t, _NOTICE_S, unnoticed)
+    if app is None or unnoticed(app, phase):
         raise err
     if phase == "recovering":
         app, phase = _wait_for_chain(t, _RIDE_OUT_S)

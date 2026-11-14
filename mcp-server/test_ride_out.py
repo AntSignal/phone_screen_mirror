@@ -81,6 +81,7 @@ def load(monkeypatch, tmp_path):
     m = importlib.import_module("imirror_mcp")
     monkeypatch.setattr(m, "_RIDE_OUT_S", 3.0)
     monkeypatch.setattr(m, "_RIDE_OUT_POLL_S", 0.05)
+    monkeypatch.setattr(m, "_NOTICE_S", 0.3)
     return m
 
 
@@ -257,8 +258,29 @@ def test_a_phone_the_app_calls_ready_gets_the_plain_error(dead):
     t0 = time.monotonic()
     with pytest.raises(m.MCPToolError) as e:
         m.ios_screenshot()
-    assert time.monotonic() - t0 < 1
+    assert 0.3 <= time.monotonic() - t0 < 1.5   # the notice window only
     assert e.value.error_kind == "unreachable" and e.value.error_code is None
+
+
+def test_a_read_rides_out_a_restart_the_app_has_not_noticed_yet(fake, live):
+    # The call fails while the file still says ready.
+    m, app = live
+    port, url = int(fake.url.rsplit(":", 1)[1]), fake.url
+    fake.stop()
+    m._drop_conn(url)
+    back = FakeWDAServer()
+
+    def come_back():
+        back.start(port)
+        app.write("ready", chain_epoch=2)
+    app.later(0.15, app.write, "starting", reason="usb_reset", chain_epoch=2)
+    app.later(0.5, come_back)
+    try:
+        assert m.ios_screenshot().data.startswith(b"\x89PNG")
+        assert back.paths() == ["/status", "/screenshot"]
+    finally:
+        m._drop_conn(back.url)
+        back.stop()
 
 
 def test_a_chain_that_restarted_during_the_call_counts_as_recovered(dead):

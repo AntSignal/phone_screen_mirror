@@ -144,8 +144,9 @@ top-level README). A call that cannot reach WDA reads that file, never
   otherwise a person must.
 - **`DEVICE_GAVE_UP`**: the app has stopped retrying; `next_retry_at` says
   when it tries again by itself.
-- A phone the app still calls `ready` gets the plain `unreachable`/`wedged`
-  error, as before.
+- The app checks WDA every 3 s, so a call can fail before the file says
+  anything. The call gives it 5 s to notice. A phone the app still calls
+  `ready` after that gets the plain `unreachable`/`wedged` error, as before.
 
 The extra values ride in the error's tail, e.g.
 `[kind=unreachable code=RECOVERING reason=usb_reset retry_after_s=15]`.
