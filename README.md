@@ -48,7 +48,11 @@ Features:
 - **Auto-installs the runner** — on connect, the app checks whether the
   WebDriverAgent app is on the connected iPhone and installs the bundled build if
   it's missing, with progress and actionable errors (e.g. "not signed for this
-  iPhone — re-sign for this device"). A pre-provisioned device just works.
+  iPhone — re-sign for this device"). A pre-provisioned device just works. A
+  runner older than the bundled one (its `CFBundleShortVersionString`, which
+  `build-wda.sh` stamps) is reinstalled; a newer one is kept, and a failed
+  upgrade keeps the old runner running. The new runner may ask for the
+  phone's passcode once ("Enable UI Automation").
 - **iOS Simulator support** — no physical phone required: enable any number of
   simulators (from **Settings (⚙) → iOS Simulator**, a shell, or the MCP server's
   `sim_enable`) and iMirror brings WebDriverAgent up on each, so an agent can drive
@@ -309,7 +313,9 @@ with a different uniqueid knows the file is stale), `app_version`, `updated_at`,
 `expected` (bool). `event` is one of `state` (`from`/`to` are states),
 `restart`, `give_up`, `auto_retry`, `usb_reset` (a reset the app is checking),
 `usb_reset_ignored` (its own start/stop did it, or WDA was not up), `request`,
-`wake`, `sleep`, `passcode`. The same lines go to the unified log, subsystem
+`wake`, `sleep`, `passcode`, `runner_upgrade` (the phone's WebDriverAgent
+runner is older than the bundled one and is reinstalled; `from`/`to` are
+versions; the new runner may raise the passcode sheet once). The same lines go to the unified log, subsystem
 `com.local.imirror`, category `events`, in the clear.
 
 **`expected-resets/<udid>.json`** — written by a client, not the app. Before

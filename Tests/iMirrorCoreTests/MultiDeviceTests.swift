@@ -168,6 +168,30 @@ final class GoIOSParsingTests: XCTestCase {
         XCTAssertEqual(devices.map(\.isUSB), [true, false])
     }
 
+    /// Captured from go-ios v1.3.2 (`ios list --details`, 2026-11-14, the 16e
+    /// on USB). One JSON line on stdout, nothing on stderr.
+    func testListDetailsFromGoIOS132() {
+        let out = """
+        {"deviceList":[{"Udid":"00008140-0006423002D3401C","ProductName":"iPhone OS","ProductType":"iPhone17,5","ProductVersion":"26.6","ConnectionType":"USB"}]}
+
+        """
+        XCTAssertEqual(GoIOSParsing.attachedDevices(fromListDetails: Data(out.utf8)), [
+            AttachedDevice(udid: phone16e, productType: "iPhone17,5", productVersion: "26.6", connection: "USB"),
+        ])
+    }
+
+    /// go-ios v1.3.2's agent encodes `[]Tunnel` with json.Encoder, so the
+    /// body ends in a newline, and no tunnels is "[]", not null. The shape
+    /// is from tunnel.go; the values are a live agent's (2026-11-14).
+    func testTunnelsFromGoIOS132() {
+        let body = """
+        [{"address":"fd7d:b905:6d8c::1","rsdPort":54586,"udid":"00008140-0006423002D3401C","userspaceTun":true,"userspaceTunPort":60172}]
+
+        """
+        XCTAssertEqual(GoIOSParsing.tunnelUDIDs(fromTunnels: Data(body.utf8)), [phone16e])
+        XCTAssertEqual(GoIOSParsing.tunnelUDIDs(fromTunnels: Data("[]\n".utf8)), [])
+    }
+
     func testLogLinesAroundTheJSONAreSkipped() {
         let out = """
         {"time":"2026-09-28T19:32:44Z","level":"INFO","msg":"no udid specified using first device in list"}

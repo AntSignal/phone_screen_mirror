@@ -101,6 +101,8 @@ public enum DeviceEventKind: String, Sendable {
     case autoRetry = "auto_retry"
     case usbReset = "usb_reset"
     case usbResetIgnored = "usb_reset_ignored"
+    /// The phone's runner is older than the bundled one and is reinstalled.
+    case runnerUpgrade = "runner_upgrade"
 }
 
 /// One line of events.jsonl.

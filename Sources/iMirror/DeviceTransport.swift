@@ -338,7 +338,7 @@ final class DeviceChain {
                 Thread.sleep(forTimeInterval: 0.5)
             }
             guard self.generation == gen else { return }
-            let install = self.installRunnerIfMissing()
+            let install = self.installOrUpgradeRunner()
             guard self.generation == gen, shouldSpawnRunwda(after: install) else { return }
             DispatchQueue.main.async { [weak self] in
                 guard let self, self.generation == gen else { return }
@@ -393,20 +393,51 @@ final class DeviceChain {
         DispatchQueue.main.async { [weak self] in self?.onRunnerInstall?(event) }
     }
 
-    /// Check for the branded runner on THIS phone and install the bundled ipa
-    /// if it's missing. Dev builds ship no ipa (the runner is installed by
-    /// scripts/build-wda.sh), which is reported as `.noBundle`.
-    private func installRunnerIfMissing() -> RunnerInstall {
+    /// A bundled version whose upgrade failed on this chain (runnerAction).
+    /// Bring-ups run off main and may overlap, so it sits behind holdLock.
+    private var _failedUpgradeTo: String?
+    private var failedUpgradeTo: String? {
+        get { holdLock.lock(); defer { holdLock.unlock() }; return _failedUpgradeTo }
+        set { holdLock.lock(); _failedUpgradeTo = newValue; holdLock.unlock() }
+    }
+
+    /// Check the branded runner on THIS phone. Install the bundled ipa when
+    /// it is missing, and reinstall it when the phone's copy is older. Dev
+    /// builds ship no ipa (scripts/build-wda.sh installs the runner), which
+    /// is reported as `.noBundle`.
+    private func installOrUpgradeRunner() -> RunnerInstall {
         emitInstall(.checking)
         guard let ipa = Bundle.main.url(forResource: "WebDriverAgent", withExtension: "ipa") else {
             emitInstall(.done(.noBundle))
             return .noBundle
         }
-        if runnerIsInstalled() {
+        let installed = installedRunnerVersion()
+        let bundled = Self.bundledRunnerVersion(ipa: ipa)
+        switch runnerAction(installed: installed, bundled: bundled, failedUpgradeTo: failedUpgradeTo) {
+        case .keep:
             emitInstall(.done(.alreadyPresent))
             return .alreadyPresent
+        case .install:
+            emitInstall(.installing)
+            let result = installWithRetry(ipa: ipa)
+            emitInstall(.done(result))
+            return result
+        case .upgrade:
+            let from = installed ?? "", to = bundled ?? ""
+            emitInstall(.upgrading(from: from, to: to))
+            let attempt = installWithRetry(ipa: ipa)
+            if case .failed(let err) = attempt {
+                failedUpgradeTo = to
+                emitInstall(.upgradeFailed(kept: from, raw: err.raw))
+            }
+            let result = upgradeResult(attempt)
+            emitInstall(.done(result))
+            return result
         }
-        emitInstall(.installing)
+    }
+
+    /// `ios install` with retries: `.installed` or the last `.failed`.
+    private func installWithRetry(ipa: URL) -> RunnerInstall {
         // The tunnel is briefly unusable right after it appears; retry the
         // unrecognised (transient) failures, stop at once on a definite one
         // (not provisioned for this phone, phone locked).
@@ -419,12 +450,34 @@ final class DeviceChain {
             if case .other = cls, attempt < 7 { Thread.sleep(forTimeInterval: 2); continue }
             break
         }
-        emitInstall(.done(result))
         return result
     }
 
-    private func runnerIsInstalled() -> Bool {
+    /// The phone's runner version: nil when it is not installed or the
+    /// listing failed (then we install, as before), "" when it has none.
+    private func installedRunnerVersion() -> String? {
         let r = GoIOS.run(bin, GoIOS.appsListArgs(udid: udid), workDir: workDir)
-        return String(decoding: r.out, as: UTF8.self).contains("com.local.imirror.WebDriverAgentRunner")
+        guard r.status == 0 else { return nil }
+        return runnerVersion(inAppsList: String(decoding: r.out, as: UTF8.self),
+                             bundleId: WDAIdentity.runnerBundleId)
+    }
+
+    // The ipa cannot change while the app runs, so read it once.
+    private static let bundledVersionLock = NSLock()
+    private static var bundledVersionCache: String?
+
+    /// CFBundleShortVersionString of the runner in the bundled ipa, which
+    /// build-wda.sh stamps with the WDA release. nil if unreadable.
+    private static func bundledRunnerVersion(ipa: URL) -> String? {
+        bundledVersionLock.lock(); defer { bundledVersionLock.unlock() }
+        if let v = bundledVersionCache { return v }
+        let r = GoIOS.run(URL(fileURLWithPath: "/usr/bin/unzip"),
+                          ["-p", ipa.path, "Payload/*.app/Info.plist"],
+                          workDir: FileManager.default.temporaryDirectory)
+        guard r.status == 0,
+              let plist = try? PropertyListSerialization.propertyList(from: r.out, format: nil) as? [String: Any],
+              let v = plist["CFBundleShortVersionString"] as? String else { return nil }
+        bundledVersionCache = v
+        return v
     }
 }
