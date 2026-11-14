@@ -310,6 +310,17 @@ with a different uniqueid knows the file is stale), `app_version`, `updated_at`,
 with `"expected": true`. Recovery still runs as usual; the note only stops the
 reset reading as a fault. A note more than 10 min ahead is ignored.
 
+**`requests/restart-<udid>.json`** — written by a client to restart a phone's
+chain: `{"udid", "requested_at": ISO-8601, "requested_by": "<short name>"}`.
+Write a temp file and rename it in; other names in the folder are ignored. The
+app deletes the file, then logs an event `request` whose `detail` is
+`accepted` (the chain restarts now; `chain_epoch` goes up), `cooldown` (a
+request for this phone was honoured in the last 60 s, so nothing happens),
+`stale` (`requested_at` more than 2 min off) or `not_attached`. A request acts
+like Settings → Restart: this phone's chain only, never the shared tunnel. It
+never types a passcode. While the phone shows `needs_passcode`, don't send one:
+a new runner raises the sheet again.
+
 ## Dependency security policy
 
 Supply-chain risk is treated as a first-class constraint:
