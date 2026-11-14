@@ -14,7 +14,7 @@ its self-managed transport (userspace tunnel + runwda + forward + relay).
 
 | Tool | What it does |
 |------|--------------|
-| `ios_status` | WDA ready? + iOS version / device name, and which server answered (`server_version`, `script_path`); with iMirror's device file, also the app's view (`app_state`, `reason`, `state_since`, `chain_epoch`, `next_retry_at`, `last_error`) and the phone's last 5 events |
+| `ios_status` | WDA ready? + iOS version / device name, which server answered (`server_version`, `script_path`) and which endpoint (`target`, `wda_endpoint`, `selected_udid`); with iMirror's device file, also the app's view (`app_state`, `reason`, `state_since`, `chain_epoch`, `next_retry_at`, `last_error`) and the phone's last 5 events |
 | `ios_devices` | every device this server can drive (alias, UDID, port, ready?, the app's view as above, how its WDA sessions were got) and which one is the default |
 | `ios_recover` | ask iMirror to restart a phone's WDA chain, then wait ≤30 s: `accepted`, `cooldown` (one ran in the last minute) or `timeout` |
 | `ios_window_size` | logical screen size (points) for the current orientation |
@@ -25,10 +25,11 @@ its self-managed transport (userspace tunnel + runwda + forward + relay).
 | `ios_scroll_to(text, direction, max_swipes, distance_pct, settle_ms)` | scroll (capped at 20 swipes) until an element with that label/name/value is on screen |
 | `ios_type(text)` | type into the focused field (`\n`=return, `\b`=backspace) |
 | `ios_press_button(name)` | `home` / `volumeUp` / `volumeDown` |
+| `ios_alert(action, button_label)` | `get` a system alert's text and buttons (`present: false` when none), or `accept` / `dismiss` it, optionally by exact button label. Alert text is never recorded in run reports |
 | `ios_find_and_tap(text)` | find an element by visible label/name and tap it |
 | `ios_wait_for(text, timeout_s)` | poll until an element with that label/name appears |
 | `ios_orientation(set_to)` | get orientation, or set `PORTRAIT` / `LANDSCAPE` |
-| `ios_source` | accessibility hierarchy (XML) of the current screen |
+| `ios_source` | accessibility hierarchy of the current screen: a compact text tree (at most 400 elements, 20,000 characters, 240 per field) or raw XML |
 | `ios_start_run(label)` | begin recording a test run (opt-in) |
 | `ios_run_section(title)` | start a named section — groups following steps under it in the report + TOC |
 | `ios_run_note(text, status)` | add a checkpoint — `info` / `pass` / `fail` |
@@ -149,6 +150,15 @@ top-level README). A call that cannot reach WDA reads that file, never
   anything. The call gives it 5 s to notice. A phone the app still calls
   `ready` after that gets the plain `unreachable`/`wedged` error, as before.
 
+**A lost reply to a change.** A tap, type, swipe, alert accept or launch whose
+reply never came back fails with `kind=outcome_unknown`: WDA may already have
+done it, so it is never sent again. Look at the screen before repeating it. It
+is re-sent only when it failed before its first byte left (a refused connection,
+or a send that failed at once), and a kept-alive socket WDA closed while idle is
+replaced before a request goes out on it. Reads (and the POSTs that only find
+elements or read state) are still retried. During a restart, such a call waits
+like any other change and keeps `kind=outcome_unknown` with `code=RECOVERING`.
+
 The extra values ride in the error's tail, e.g.
 `[kind=unreachable code=RECOVERING reason=usb_reset retry_after_s=15]`.
 
@@ -195,6 +205,12 @@ Screenshots are PNG by default. On a physical device, set `IMIRROR_SCREENSHOT_QU
 to `1` (medium JPEG) or `2` (low JPEG) for smaller, faster-to-encode frames; `0` keeps
 lossless PNG. The default is target-aware — `1` on a device, `0` on the simulator,
 where WDA ignores the JPEG path and returns PNG regardless.
+
+`IMIRROR_SNAPSHOT_MAX_DEPTH` (1–200) sets WDA's `snapshotMaxDepth` on each session
+this server makes or joins. A lower depth makes a heavy `/source` cheaper, and a
+heavy one can kill the runner and reset the phone's USB link. It is unset by
+default (WDA's own 50), because WDA applies it to every element lookup too: an
+element nested deeper is not found at all. Measure on the phone before setting it.
 
 ## Running against an iOS Simulator
 

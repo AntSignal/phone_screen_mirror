@@ -10,6 +10,7 @@ from __future__ import annotations
 import importlib
 import json
 import sys
+import time
 
 import pytest
 
@@ -334,3 +335,77 @@ def test_status_and_devices_name_the_server_and_its_file(m, fake):
     assert {k: status.get(k) for k in want} == want
     assert {k: devices.get(k) for k in want} == want
     assert want["script_path"].endswith("/imirror_mcp.py")
+
+
+# ---- OUTCOME_UNKNOWN: a change is sent again only if none of it left ----------
+
+class _SendFails:
+    """Stands in for the socket inside _CountingSocket: lets `ok` bytes out,
+    then fails the next send, as a peer that just went away does."""
+
+    def __init__(self, real, ok: int = 0):
+        self.real, self.ok = real, ok
+
+    def send(self, data):
+        if self.ok <= 0:
+            raise BrokenPipeError(32, "Broken pipe")
+        n = self.real.send(bytes(data[: self.ok]))
+        self.ok -= n
+        return n
+
+    def __getattr__(self, name):
+        return getattr(self.real, name)
+
+
+def test_a_tap_whose_reply_is_cut_off_is_not_sent_again(m, fake):
+    m.ios_tap(10, 20)
+    actions = f"/session/{fake.active}/actions"
+    fake.drops[actions] = 1                     # WDA tapped, then hung up
+    with pytest.raises(m.MCPToolError) as e:
+        m.ios_tap(10, 20)
+    assert e.value.error_kind == m.ErrorKind.OUTCOME_UNKNOWN
+    assert fake.count("POST", actions) == 2     # never a third
+
+
+def test_a_tap_that_failed_before_any_byte_left_is_sent_again(m, fake):
+    m.ios_tap(10, 20)
+    conn = m._conns()[fake.url]
+    conn.sock._sock = _SendFails(conn.sock._sock)
+    assert m.ios_tap(10, 20).startswith("tapped")
+    assert fake.count("POST", f"/session/{fake.active}/actions") == 2
+    assert fake.connections == 2
+
+
+def test_a_tap_that_partly_left_is_not_sent_again(m, fake):
+    m.ios_tap(10, 20)
+    conn = m._conns()[fake.url]
+    conn.sock._sock = _SendFails(conn.sock._sock, ok=5)
+    with pytest.raises(m.MCPToolError) as e:
+        m.ios_tap(10, 20)
+    assert e.value.error_kind == m.ErrorKind.OUTCOME_UNKNOWN
+    assert fake.count("POST", f"/session/{fake.active}/actions") == 1
+
+
+def test_a_tap_on_a_socket_wda_closed_while_idle_goes_out_on_a_new_one(m, fake):
+    """WDA hung up the kept-alive socket. Writing the tap into it would make
+    its outcome unknown, so the socket is replaced before the tap is sent."""
+    m.ios_tap(10, 20)
+    fake.close_after = 1
+    m._req("GET", "/status")                   # that reply, then WDA hangs up
+    time.sleep(0.1)
+    assert m.ios_tap(30, 40).startswith("tapped")
+    assert fake.count("POST", f"/session/{fake.active}/actions") == 2
+    assert fake.connections == 2
+
+
+def test_a_refused_connection_is_marked_as_nothing_sent(m, fake):
+    url = fake.url
+    fake.stop()
+    m._drop_conn(url)
+    try:
+        with pytest.raises(ConnectionRefusedError) as e:
+            m._http("POST", "/session/x/actions", b"{}", 1.0)
+        assert m._nothing_sent(e.value)
+        assert e.value.imirror_unsent            # marked by the connect step
+    finally:
+        fake.start(int(url.rsplit(":", 1)[1]))

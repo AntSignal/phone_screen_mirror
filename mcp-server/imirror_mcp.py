@@ -40,6 +40,7 @@ import json
 import math
 import os
 import re
+import select
 import shutil
 import signal
 import socket
@@ -60,8 +61,14 @@ from mcp.server.fastmcp import FastMCP, Image
 from mcp.types import ToolAnnotations
 from pydantic import Field
 
-import sim_control
-import wda_bringup
+# A __pycache__ in the signed bundle breaks its seal.
+_saved_dont_write_bytecode = sys.dont_write_bytecode
+sys.dont_write_bytecode = True
+try:
+    import sim_control
+    import wda_bringup
+finally:
+    sys.dont_write_bytecode = _saved_dont_write_bytecode
 
 
 class ErrorKind:
@@ -76,11 +83,13 @@ class ErrorKind:
     WEDGED = "wedged"
     TIMEOUT = "timeout"
     UNSUPPORTED = "unsupported"
+    # A change may have reached WDA; its reply was lost.
+    OUTCOME_UNKNOWN = "outcome_unknown"
 
 
 _ERROR_KINDS = {ErrorKind.VALIDATION, ErrorKind.NOT_FOUND, ErrorKind.WDA_HTTP,
                 ErrorKind.UNREACHABLE, ErrorKind.WEDGED, ErrorKind.TIMEOUT,
-                ErrorKind.UNSUPPORTED}
+                ErrorKind.UNSUPPORTED, ErrorKind.OUTCOME_UNKNOWN}
 
 
 class MCPToolError(RuntimeError):
@@ -760,13 +769,14 @@ def _chain_error(app: _Target, phase: str, *, idempotent: bool) -> MCPToolError:
 
 def _rides_out(e: BaseException) -> bool:
     """Whether an error may be a chain restart worth waiting for."""
-    return isinstance(e, MCPToolError) and e.error_kind in (ErrorKind.UNREACHABLE,
-                                                            ErrorKind.WEDGED)
+    return isinstance(e, MCPToolError) and e.error_kind in (
+        ErrorKind.UNREACHABLE, ErrorKind.WEDGED, ErrorKind.OUTCOME_UNKNOWN)
 
 
 def _ride_out(t: _Target, err: MCPToolError, start_epoch: int | None,
               retry: Any) -> Any:
-    """Handle a call to `t` that failed with `err` (UNREACHABLE or WEDGED).
+    """Handle a call to `t` that failed with `err` (UNREACHABLE, WEDGED or
+    OUTCOME_UNKNOWN).
 
     If the app says the chain is restarting, wait up to _RIDE_OUT_S for it.
     Then `retry` (given only for calls that change nothing) runs once.
@@ -790,7 +800,11 @@ def _ride_out(t: _Target, err: MCPToolError, start_epoch: int | None,
         return retry()
     if phase == "down":
         raise err
-    raise _chain_error(app, phase, idempotent=retry is not None) from err
+    final = _chain_error(app, phase, idempotent=retry is not None)
+    if err.error_kind == ErrorKind.OUTCOME_UNKNOWN:
+        # The kind still says the change may have landed.
+        final.error_kind = ErrorKind.OUTCOME_UNKNOWN
+    raise final from err
 
 
 # ---- Events and restart requests (files the app shares) -------------------------
@@ -926,7 +940,10 @@ mcp = FastMCP("imirror", instructions=(
     "Several phones may be attached: ios_devices lists them. Every device tool "
     "takes an optional `device` (alias or UDID); omit it when only one phone is "
     "attached. Calls to different phones run in parallel. Simulators: sim_list "
-    "shows them, sim_enable turns one on (it is then a device by its alias)."))
+    "shows them, sim_enable turns one on (it is then a device by its alias). "
+    "A failure with kind=outcome_unknown means the action may already have "
+    "happened: look at the screen before repeating it. If ios_source and the "
+    "screenshot disagree, ios_alert reads a system alert covering the app."))
 
 # Optional per-run recording. Off until ios_start_run; every action/screenshot is
 # appended to _run["steps"], and ios_finish_run renders them into a report.
@@ -1210,24 +1227,104 @@ def _http(method: str, path: str, data: bytes | None,
     host, port = parts.hostname, parts.port or 80
     conns = _conns()
     c = conns.get(base)
+    if c is not None and _peer_closed(getattr(c, "sock", None)):
+        _drop_conn(base)      # replace it before any byte goes out
+        c = None
     if c is None:
         c = http.client.HTTPConnection(host, port, timeout=timeout)
         conns[base] = c
+    counter: _CountingSocket | None = None
+    connecting = False
     try:
         # connect() reads c.timeout only when it opens a socket. A reused
         # keep-alive socket keeps its first timeout unless it is set here,
         # so the PROBE/INTERACT/TREE tiers would silently not apply.
         c.timeout = timeout
+        if getattr(c, "sock", False) is None:      # a real, unopened connection
+            connecting = True
+            c.connect()
+            connecting = False
+            c.sock = _CountingSocket(c.sock)
         sock = getattr(c, "sock", None)
         if sock is not None:
             sock.settimeout(timeout)
+        if isinstance(sock, _CountingSocket):
+            counter = sock
+            counter.sent = 0
         c.request(method, path, body=data,
                   headers={"Content-Type": "application/json"})
         r = c.getresponse()
         return r.status, r.read()
-    except Exception:
+    except Exception as e:
         _drop_conn(base)      # poison so the next call reconnects clean
+        if connecting or (counter is not None and counter.sent == 0):
+            e.imirror_unsent = True  # type: ignore[attr-defined]
         raise
+
+
+class _CountingSocket:
+    """A socket that counts the bytes it hands to the kernel.
+
+    socket.sendall() cannot say how much went out before it failed; a loop
+    of send() calls can. _req uses the count: a change whose request never
+    left may be sent again, one that partly left may not."""
+
+    def __init__(self, sock: socket.socket):
+        self._sock = sock
+        self.sent = 0
+
+    def sendall(self, data: Any) -> None:
+        view = memoryview(data).cast("B")
+        while view:
+            n = self._sock.send(view)
+            self.sent += n
+            view = view[n:]
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._sock, name)
+
+
+def _peer_closed(sock: Any) -> bool:
+    """Whether a kept-alive socket can no longer carry a request.
+
+    An idle keep-alive socket has nothing to read. If it is readable, WDA
+    closed it or sent bytes nobody asked for. Checking first means a change
+    is not written into a dead socket, where its outcome would be unknown."""
+    if sock is None:
+        return False
+    try:
+        readable, _, _ = select.select([sock], [], [], 0)
+    except (OSError, ValueError, TypeError):
+        return True
+    return bool(readable)
+
+
+def _nothing_sent(e: BaseException) -> bool:
+    """Whether a failed request surely never reached WDA: the connection
+    was refused, or it failed before its first byte left (see _http)."""
+    return isinstance(e, ConnectionRefusedError) or getattr(e, "imirror_unsent", False)
+
+
+# POSTs safe to send twice. Exact: neighbours must not match.
+_REPLAY_SAFE_POST = re.compile(
+    r"/session|/session/[^/]+/(?:elements?|wda/apps/state|wda/getPasteboard"
+    r"|appium/settings)")
+
+
+def _replay_safe(method: str, path: str) -> bool:
+    """Whether a request may be sent again after its reply was lost. POST
+    /session counts: a second one only replaces the session the first made."""
+    m = method.upper()
+    return m in ("GET", "HEAD", "OPTIONS") or (
+        m == "POST" and _REPLAY_SAFE_POST.fullmatch(path) is not None)
+
+
+def _outcome_unknown(method: str, path: str, e: BaseException) -> MCPToolError:
+    return MCPToolError(
+        f"Outcome unknown for {method} {path}: WDA at {_label(_cur_or_none())} "
+        f"may have received it, but no reply came back ({e}). The action may "
+        "already have happened, so it was not sent again. Take ios_screenshot "
+        "before repeating it.", kind=ErrorKind.OUTCOME_UNKNOWN)
 
 
 def _req(method: str, path: str, body: dict | None = None,
@@ -1236,6 +1333,8 @@ def _req(method: str, path: str, body: dict | None = None,
     # WDA's CocoaHTTPServer occasionally drops a connection mid-exchange
     # (RemoteDisconnected / reset), and keep-alive means we may hand back a
     # server-closed socket — retry such transient failures a couple times.
+    # Resend a change only if none of it left.
+    safe = _replay_safe(method, path)
     last_exc: Exception | None = None
     for attempt in range(3):
         try:
@@ -1243,6 +1342,8 @@ def _req(method: str, path: str, body: dict | None = None,
         except (http.client.RemoteDisconnected, ConnectionResetError,
                 http.client.BadStatusLine, http.client.IncompleteRead,
                 BrokenPipeError) as e:
+            if not (safe or _nothing_sent(e)):
+                raise _outcome_unknown(method, path, e) from e
             last_exc = e
             # A reused keep-alive socket the server already closed fails on the
             # first send — that's expected staleness, so reconnect and retry
@@ -1252,10 +1353,14 @@ def _req(method: str, path: str, body: dict | None = None,
                 time.sleep(0.3 * attempt)
             continue
         except (socket.timeout, TimeoutError) as e:
+            if not (safe or _nothing_sent(e)):
+                raise _outcome_unknown(method, path, e) from e
             raise MCPToolError(
                 f"WDA timed out after {timeout}s on {path}. It may be busy or "
                 f"wedged — {_wedged_hint()}.", kind=ErrorKind.WEDGED) from e
         except OSError as e:
+            if not (safe or _nothing_sent(e)):
+                raise _outcome_unknown(method, path, e) from e
             raise MCPToolError(
                 f"Cannot reach WDA at {_label(_cur_or_none())} ({e}). "
                 f"{_unreachable_hint()}", kind=ErrorKind.UNREACHABLE) from e
@@ -1464,6 +1569,29 @@ def _apply_session_settings(sid: str) -> None:
              {"settings": {"screenshotQuality": _screenshot_quality()}}, timeout=_TIMEOUT_PROBE)
     except Exception:
         pass
+    # A shallower snapshot makes /source cheaper. Off unless configured.
+    depth = _snapshot_max_depth()
+    if depth:
+        try:
+            _req("POST", f"/session/{sid}/appium/settings",
+                 {"settings": {"snapshotMaxDepth": depth}}, timeout=_TIMEOUT_PROBE)
+        except Exception:
+            pass
+
+
+def _snapshot_max_depth() -> int | None:
+    """IMIRROR_SNAPSHOT_MAX_DEPTH (1-200), or None to keep WDA's own 50.
+
+    A heavy /source (a long Safari page) can kill the runner, which resets
+    the phone's USB link, and a lower depth makes it cheaper. It is off by
+    default: WDA applies it to every element lookup too, so an element
+    nested deeper is not found at all. Measure on a phone before setting
+    it. Never raises."""
+    try:
+        n = int(os.environ.get("IMIRROR_SNAPSHOT_MAX_DEPTH", ""))
+    except ValueError:
+        return None
+    return n if 1 <= n <= 200 else None
 
 
 def _wda_error(j: Any) -> str | None:
@@ -1693,6 +1821,11 @@ def _find_element_or_timeout(text: str, visible_only: bool = False) -> tuple[str
 # but info-dense tree, and a byte cap would truncate mid-element. The full
 # payload is always parsed first; only the rendered output is capped.
 _SOURCE_MAX_ELEMENTS = 400
+# A huge label (web page text) can still flood replies.
+_SOURCE_MAX_FIELD_CHARS = 240
+_SOURCE_MAX_TEXT_CHARS = 20000
+_SOURCE_TEXT_FIELDS = (("label", "label"), ("name", "name"),
+                       ("value", "value"), ("identifier", "id"))
 
 # "Content" roles are always rendered, even with an empty label, because they're
 # the elements an agent actually taps/reads. Pure containers (Other, Window,
@@ -1841,11 +1974,18 @@ def _render_source_line(depth: int, node: dict[str, Any],
                         win_w: float, win_h: float) -> str:
     short = _source_short_type(node.get("type"))
     parts = [("  " * depth) + short]
-    for field, tag in (("label", "label"), ("name", "name"),
-                       ("value", "value"), ("identifier", "id")):
+    seen: set[str] = set()
+    for field, tag in _SOURCE_TEXT_FIELDS:
         v = node.get(field)
         if v:
-            parts.append(f'{tag}="{v}"')
+            value = str(v)
+            if value in seen:             # name often repeats the label
+                continue
+            seen.add(value)
+            if len(value) > _SOURCE_MAX_FIELD_CHARS:
+                value = value[:_SOURCE_MAX_FIELD_CHARS - 1] + "…"
+            # JSON quoting keeps a multi-line label on one line.
+            parts.append(f"{tag}={json.dumps(value, ensure_ascii=False)}")
     flags = [name for name, v in (("enabled", node.get("enabled")),
                                   ("visible", node.get("visible")),
                                   ("hittable", node.get("hittable"))) if v is True]
@@ -1871,11 +2011,28 @@ def _render_source_text(root: dict[str, Any]) -> str:
     lines = ["# tap point = (x + w/2, y + h/2) in normalized [0,1] coords, "
              "multiply by window size"]
     total = len(elements)
+    # Leave room for the notice, keeping output under the cap.
+    notice = (f"… ({total} elements dropped; field values truncated; "
+              "use ios_source(format='xml') for more detail.)")
+    used = len(lines[0])
+    emitted = 0
+    fields_truncated = False
     for depth, node in elements[:_SOURCE_MAX_ELEMENTS]:
-        lines.append(_render_source_line(depth, node, win_w, win_h))
-    dropped = total - _SOURCE_MAX_ELEMENTS
-    if dropped > 0:
-        lines.append(f"… ({dropped} elements dropped; refine with a more specific screen)")
+        line = _render_source_line(depth, node, win_w, win_h)
+        if used + 1 + len(line) + 1 + len(notice) > _SOURCE_MAX_TEXT_CHARS:
+            break                         # whole lines only
+        lines.append(line)
+        used += 1 + len(line)
+        emitted += 1
+        fields_truncated |= any(len(str(node.get(field) or "")) > _SOURCE_MAX_FIELD_CHARS
+                                for field, _ in _SOURCE_TEXT_FIELDS)
+    dropped = total - emitted
+    if dropped or fields_truncated:
+        details = [f"{dropped} elements dropped"] if dropped else []
+        if fields_truncated:
+            details.append("field values truncated")
+        lines.append("… (" + "; ".join(details) +
+                     "; use ios_source(format='xml') for more detail.)")
     return "\n".join(lines)
 
 
@@ -1885,13 +2042,15 @@ def _render_source_text(root: dict[str, Any]) -> str:
 def ios_status() -> str:
     """Check whether WebDriverAgent is up and ready to accept commands.
 
-    Returns a short JSON summary (ready flag, iOS version, device name, and this
-    MCP server's version and file). Call this first if other tools fail — a
-    not-ready/unreachable result means the iMirror app isn't running or its
-    health dot isn't green yet. With iMirror's device file it also gives the
-    app's view: app_state, reason (why it is not ready), state_since,
-    chain_epoch, next_retry_at, last_error and the phone's last 5 events.
-    While WDA is down this call fails too; ios_devices still shows that view.
+    Returns a short JSON summary (ready flag, iOS version, device name, this
+    MCP server's version and file, and which target answered: `target`
+    "device" or "simulator", `wda_endpoint`, `selected_udid`). Call this
+    first if other tools fail — a not-ready/unreachable result means the
+    iMirror app isn't running or its health dot isn't green yet. With
+    iMirror's device file it also gives the app's view: app_state, reason
+    (why it is not ready), state_since, chain_epoch, next_retry_at,
+    last_error and the phone's last 5 events. While WDA is down this call
+    fails too; ios_devices still shows that view.
     """
     _, j = _req("GET", "/status")
     v = j.get("value", {})
@@ -1903,6 +2062,8 @@ def ios_status() -> str:
         **_server_identity(),
     }
     t = _cur()
+    # Which endpoint answered, so a wrong pin shows here.
+    out.update(target=t.kind, wda_endpoint=t.wda, selected_udid=t.udid)
     if t is not _LEGACY:                 # list mode: say which phone answered
         out.update(alias=t.alias, udid=t.udid, kind=t.kind, **_chain_fields(t),
                    events=_recent_events({t.udid} if t.udid else set()).get(t.udid, []))
@@ -2189,9 +2350,11 @@ def ios_source(format: str = "text") -> str:
     be briefly stale. Pure containers (Other/Window/Group/...) are collapsed
     unless they carry their own label/value/identifier or are interactive;
     content elements (buttons, text, fields, images, cells, ...) always
-    appear, even with an empty label. Output is capped at 400 elements (by
-    count, not bytes — the full tree is always parsed first); a trailing line
-    reports how many were dropped, if any. This is far cheaper for an agent to
+    appear, even with an empty label. Identical field values appear once.
+    Output is capped at 400 elements and 20,000 characters, with each field
+    value cut to 240 characters; the full tree is parsed first. A trailing
+    line says how many elements were dropped or that fields were cut, and
+    points to format="xml" for more. This is far cheaper for an agent to
     read than the raw XML — prefer it unless you need the exact raw markup.
 
     `format="xml"` returns the raw WDA source string unchanged (today's
@@ -2498,6 +2661,59 @@ def ios_press_button(name: str = "home") -> str:
         _session_post("/wda/pressButton", {"name": name})
     _record("press_button", name)
     return f"pressed {name}"
+
+
+def _alert_call(method: str, route: str, body: dict | None = None) -> tuple[bool, Any]:
+    """One WDA alert request: (False, None) when no alert is up, else
+    (True, value). Errors name WDA's error but never quote its message,
+    which can carry the alert's own text, such as a one-time code."""
+    code, j = _session_call(method, route, body, _TIMEOUT_INTERACT)
+    if code == 404 and _wda_error(j) == "no such alert":
+        return False, None
+    if code >= 400:
+        err = _wda_error(j)
+        raise MCPToolError(
+            f"WDA alert request failed (HTTP {code}{', ' + err if err else ''}) on {route}.",
+            kind=ErrorKind.WDA_HTTP, code=f"WDA_HTTP_{code}")
+    return True, (j.get("value") if isinstance(j, dict) else None)
+
+
+@_tool()
+def ios_alert(action: str = "get", button_label: str = "") -> str:
+    """Read a system alert, or accept or dismiss it.
+
+    `get` returns {"present", "text", "buttons"}, or {"present": false} when
+    no alert is up. `accept` and `dismiss` press WDA's default button, or the
+    button whose label is exactly `button_label`. Read first, then choose.
+    Use it when ios_source and the screenshot disagree: an alert can cover
+    the app. Alert text never goes into run recordings, and a lost reply to
+    accept/dismiss is never sent again (kind=outcome_unknown).
+    """
+    if action not in ("get", "accept", "dismiss"):
+        raise MCPToolError("action must be 'get', 'accept', or 'dismiss'.",
+                           kind=ErrorKind.VALIDATION)
+    if not isinstance(button_label, str) or (action == "get" and button_label):
+        raise MCPToolError("button_label must be text and is only valid for accept/dismiss.",
+                           kind=ErrorKind.VALIDATION)
+    if action == "get":
+        present, text = _alert_call("GET", "/alert/text")
+        if not present:
+            return json.dumps({"present": False})
+        present, buttons = _alert_call("GET", "/wda/alert/buttons")
+        if not present:                   # closed between the two reads
+            return json.dumps({"present": False})
+        if not isinstance(text, str) or not isinstance(buttons, list) or not all(
+                isinstance(b, str) for b in buttons):
+            raise MCPToolError("WDA returned an unexpected alert response.",
+                               kind=ErrorKind.WDA_HTTP, code="WDA_BAD_RESPONSE")
+        return json.dumps({"present": True, "text": text, "buttons": buttons})
+    present, _ = _alert_call("POST", f"/alert/{action}",
+                             {"name": button_label} if button_label else {})
+    if not present:
+        return json.dumps({"present": False})
+    # The button, never the alert's text.
+    _record("alert", f"{action} {button_label!r}" if button_label else action)
+    return json.dumps({"present": True, "action": action, "button_label": button_label})
 
 
 def _click_element(eid: str, text: str) -> None:

@@ -185,7 +185,7 @@ def test_tool_names_and_required_params_are_unchanged(reg):
         "ios_start_run": [], "ios_run_note": ["text"], "ios_run_section": ["title"],
         "ios_finish_run": [], "ios_assert_visible": ["text"],
         "ios_assert_not_visible": ["text"], "ios_run_sequence": ["steps"],
-        "ios_recover": [],
+        "ios_alert": [], "ios_recover": [],
     }
     got = {n: sorted(s.get("required", [])) for n, s in tool_schemas(reg.m).items()}
     assert got == {n: sorted(r) for n, r in expected.items()}
@@ -588,6 +588,13 @@ def test_ios_bin_comes_from_the_device_file(reg, monkeypatch, tmp_path):
 def test_status_names_the_phone_in_list_mode(reg, wda):
     out = json.loads(reg.m.ios_status(device="phone2"))
     assert out["alias"] == "phone2" and out["udid"] == PHONE_17 and out["ready"] is True
+
+
+def test_status_says_which_endpoint_answered_for_each_phone(reg, wda):
+    for alias, udid, port in (("phone1", PHONE_16E, 8100), ("phone2", PHONE_17, 8110)):
+        out = json.loads(reg.m.ios_status(device=alias))
+        assert (out["target"], out["wda_endpoint"], out["selected_udid"]) == (
+            "device", f"http://127.0.0.1:{port}", udid)
 
 
 # ---- parallel across phones, in order on one phone --------------------------------
