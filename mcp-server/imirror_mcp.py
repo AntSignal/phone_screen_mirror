@@ -97,8 +97,7 @@ class MCPToolError(RuntimeError):
     is additive, not a breaking change to the exception contract.
     """
 
-    # The W3C error name from WDA's reply, e.g. "stale element reference",
-    # when the failure came from one (see _wda_http_error).
+    # WDA's W3C error name, e.g. "stale element reference", if any.
     wda_error: str | None = None
 
     def __init__(self, message: str, *, kind: str, code: str | None = None):
@@ -968,7 +967,7 @@ def _wda_http_error(code: int, j: Any, where: str) -> MCPToolError:
         detail = f"{err}: {msg}" if isinstance(msg, str) and msg else err
     else:
         detail = str(j)[:300]
-    # WDA's own "timeout" (408) means slow, so poll loops ride it out.
+    # WDA's 408 "timeout" is slowness; poll loops ride it out.
     kind = ErrorKind.TIMEOUT if err == "timeout" else ErrorKind.WDA_HTTP
     e = MCPToolError(f"WDA error (HTTP {code}) on {where}: {detail}",
                      kind=kind, code=f"WDA_HTTP_{code}")
@@ -992,7 +991,7 @@ def _session_call(method: str, subpath: str, body: dict | None,
     err = _wda_error(j)
     if err is not None and err != "invalid session id":
         return code, j                      # a miss, a stale element, an unknown route
-    # The session is gone, or an older WDA build sent a bare 404: recreate once.
+    # Session gone, or an old WDA sent a bare 404: recreate once.
     t.session["id"] = None
     sid = _ensure_session()
     return _req(method, f"/session/{sid}{subpath}", body, timeout=timeout)

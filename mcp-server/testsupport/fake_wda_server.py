@@ -27,7 +27,7 @@ from urllib.parse import parse_qs, urlsplit
 PNG = b"\x89PNG\r\n\x1a\nfake"
 W3C_ELEMENT_KEY = "element-6066-11e4-a52e-4f735466cecf"
 
-# WDA puts NSThread.callStackSymbols here: long, and useless to an agent.
+# WDA sends NSThread.callStackSymbols here: long and useless.
 TRACEBACK = "\n".join(f"{i}   WebDriverAgentLib   0x00000001{i:08x} -[FBRoute mountRequest:]"
                       for i in range(40))
 
@@ -57,15 +57,14 @@ class FakeWDAServer:
         self.connections = 0                   # TCP connections accepted
         self.settings: dict[str, Any] = {}
         self.window = {"width": 402, "height": 874}
-        # label -> element ids handed out in turn (the last one repeats).
+        # label -> ids handed out in turn; the last repeats.
         self.find_ids: dict[str, list[str]] = {}
         self.stale: set[str] = set()           # ids whose click says "stale"
-        # route path (no query) -> seconds to sleep, one entry per request.
+        # route path -> seconds to sleep, one per request.
         self.delays: dict[str, list[float]] = {}
         # route path -> how many replies to cut off halfway (IncompleteRead).
         self.drops: dict[str, int] = {}
-        # Close the socket silently after this many more replies, the way
-        # CocoaHTTPServer drops an idle keep-alive connection.
+        # Hang up silently after N more replies, like CocoaHTTPServer idling.
         self.close_after: int | None = None
         self.json_source = True                # False: format=json is a 400
         # (method, path suffix) -> W3C errors to answer instead, in turn.
@@ -231,7 +230,7 @@ class _Server(ThreadingHTTPServer):
     fake: FakeWDAServer
 
     def handle_error(self, request, client_address):
-        pass  # a client that timed out and hung up is expected here
+        pass  # expected: a client timed out and hung up
 
 
 class _Handler(BaseHTTPRequestHandler):
