@@ -22,6 +22,9 @@ final class ChainManager {
     private let tunnel: TunnelSupervisor?
     private let registry = DeviceRegistryWriter()
     private let usbWatcher = USBDeviceWatcher()
+    private lazy var requests = RestartRequestWatcher(
+        dir: registry.url.deletingLastPathComponent().appendingPathComponent("requests", isDirectory: true))
+    private var requestGate = RestartRequestGate()
 
     /// Attached phones with a chain, by slot.
     private(set) var controllers: [DeviceController] = []
@@ -122,6 +125,7 @@ final class ChainManager {
                 guard let self, self.running else { return }
                 self.tunnel?.start()
                 self.watchUSB()
+                self.watchRequests()
                 self.poll()
                 let t = Timer(timeInterval: 3, repeats: true) { [weak self] _ in self?.poll() }
                 RunLoop.main.add(t, forMode: .common)
@@ -137,6 +141,7 @@ final class ChainManager {
         pollTimer?.invalidate()
         pollTimer = nil
         usbWatcher.stop()
+        requests.stop()
         for c in controllers { c.stop() }
         controllers = []
         problems = [:]
@@ -236,6 +241,25 @@ final class ChainManager {
         usbWatcher.onDetached = { [weak self] serial in self?.usbController(serial)?.usbDetached() }
         usbWatcher.onAttached = { [weak self] serial in self?.usbController(serial)?.usbReattached() }
         usbWatcher.start()
+    }
+
+    /// Clients' restart requests (README, "Files other tools read").
+    private func watchRequests() {
+        requests.onRequest = { [weak self] r in self?.handle(r) }
+        requests.start()
+    }
+
+    private func handle(_ r: RestartRequest) {
+        let c = controller(r.udid)
+        let outcome = requestGate.decide(r, attached: c?.chain != nil, wallNow: Date(),
+                                         uptime: ProcessInfo.processInfo.systemUptime)
+        NSLog("iMirror: restart request for \(r.udid) from \(r.requestedBy): \(outcome.rawValue)")
+        if let c {
+            c.restartRequested(outcome)
+        } else {
+            EventLog.shared.write(DeviceEvent(at: Date(), udid: r.udid, alias: "", event: .request,
+                                              detail: outcome.rawValue))
+        }
     }
 
     private func usbController(_ serial: String) -> DeviceController? {
