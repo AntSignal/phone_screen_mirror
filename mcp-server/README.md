@@ -14,8 +14,8 @@ its self-managed transport (userspace tunnel + runwda + forward + relay).
 
 | Tool | What it does |
 |------|--------------|
-| `ios_status` | WDA ready? + iOS version / device name |
-| `ios_devices` | every device this server can drive (alias, UDID, port, ready?) and which one is the default |
+| `ios_status` | WDA ready? + iOS version / device name, and which server answered (`server_version`, `script_path`) |
+| `ios_devices` | every device this server can drive (alias, UDID, port, ready?, how its WDA sessions were got) and which one is the default |
 | `ios_window_size` | logical screen size (points) for the current orientation |
 | `ios_screenshot` | full-res device screenshot (PNG, or JPEG on a device via `IMIRROR_SCREENSHOT_QUALITY`) — no macOS Screen Recording perm needed |
 | `ios_tap(x, y)` | tap at a point (points, top-left origin) |
@@ -84,8 +84,47 @@ ios_run_sequence steps=[…] device="phone1"   # one device for the whole sequen
   server uses the device file, and falls back to `127.0.0.1:8100` when there is
   no live file (an older iMirror app, or the app isn't running). `ios_devices`
   reports which mode it is in. `IMIRROR_DEVICES_FILE` overrides the file's path.
+- **A pinned default never falls back.** With `IMIRROR_DEFAULT_DEVICE` set
+  (run.sh sets it per agent) and no live file, a call that names no device
+  fails with `DEVICE_FILE_INVALID` instead of driving `:8100`, which may be
+  another phone. A pin of `default`, or of `IMIRROR_UDID`, still uses it.
 - The file is only trusted while the app that wrote it is running, and only
-  loopback entries are used — WDA has no auth on the wire.
+  loopback entries are used — WDA has no auth on the wire. "Running" means
+  the `owner_pid` is a live process that is not a zombie and, when the file
+  has `owner_uniqueid`, is the very process that wrote it (macOS's kernel
+  uniqueid is never reused within a boot, unlike a pid).
+
+## Sharing a phone: WDA sessions
+
+WebDriverAgent keeps **one session per phone**, and creating a session ends
+the one that was there. Several clients share each phone (the iMirror app's
+mirror, every agent's MCP server), so this server avoids creating one:
+
+- **It joins the session already on the phone.** With no session of its own
+  it reads `GET /status` and adopts the active one, re-applying its two
+  settings (no idle wait; `screenshotQuality`); it creates one only when the
+  phone has none. Screenshots, `ios_window_size` and `ios_source` use WDA's
+  sessionless routes and never create one.
+- **A miss is not a dead session.** WDA answers 404 for four things. Only
+  `invalid session id` replaces the session: the reply names the session now
+  active, which is adopted (another client made it), or none (WDA restarted:
+  a new one is created). `no such element` is a clean miss; a click that hits
+  `stale element reference` re-finds the element once; any other 4xx raises
+  `WDA_HTTP_<code>`.
+- **`SESSION_CONTESTED`** means another session replaced this server's twice
+  within 60 s (a WDA restart does not count), so something keeps creating
+  sessions on that phone: another agent's server, an
+  old iMirror server, or iMirror itself while a system alert is up. The action
+  was not run. Take a screenshot; tap a system alert by coordinates if one is
+  showing; otherwise check `ios_devices` rather than retrying in a loop. Its
+  per-device `session` counts (`created`, `adopted`, `lost`) show the history.
+
+Nothing here orders two servers' calls to one phone: calls are serialised per
+phone only within one server process.
+
+A server exits as soon as its client is gone: when its stdin closes, or when
+its parent process changes (it was orphaned). It does not wait for a tool
+call still blocked on WDA.
 
 ## Setup
 
@@ -191,11 +230,15 @@ and give me a report".
 
 ## Tests
 
-The unit tests stub the HTTP layer, so no device or WebDriverAgent is needed:
+No device or WebDriverAgent is needed. Most tests stub the HTTP layer;
+`test_wda_wire.py` runs the real wire layer against
+`testsupport/fake_wda_server.py`, a keep-alive loopback server that answers
+with the vendored WDA's real reply bodies and can stall, drop a connection,
+or hand the phone's session to another client:
 
 ```bash
 mcp-server/.venv/bin/pip install pytest
-mcp-server/.venv/bin/python -m pytest mcp-server/test_imirror_mcp.py
+mcp-server/.venv/bin/python -m pytest mcp-server
 ```
 
 ## Security

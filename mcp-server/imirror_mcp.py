@@ -158,8 +158,8 @@ _IS_SIM = TARGET == "simulator"
 # ---- Targets: which phone a call drives -----------------------------------------
 #
 # A _Target is one WDA endpoint plus everything that must NOT be shared between
-# phones: the WDA session id, the cached window size, the gesture lock, and a
-# per-phone call lock. Three modes decide where targets come from:
+# phones: the WDA session id, the cached window size, and a per-phone call
+# lock. Three modes decide where targets come from:
 #
 #   pinned   — IMIRROR_WDA is set. Exactly one target (_LEGACY), exactly the
 #              pre-multi-device behaviour. Keeps the `imirror-sim` registration
@@ -180,18 +180,20 @@ class _Target:
         default_factory=lambda: {"id": None})
     window: dict[str, Any] = dataclasses.field(
         default_factory=lambda: {"size": None, "t": 0.0})
-    # Serialises /actions posts on this phone. WDA has one XCUITest queue per
-    # phone; two overlapping gestures stall it and can wedge the wire.
-    gesture_lock: Any = dataclasses.field(default_factory=threading.Lock)
     # Held for a whole tool call, so calls to ONE phone run in order (as they
     # always did) while calls to different phones run side by side. Re-entrant
-    # so ios_run_sequence's steps can run inside the sequence's own hold.
+    # so ios_run_sequence's steps can run inside the sequence's own hold. This
+    # is also what keeps two gestures from overlapping on one phone's single
+    # XCUITest queue, but only within this process: nothing orders calls from
+    # another MCP server until the device lease exists.
     call_lock: Any = dataclasses.field(default_factory=threading.RLock)
     # When WDA said this server's session was gone.
     session_losses: list[float] = dataclasses.field(default_factory=list)
     # How this server got its sessions, shown by ios_devices.
     session_stats: dict[str, int] = dataclasses.field(
         default_factory=lambda: {"created": 0, "adopted": 0, "lost": 0})
+    # Whether this WDA serves /source?format=json; None until tried.
+    json_source: bool | None = None
     product_type: str | None = None
     ios_version: str | None = None
     state: str | None = None
@@ -406,6 +408,7 @@ class _Registry:
             t.wda = wda
             t.session["id"] = None
             t.session_losses.clear()
+            t.json_source = None             # may be another WDA build now
             t.window.update(size=None, t=0.0)
         t.alias, t.kind = alias, kind
 
@@ -1226,10 +1229,6 @@ def _pointer(steps: list[dict]) -> dict:
                          "parameters": {"pointerType": "touch"}, "actions": steps}]}
 
 
-# Gesture (/actions) posts are serialised per phone by _Target.gesture_lock:
-# WDA has a single XCUITest queue per phone, and two overlapping gestures stall
-# it and can wedge the wire. Different phones' gestures don't wait on each other.
-
 # Serialise the simulator recorder handoff (start/stop) across threads. Two
 # racing ios_start_run calls could otherwise interleave their _run["recorder"]
 # mutations and orphan a recordVideo child with no reference left to kill it.
@@ -1239,13 +1238,9 @@ _recorder_lock = threading.RLock()
 
 
 def _gesture(steps: list[dict]) -> None:
-    lock = _cur().gesture_lock
-    if not lock.acquire(timeout=5):
-        raise RuntimeError("WDA gesture lock timeout — another gesture is stuck")
-    try:
-        _session_post("/actions", _pointer(steps))
-    finally:
-        lock.release()
+    """Send one pointer gesture. The caller's call_lock keeps it from
+    overlapping another gesture on this phone from this process."""
+    _session_post("/actions", _pointer(steps))
 
 
 def _win_size() -> tuple[float, float]:
@@ -1468,18 +1463,27 @@ def _norm_source_json(d: dict) -> dict[str, Any] | None:
 
 
 def _fetch_source_json_tree() -> dict[str, Any] | None:
-    """Probe WDA's JSON source once. Returns a normalized root node, or None if
-    this WDA build doesn't support it (non-2xx, missing/non-dict `value`, or the
-    request itself blows up) so the caller falls back to XML. Never raises."""
+    """Read WDA's JSON source. Returns a normalized root node, or None when
+    this WDA build doesn't serve it, so the caller falls back to XML.
+
+    A stalled or unreachable WDA raises: falling back to XML then only waits
+    out the same stall a second time. A 4xx or a non-JSON or non-tree reply
+    marks the build unsupported, so later reads skip straight to XML."""
+    t = _cur()
+    if t.json_source is False:
+        return None
     try:
         code, j = _req_tree("/source?format=json")
-    except Exception:
-        return None
-    if code >= 400:
+    except ValueError:                       # a 2xx body that is not JSON
+        t.json_source = False
         return None
     value = j.get("value")
-    if not isinstance(value, dict):
+    if code >= 500:
+        return None                          # maybe passing; try JSON again later
+    if code >= 400 or not isinstance(value, dict):
+        t.json_source = False
         return None
+    t.json_source = True
     return _norm_source_json(value)
 
 
@@ -1565,9 +1569,9 @@ def ios_status() -> str:
     """Check whether WebDriverAgent is up and ready to accept commands.
 
     Returns a short JSON summary (ready flag, iOS version, device name, and this
-    MCP server's version). Call this first if other tools fail — a not-ready/
-    unreachable result means the iMirror app isn't running or its health dot isn't
-    green yet.
+    MCP server's version and file). Call this first if other tools fail — a
+    not-ready/unreachable result means the iMirror app isn't running or its
+    health dot isn't green yet.
     """
     _, j = _req("GET", "/status")
     v = j.get("value", {})
@@ -1576,12 +1580,18 @@ def ios_status() -> str:
         "message": v.get("message"),
         "ios": v.get("os", {}).get("version"),
         "device": v.get("device"),
-        "server_version": __version__,
+        **_server_identity(),
     }
     t = _cur()
     if t is not _LEGACY:                 # list mode: say which phone answered
         out.update(alias=t.alias, udid=t.udid, kind=t.kind)
     return json.dumps(out)
+
+
+def _server_identity() -> dict[str, str]:
+    """Which server answered: a session can then spot one running from a
+    stale checkout or a dev tree instead of the installed copy."""
+    return {"server_version": __version__, "script_path": os.path.realpath(__file__)}
 
 
 _PROBE_S = 2.0
@@ -1609,12 +1619,12 @@ def _probe_status(t: _Target) -> dict[str, Any]:
 def ios_devices() -> str:
     """List the devices this server can drive, and whether each one answers.
 
-    Returns JSON {"mode", "default", "devices": [{"alias", "udid", "kind",
-    "product_type", "ios", "wda", "app_state", "wda_ready", "is_default",
-    "session"}]}. `session` counts how this server got its WDA sessions
-    (created, adopted from another client, lost): losses mean another
-    client on this phone. Pass a device's `alias` (or its UDID) as `device`
-    to any other tool.
+    Returns JSON {"mode", "default", "server_version", "script_path",
+    "devices": [{"alias", "udid", "kind", "product_type", "ios", "wda",
+    "app_state", "wda_ready", "is_default", "session"}]}. `session` counts
+    how this server got its WDA sessions (created, adopted from another
+    client, lost): losses mean another client on this phone. Pass a device's
+    `alias` (or its UDID) as `device` to any other tool.
     `mode` is "list" when the iMirror app is publishing its phones, "pinned"
     when IMIRROR_WDA fixes one target, and "fallback" when neither (then only
     127.0.0.1:8100 is known). `default` is the device a call without `device`
@@ -1638,7 +1648,8 @@ def ios_devices() -> str:
             "session": {"cached": bool(t.session["id"]), **t.session_stats},
             **({"error": p["error"]} if "error" in p else {}),
         })
-    out: dict[str, Any] = {"mode": mode, "default": default, "devices": devices}
+    out: dict[str, Any] = {"mode": mode, "default": default, **_server_identity(),
+                           "devices": devices}
     if mode == "fallback":
         out["note"] = f"not using an iMirror device file: {_REGISTRY.problem}"
     return json.dumps(out)
@@ -1881,8 +1892,7 @@ def ios_await_idle(timeout_s: float = 5.0, min_stable_ms: int = 600) -> str:
     A genuine transport failure (WDA unreachable/wedged) still raises out of
     this call — only "didn't settle in time" is swallowed into a verdict.
 
-    Read-only: does not take the gesture lock, so it's safe to call alongside
-    other read tools. Each poll is a full compact-tree read (the same heavy
+    Read-only, so it's safe to call alongside other read tools. Each poll is a full compact-tree read (the same heavy
     /source call ios_source makes), so a long timeout_s here means real
     device round-trips — call it deliberately, not in a tight loop.
     """
@@ -3449,6 +3459,83 @@ _REPORT_CSS = """
 """
 
 
+def _exit_reason(start_ppid: int, now_ppid: int, stdin_closed: bool) -> str | None:
+    """Why this server should stop now, or None to keep serving.
+
+    A server whose client is gone can never be called again, yet such
+    servers stayed alive: another process can hold the client's stdin
+    pipe open after the client dies, and a tool stuck on WDA keeps the
+    process up after EOF. A new parent pid means we were orphaned, and
+    so does pid 1 (launchd), which adopts orphans: a parent can die
+    before this server is up far enough to note its pid.
+    """
+    if stdin_closed:
+        return "stdin closed"
+    if now_ppid != start_ppid or now_ppid == 1:
+        return f"parent {start_ppid} is gone"
+    return None
+
+
+def _stdin_eof_queue(fd: int):
+    """A kqueue that fires when fd's writer hangs up, or None.
+
+    kqueue reports EV_EOF without reading, so FastMCP still gets every
+    byte of stdin. EV_CLEAR makes it fire once per change, not spin
+    while a message waits to be read. None off macOS, or when fd is
+    not something kqueue can watch.
+    """
+    import select
+    if not hasattr(select, "kqueue"):
+        return None
+    kq = select.kqueue()
+    try:
+        flags = select.KQ_EV_ADD | select.KQ_EV_CLEAR
+        kq.control([select.kevent(fd, select.KQ_FILTER_READ, flags)], 0, 0)
+    except OSError:
+        kq.close()
+        return None
+    return kq
+
+
+def _watch_client(fd: int, start_ppid: int, on_exit, interval: float = 2.0) -> None:
+    """Call on_exit(reason) once stdin closes or the parent changes.
+
+    Runs on its own thread. It checks the parent every interval
+    seconds and wakes at once when the stdin pipe closes.
+    """
+    import select
+    kq = _stdin_eof_queue(fd)
+    while True:
+        closed = False
+        if kq is None:
+            time.sleep(interval)
+        else:
+            events = kq.control(None, 1, interval)
+            closed = any(e.flags & select.KQ_EV_EOF for e in events)
+        reason = _exit_reason(start_ppid, os.getppid(), closed)
+        if reason:
+            on_exit(reason)
+            return
+
+
+def _exit_now(reason: str) -> None:
+    """Stop the whole process, even with a tool thread stuck on WDA.
+
+    os._exit skips atexit, so run those hooks first: one stops a
+    Simulator recording that would otherwise run forever.
+    """
+    print(f"imirror_mcp: exiting, {reason}", file=sys.stderr, flush=True)
+    try:
+        atexit._run_exitfuncs()
+    finally:
+        os._exit(0)
+
+
+def _start_client_watch() -> None:
+    threading.Thread(target=_watch_client, name="client-watch", daemon=True,
+                     args=(sys.stdin.fileno(), os.getppid(), _exit_now)).start()
+
+
 def _autowda_bring_up() -> None:
     """Bring WDA up ourselves before serving, when IMIRROR_AUTOWDA is set.
 
@@ -3486,5 +3573,8 @@ def _autowda_bring_up() -> None:
 
 
 if __name__ == "__main__":
+    _start_client_watch()
     _autowda_bring_up()
     mcp.run()
+    # Don't wait on a tool thread still blocked on WDA.
+    _exit_now("stdin closed")

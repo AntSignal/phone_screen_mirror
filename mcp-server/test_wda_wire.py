@@ -43,6 +43,13 @@ def test_a_tap_goes_over_one_kept_alive_connection(m, fake):
     assert fake.connections == 1
 
 
+def test_a_call_through_mcp_runs_on_a_worker_thread_over_real_sockets(m, fake):
+    import anyio
+    fake.find_ids["OK"] = ["e1"]
+    anyio.run(m.mcp.call_tool, "ios_find_and_tap", {"text": "OK"})
+    assert fake.count("POST", f"/session/{fake.active}/element/e1/click") == 1
+
+
 # ---- mcp-core-2: a reused socket must take each request's timeout -------------
 
 def test_a_reused_socket_gets_the_longer_timeout_it_was_asked_for(m, fake):
@@ -280,3 +287,50 @@ def test_without_leave_to_adopt_a_fresh_server_refuses_too(m, fake, monkeypatch)
         m.ios_tap(1, 1)
     assert e.value.error_code == "SESSION_STOLEN"
     assert fake.count("POST", "/session") == 0 and fake.active == theirs
+
+
+# ---- mcp-tools-6: the JSON source probe must not hide a stalled WDA -----------
+
+def test_a_stalled_json_source_raises_instead_of_reading_xml_too(m, fake, monkeypatch):
+    """Swallowing the JSON probe's timeout and then reading XML doubled the
+    wait on a stalled WDA (up to ~245 s at the real tiers) before failing."""
+    monkeypatch.setattr(m, "_TIMEOUT_TREE", 0.3)
+    monkeypatch.setattr(m, "_TIMEOUT_PROBE", 0.2)
+    fake.delays["/source"] = [0.6, 0.6]
+    with pytest.raises(m.MCPToolError) as e:
+        m.ios_source()
+    assert e.value.error_kind == m.ErrorKind.WEDGED
+    assert "/source" not in fake.paths("GET")        # no XML read after it
+
+
+def test_json_source_unsupported_is_remembered(m, fake):
+    fake.json_source = False                          # this build: a 400
+    m.ios_source()
+    m.ios_source()
+    assert fake.paths("GET").count("/source?format=json") == 1
+    assert fake.paths("GET").count("/source") == 2
+
+
+def test_a_non_json_reply_to_the_json_probe_falls_back_to_xml(m, fake, monkeypatch):
+    real = m._req_tree
+
+    def not_json(path):
+        if path == "/source?format=json":
+            raise json.JSONDecodeError("Expecting value", "<html>", 0)
+        return real(path)
+    monkeypatch.setattr(m, "_req_tree", not_json)
+    assert 'label="OK"' in m.ios_source()
+    assert m._LEGACY.json_source is False
+
+
+# ---- which server answered -----------------------------------------------------
+
+def test_status_and_devices_name_the_server_and_its_file(m, fake):
+    """A session can then spot a server running from a stale or dev tree."""
+    import os
+    want = {"server_version": m.__version__, "script_path": os.path.realpath(m.__file__)}
+    status = json.loads(m.ios_status())
+    devices = json.loads(m.ios_devices())
+    assert {k: status.get(k) for k in want} == want
+    assert {k: devices.get(k) for k in want} == want
+    assert want["script_path"].endswith("/imirror_mcp.py")
