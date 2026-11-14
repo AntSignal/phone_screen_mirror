@@ -7,7 +7,7 @@
 // 127.0.0.1; the initialiser refuses anything else.
 //
 // Robustness: WDA sessions are fragile (the runner can drop, restart, or expire).
-// `probe()` validates the live session and reports one of three states so the UI
+// `probe()` validates the live session and reports one of four states so the UI
 // can auto-reconnect. Input calls self-invalidate the session on a 404 so the
 // next probe transparently recreates it.
 //
@@ -22,6 +22,7 @@ final class WDAClient {
     /// Result of a health probe.
     enum Health {
         case down          // WDA/relay unreachable
+        case timedOut      // /status gave no answer in time (maybe just busy)
         case needsSession  // WDA is up but we have no valid session — create one
         case alive         // session valid, ready to drive
     }
@@ -100,50 +101,53 @@ final class WDAClient {
 
     // MARK: Health
 
-    /// Validates the current session (if any) and reports health. If a session
-    /// call fails, falls back to /status to distinguish a dead session (WDA up)
-    /// from WDA being unreachable.
+    /// Reports health, asking /status first: it is what decides whether WDA
+    /// is up. The session check after it only picks or makes a session, so a
+    /// slow session call on a busy WDA is never read as WDA being down.
     func probe(completion: @escaping (Health) -> Void) {
-        if let sid = sessionId {
-            send("GET", "/session/\(sid)/window/size", nil) { [weak self] code, json, error in
+        send("GET", "/status", nil) { [weak self] _, json, error in
+            guard let self else { return }
+            if let error {
+                completion((error as? URLError)?.code == .timedOut ? .timedOut : .down)
+                return
+            }
+            guard WDAParse.ready(json) else { completion(.down); return }
+            guard let sid = self.sessionId else { self.adopt(statusJSON: json, completion); return }
+            self.send("GET", "/session/\(sid)/window/size", nil) { [weak self] code, sizeJSON, error in
                 guard let self else { return }
                 if error == nil, let code, (200..<300).contains(code),
-                   let size = WDAParse.windowSize(json) {
+                   let size = WDAParse.windowSize(sizeJSON) {
                     self.deviceSize = size
                     completion(.alive)
+                } else if error != nil {
+                    completion(.alive)                         // /status answered; just slow
                 } else {
-                    self.sessionId = nil                       // session gone
-                    self.statusOrAdopt(completion)
+                    self.sessionId = nil                       // WDA says the session is gone
+                    self.adopt(statusJSON: json, completion)
                 }
             }
-        } else {
-            statusOrAdopt(completion)
         }
     }
 
-    /// No usable session of our own: read /status. WDA allows ONE session per
-    /// phone and creating one silently ends the old one — so if an agent (the
-    /// MCP server) already has a session, join it instead of reporting
+    /// No usable session of our own. WDA allows ONE session per phone and
+    /// creating one silently ends the old one — so if an agent (the MCP
+    /// server) already has a session, join it instead of reporting
     /// `.needsSession`, which would make the app create its own and yank the
     /// agent's out from under it mid-flow.
-    private func statusOrAdopt(_ completion: @escaping (Health) -> Void) {
-        send("GET", "/status", nil) { [weak self] _, json, error in
-            guard let self else { return }
-            guard error == nil, WDAParse.ready(json) else { completion(.down); return }
-            guard let active = WDAParse.activeSessionId(json) else { completion(.needsSession); return }
-            self.sessionId = active
-            // The mirror's MJPEG tuning is WDA-wide, so it must be re-applied
-            // when joining a session someone else created, or the stream drops
-            // to WDA's low defaults. The gesture settings match the MCP's own.
-            self.applyFastGestureSettings(sid: active)
-            self.applyMJPEGSettings(sid: active)
-            self.fetchWindowSize { result in
-                switch result {
-                case .success: completion(.alive)
-                case .failure:
-                    self.sessionId = nil
-                    completion(.needsSession)
-                }
+    private func adopt(statusJSON json: [String: Any]?, _ completion: @escaping (Health) -> Void) {
+        guard let active = WDAParse.activeSessionId(json) else { completion(.needsSession); return }
+        sessionId = active
+        // The mirror's MJPEG tuning is WDA-wide, so it must be re-applied
+        // when joining a session someone else created, or the stream drops
+        // to WDA's low defaults. The gesture settings match the MCP's own.
+        applyFastGestureSettings(sid: active)
+        applyMJPEGSettings(sid: active)
+        fetchWindowSize { [weak self] result in
+            switch result {
+            case .success: completion(.alive)
+            case .failure:
+                self?.sessionId = nil
+                completion(.needsSession)
             }
         }
     }

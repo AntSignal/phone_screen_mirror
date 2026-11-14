@@ -283,6 +283,9 @@ final class DeviceChain {
 
     func bounceMJPEGForward() { mjpegForward?.bounce() }
 
+    /// Requests waiting on this phone's WDA through its relay.
+    var relayInFlight: Int { relay.inFlight }
+
     /// Tunnel route → runner check/install → runwda + forwards. The install and
     /// `apps --list` go through the tunnel on iOS 17+, so they must wait for it.
     private func bringUp(generation gen: Int) {

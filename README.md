@@ -245,12 +245,15 @@ it skips the CFNetwork relay entirely — only the WDA HTTP path needs the relay
 Children run with a writable working dir (`~/Library/Application Support/iMirror`)
 and auto-restart on crash. `runwda` carries a readiness deadline: if WDA isn't
 serving within ~40 s the runner is killed and respawned, since a wedged runner
-otherwise never exits on its own. If that keeps failing, an escalation ladder
-does a full chain restart (fresh tunnel, runner, and both forwards); if the
-chain still won't come up, the app stops retrying and shows a "tap WDA to
-retry" state instead of looping forever. A separate MJPEG no-frame watchdog
-covers the case where WDA is healthy but no video frames arrive — it bounces
-the MJPEG forward first, then escalates the same way. Before each bring-up the
+otherwise never exits on its own. A phone is called down only after two
+failed health probes in a row, and a probe that times out while other requests
+(say an agent's slow `/source`) are already waiting on WDA counts as busy, not
+failed. If WDA stays down, a ladder restarts that phone's own chain first, then
+the shared tunnel. If it still won't come up, the app stops the chain and
+retries by itself after 2 min, then 5 min, then every 10 min; tapping the WDA
+dot retries at once. A separate MJPEG no-frame watchdog covers the case where
+WDA is healthy but no video frames arrive: it bounces the MJPEG forward (at
+most once a minute) and never restarts a WDA that still answers `/status`. Before each bring-up the
 app also sweeps any stray go-ios children left by a previously crashed
 instance — most often a tunnel reparented to `launchd` that would otherwise
 keep holding the device's RSD state and port 60105 and pin the dot on red. The
@@ -413,9 +416,9 @@ distribute the notarized DMG directly.
   physically rotation-tested.
 - Relaunching the app in quick succession can still briefly wedge the device's
   `testmanagerd`. Recovery now escalates in stages: a readiness-deadline
-  auto-restart of the runner, then a full chain restart, then (if the chain
-  still won't come up) a hard-stop "tap WDA to retry" state rather than
-  looping forever. A hard crash (rather than a clean quit) can orphan a go-ios
+  auto-restart of the runner, then a chain restart, then a tunnel restart, then
+  (if the chain still won't come up) a pause that retries by itself with a
+  growing backoff (2 min, 5 min, then every 10 min). A hard crash (rather than a clean quit) can orphan a go-ios
   child; the next launch sweeps it automatically.
 
 ## Credits
