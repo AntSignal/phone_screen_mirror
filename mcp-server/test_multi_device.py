@@ -185,6 +185,7 @@ def test_tool_names_and_required_params_are_unchanged(reg):
         "ios_start_run": [], "ios_run_note": ["text"], "ios_run_section": ["title"],
         "ios_finish_run": [], "ios_assert_visible": ["text"],
         "ios_assert_not_visible": ["text"], "ios_run_sequence": ["steps"],
+        "ios_recover": [],
     }
     got = {n: sorted(s.get("required", [])) for n, s in tool_schemas(reg.m).items()}
     assert got == {n: sorted(r) for n, r in expected.items()}

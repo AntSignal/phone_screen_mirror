@@ -1,8 +1,9 @@
 """The MCP server rides out a chain restart instead of failing at once.
 
 When WDA stops answering, the iMirror app is often already restarting that
-phone's chain and says so in devices.json. These tests write that file in a
-temp folder and drive a real-HTTP fake WDA, so no phone is needed.
+phone's chain and says so in devices.json. These tests write that file (and
+events.jsonl, and read the restart requests) in a temp folder, and drive a
+real-HTTP fake WDA, so no phone is needed.
 """
 from __future__ import annotations
 
@@ -82,6 +83,7 @@ def load(monkeypatch, tmp_path):
     monkeypatch.setattr(m, "_RIDE_OUT_S", 3.0)
     monkeypatch.setattr(m, "_RIDE_OUT_POLL_S", 0.05)
     monkeypatch.setattr(m, "_NOTICE_S", 0.3)
+    monkeypatch.setattr(m, "_RECOVER_WAIT_S", 3.0)
     return m
 
 
@@ -241,7 +243,7 @@ def test_a_phone_the_app_gave_up_on_says_when_it_retries(dead):
     assert e.value.error_code == "DEVICE_GAVE_UP"
     assert "next_retry_at=2099-01-01T00:00:00Z" in str(e.value)
     assert e.value.fields["retry_after_s"] > 0
-    assert "runwda exited" in str(e.value)
+    assert "runwda exited" in str(e.value) and "ios_recover" in str(e.value)
 
 
 def test_an_old_apps_failed_state_is_a_give_up_without_a_retry_time(dead):
@@ -338,3 +340,132 @@ def test_a_failed_ride_out_records_one_fail_step(dead, monkeypatch, tmp_path):
     fails = [s for s in m._run["steps"] if m._step_is_fail(s)]
     assert len(fails) == 1
     assert fails[0]["verdict"]["error_code"] == "RECOVERING"
+
+
+# ---- events in ios_status / ios_devices ------------------------------------------
+
+def test_status_shows_the_apps_view_and_the_last_five_events(live):
+    m, app = live
+    app.write("ready", chain_epoch=4, state_since="2026-11-13T10:05:00Z")
+    app.log(PHONE, "state", path=app.events + ".1", to="old")
+    for i in range(7):
+        app.log(PHONE, "state", ts=f"2026-11-13T10:00:0{i}.000Z", to=f"s{i}")
+        app.log(OTHER, "restart")
+    with open(app.events, "a") as f:
+        f.write("not json\n{\"udid\": [1]}\n")
+    out = json.loads(m.ios_status())
+    assert out["app_state"] == "ready" and out["chain_epoch"] == 4
+    assert out["state_since"] == "2026-11-13T10:05:00Z" and out["reason"] is None
+    assert [e["to"] for e in out["events"]] == ["s2", "s3", "s4", "s5", "s6"]
+    assert "udid" not in out["events"][0]
+
+
+def test_events_fall_back_to_the_rotated_file(live):
+    m, app = live
+    app.log(PHONE, "give_up", path=app.events + ".1", reason="gave_up")
+    app.log(PHONE, "auto_retry")
+    events = m._recent_events({PHONE})[PHONE]
+    assert [e["event"] for e in events] == ["give_up", "auto_retry"]
+
+
+def test_events_are_read_from_the_end_of_a_big_file(live, monkeypatch):
+    m, app = live
+    monkeypatch.setattr(m, "_EVENTS_TAIL_BYTES", 4096)
+    app.log(PHONE, "state", to="ancient")
+    for _ in range(200):
+        app.log(OTHER, "state", detail="x" * 40)
+    app.log(PHONE, "usb_reset", expected=True)
+    events = m._recent_events({PHONE})[PHONE]
+    assert events == [{"ts": "2026-11-13T10:00:00.000Z", "event": "usb_reset",
+                       "expected": True}]
+
+
+def test_devices_lists_each_phones_reason_and_events(live, monkeypatch):
+    m, app = live
+    monkeypatch.setattr(m, "_probe_status", lambda t: {"wda_ready": False})
+    app.write("down", reason="gave_up", next_retry_at="2026-11-13T10:10:00Z", chain_epoch=9)
+    app.log(PHONE, "give_up")
+    d = json.loads(m.ios_devices())["devices"][0]
+    assert (d["app_state"], d["reason"], d["chain_epoch"], d["next_retry_at"]) == (
+        "down", "gave_up", 9, "2026-11-13T10:10:00Z")
+    assert [e["event"] for e in d["events"]] == ["give_up"]
+
+
+# ---- ios_recover -----------------------------------------------------------------
+
+def answer_request(app: App, detail: str, then=None) -> threading.Thread:
+    """Wait for a restart request, consume it and log the answer, as the app does."""
+    path = os.path.join(app.requests, f"restart-{PHONE}.json")
+    seen: dict = {}
+
+    def run():
+        for _ in range(200):
+            if os.path.exists(path):
+                with open(path, encoding="utf-8") as f:
+                    seen.update(json.load(f))
+                os.unlink(path)
+                app.log(PHONE, "request", ts=m_iso_now(), detail=detail)
+                if then:
+                    then()
+                return
+            time.sleep(0.02)
+    th = threading.Thread(target=run, daemon=True)
+    th.start()
+    th.seen = seen  # type: ignore[attr-defined]
+    return th
+
+
+def m_iso_now() -> str:
+    from datetime import datetime, timezone
+    return datetime.now(timezone.utc).isoformat(timespec="milliseconds").replace(
+        "+00:00", "Z")
+
+
+def test_recover_writes_a_request_and_waits_for_the_new_chain(live):
+    m, app = live
+
+    def restart():
+        app.write("starting", reason="recovering", chain_epoch=2)
+        app.later(0.2, app.write, "ready", chain_epoch=2)
+    th = answer_request(app, "accepted", then=restart)
+    out = json.loads(m.ios_recover())
+    th.join(1)
+    assert out["result"] == "accepted"
+    assert out["app_state"] == "ready" and out["chain_epoch"] == 2
+    assert th.seen["udid"] == PHONE and th.seen["requested_by"].startswith("imirror-mcp")
+    assert th.seen["requested_at"].endswith("Z")
+
+
+def test_recover_reports_a_cooldown_at_once(live):
+    m, app = live
+    answer_request(app, "cooldown")
+    t0 = time.monotonic()
+    out = json.loads(m.ios_recover())
+    assert out["result"] == "cooldown" and time.monotonic() - t0 < 2
+
+
+def test_recover_ignores_an_answer_to_an_older_request(live, monkeypatch):
+    m, app = live
+    monkeypatch.setattr(m, "_RECOVER_WAIT_S", 0.3)
+    app.log(PHONE, "request", ts="2020-01-01T00:00:00.000Z", detail="cooldown")
+    out = json.loads(m.ios_recover())
+    assert out["result"] == "timeout"
+
+
+def test_recover_times_out_and_withdraws_an_unread_request(live, monkeypatch):
+    m, app = live
+    monkeypatch.setattr(m, "_RECOVER_WAIT_S", 0.3)
+    out = json.loads(m.ios_recover())
+    assert out["result"] == "timeout" and "older build" in out["hint"]
+    assert os.listdir(app.requests) == []
+
+
+def test_recover_needs_the_device_file(monkeypatch, tmp_path, fake):
+    monkeypatch.setenv("IMIRROR_WDA", fake.url)
+    monkeypatch.delenv("IMIRROR_UDID", raising=False)
+    monkeypatch.setenv("IMIRROR_DEVICES_FILE", str(tmp_path / "devices.json"))
+    sys.modules.pop("imirror_mcp", None)
+    m = importlib.import_module("imirror_mcp")
+    with pytest.raises(m.MCPToolError) as e:
+        m.ios_recover()
+    assert e.value.error_code == "DEVICE_FILE_INVALID"
