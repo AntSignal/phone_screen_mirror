@@ -111,8 +111,9 @@ mirror, every agent's MCP server), so this server avoids creating one:
   a new one is created). `no such element` is a clean miss; a click that hits
   `stale element reference` re-finds the element once; any other 4xx raises
   `WDA_HTTP_<code>`.
-- **`SESSION_CONTESTED`** means the session was lost twice within 60 s, so
-  something keeps creating sessions on that phone: another agent's server, an
+- **`SESSION_CONTESTED`** means another session replaced this server's twice
+  within 60 s (a WDA restart does not count), so something keeps creating
+  sessions on that phone: another agent's server, an
   old iMirror server, or iMirror itself while a system alert is up. The action
   was not run. Take a screenshot; tap a system alert by coordinates if one is
   showing; otherwise check `ios_devices` rather than retrying in a loop. Its
