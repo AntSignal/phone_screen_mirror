@@ -11,6 +11,7 @@
 //
 // Main thread only.
 
+import AppKit
 import Darwin
 import Foundation
 import iMirrorCore
@@ -20,6 +21,12 @@ final class ChainManager {
     private let workDir: URL
     private let tunnel: TunnelSupervisor?
     private let registry = DeviceRegistryWriter()
+    private let usbWatcher = USBDeviceWatcher()
+    private lazy var requests = RestartRequestWatcher(
+        dir: registry.url.deletingLastPathComponent().appendingPathComponent("requests", isDirectory: true))
+    private var requestGate = RestartRequestGate()
+    private let sleepAssertion = SleepAssertion()
+    private var powerTimer: Timer?
 
     /// Attached phones with a chain, by slot.
     private(set) var controllers: [DeviceController] = []
@@ -65,6 +72,37 @@ final class ChainManager {
         } else {
             table = SlotTable()
         }
+        // Tunnel starts reset every phone's USB; those resets are ours.
+        tunnel?.onSpawn = { [weak self] in
+            DispatchQueue.main.async { self?.controllers.forEach { $0.noteOwnUSBChange() } }
+        }
+        watchPower()
+    }
+
+    /// Sleep marks every phone mac_asleep; wake restarts every chain at
+    /// once, since sleep dropped their USB.
+    private func watchPower() {
+        let nc = NSWorkspace.shared.notificationCenter
+        nc.addObserver(forName: NSWorkspace.willSleepNotification, object: nil, queue: .main) { [weak self] _ in
+            guard let self else { return }
+            self.controllers.forEach { $0.macWillSleep() }
+            // Write now: the Mac may sleep within 0.25 s.
+            if self.running, self.canSelfManage { self.registry.write(self.snapshot()) }
+        }
+        nc.addObserver(forName: NSWorkspace.didWakeNotification, object: nil, queue: .main) { [weak self] _ in
+            self?.controllers.forEach { $0.macDidWake() }
+            self?.updateSleepAssertion()
+        }
+    }
+
+    /// Hold the Mac awake only while a client drives a phone or one is
+    /// recovering (iMirrorCore/PowerPolicy.swift).
+    private func updateSleepAssertion() {
+        let now = ProcessInfo.processInfo.systemUptime
+        let lastTraffic = controllers.compactMap { $0.sampleTraffic(now: now) }.max()
+        let recovering = controllers.contains { SleepPolicy.isRecovering($0.reason, gaveUp: $0.ladder.hardStopped) }
+        sleepAssertion.set(SleepPolicy.keepAwake(automationOn: running, lastTrafficAt: lastTraffic,
+                                                 recovering: recovering, now: now))
     }
 
     /// True if the go-ios binary was found, so the app runs WDA itself. If
@@ -102,6 +140,11 @@ final class ChainManager {
             DispatchQueue.main.async {
                 guard let self, self.running else { return }
                 self.tunnel?.start()
+                self.watchUSB()
+                self.watchRequests()
+                let power = Timer(timeInterval: 15, repeats: true) { [weak self] _ in self?.updateSleepAssertion() }
+                RunLoop.main.add(power, forMode: .common)
+                self.powerTimer = power
                 self.poll()
                 let t = Timer(timeInterval: 3, repeats: true) { [weak self] _ in self?.poll() }
                 RunLoop.main.add(t, forMode: .common)
@@ -116,6 +159,11 @@ final class ChainManager {
         running = false
         pollTimer?.invalidate()
         pollTimer = nil
+        usbWatcher.stop()
+        requests.stop()
+        powerTimer?.invalidate()
+        powerTimer = nil
+        sleepAssertion.set(false)
         for c in controllers { c.stop() }
         controllers = []
         problems = [:]
@@ -139,6 +187,8 @@ final class ChainManager {
                 guard let self else { return }
                 self.polling = false
                 guard self.running else { return }
+                // A lost or regained route changes a phone's reason.
+                if tunneled != self.tunnelUDIDs { self.scheduleWrite() }
                 self.tunnelUDIDs = tunneled
                 // A failed `ios list` says nothing about what's attached: never
                 // tear a phone down on it.
@@ -154,6 +204,7 @@ final class ChainManager {
         // Gone phones: two misses in a row, so one flaky poll doesn't bounce a chain.
         for c in controllers where present[c.udid] == nil {
             missingPolls[c.udid, default: 0] += 1
+            if missingPolls[c.udid] == 1 { c.usbDetached() }   // the fallback signal
             if missingPolls[c.udid, default: 0] >= 2 {
                 NSLog("iMirror: \(c.alias) (\(c.udid)) detached — stopping its chain")
                 c.stop()
@@ -166,9 +217,13 @@ final class ChainManager {
         // their slots in a repeatable order.
         for device in usb where present[device.udid] == device {
             let udid = device.udid
+            let missedAPoll = missingPolls[udid] != nil
             missingPolls[udid] = nil
             if let c = controller(udid) {
                 c.attached = device                   // e.g. an iOS update
+                // Gone for one poll, then back: a USB reset (the 16e does
+                // this under load), which may have killed the forwards.
+                if missedAPoll { c.usbReattached() }
                 continue
             }
             // New (or still-blocked) phone: try to give it its slot.
@@ -203,6 +258,36 @@ final class ChainManager {
         }
     }
 
+    /// IOKit's view of resets: faster than the poll, which stays as a fallback.
+    private func watchUSB() {
+        usbWatcher.onDetached = { [weak self] serial in self?.usbController(serial)?.usbDetached() }
+        usbWatcher.onAttached = { [weak self] serial in self?.usbController(serial)?.usbReattached() }
+        usbWatcher.start()
+    }
+
+    /// Clients' restart requests (README, "Files other tools read").
+    private func watchRequests() {
+        requests.onRequest = { [weak self] r in self?.handle(r) }
+        requests.start()
+    }
+
+    private func handle(_ r: RestartRequest) {
+        let c = controller(r.udid)
+        let outcome = requestGate.decide(r, attached: c?.chain != nil, wallNow: Date(),
+                                         uptime: ProcessInfo.processInfo.systemUptime)
+        NSLog("iMirror: restart request for \(r.udid) from \(r.requestedBy): \(outcome.rawValue)")
+        if let c {
+            c.restartRequested(outcome)
+        } else {
+            EventLog.shared.write(DeviceEvent(at: Date(), udid: r.udid, alias: "", event: .request,
+                                              detail: outcome.rawValue))
+        }
+    }
+
+    private func usbController(_ serial: String) -> DeviceController? {
+        controllers.first { usbSerial(serial, matchesUDID: $0.udid) }
+    }
+
     private func makeController(_ device: AttachedDevice, slot: PortSlot, alias: String,
                                 chain: DeviceChain?) -> DeviceController {
         let c = DeviceController(udid: device.udid, slot: slot, alias: alias, attached: device, chain: chain)
@@ -210,7 +295,7 @@ final class ChainManager {
             self?.controllers.contains { $0 !== c && $0.health == .connected } ?? false
         }
         c.tunnelHasDevice = { [weak self] in self?.tunnelUDIDs.contains(device.udid) ?? false }
-        c.requestTunnelRestart = { [weak self] in self?.requestTunnelRestart(coalesce: true) }
+        c.requestTunnelRestart = { [weak self] in self?.requestTunnelRestart(coalesce: true) ?? true }
         c.onChange = { [weak self, weak c] in
             guard let self, let c else { return }
             self.scheduleWrite()
@@ -239,13 +324,15 @@ final class ChainManager {
     /// Restart the tunnel and, with it, every phone's chain. From a phone's
     /// ladder this is rate-limited: two phones reaching their grace together
     /// would otherwise knock each other's fresh chains down again. A request
-    /// inside the cooldown restarts only that phone's chain.
-    func requestTunnelRestart(coalesce: Bool) {
-        guard running, let tunnel else { return }
+    /// inside the cooldown restarts nothing and returns false, so the caller
+    /// restarts its own chain.
+    @discardableResult
+    func requestTunnelRestart(coalesce: Bool) -> Bool {
+        guard running, let tunnel else { return true }
         let now = ProcessInfo.processInfo.systemUptime
         if coalesce, !shouldRestartTunnel(lastAt: lastTunnelRestart, now: now) {
             NSLog("iMirror: tunnel restarted \(Int(now - (lastTunnelRestart ?? now)))s ago — not again yet")
-            return
+            return false
         }
         lastTunnelRestart = now
         NSLog("iMirror: restarting the USB tunnel and every phone's chain")
@@ -257,6 +344,7 @@ final class ChainManager {
                 c.chain?.start()
             }
         }
+        return true
     }
 
     // MARK: Aliases
@@ -298,16 +386,12 @@ final class ChainManager {
     }
 
     private func snapshot() -> DeviceRegistryFile {
-        var devices = controllers.map { c in
-            RegisteredDevice(udid: c.udid, alias: c.alias, kind: .device,
-                             productType: c.attached.productType, iosVersion: c.attached.productVersion,
-                             connection: c.attached.connection, slot: c.slot.index,
-                             wdaURL: c.slot.relayURL, mjpegPort: Int(c.slot.mjpegPort),
-                             state: c.registryState, detail: c.detail)
-        }
+        let now = Date()
+        var devices = controllers.map { $0.registryEntry(now: now) }
         devices.append(contentsOf: simulatorEntries)
         let version = Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "dev"
-        return DeviceRegistryFile(ownerPid: getpid(), appVersion: version,
+        return DeviceRegistryFile(ownerPid: getpid(), ownerUniqueID: ProcessIdentity.ownUniqueID,
+                                  appVersion: version,
                                   updatedAt: DeviceRegistryCodec.timestamp(Date()),
                                   goios: bin?.path, devices: devices)
     }

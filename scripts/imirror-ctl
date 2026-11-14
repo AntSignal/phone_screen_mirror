@@ -1,0 +1,291 @@
+#!/usr/bin/env python3
+"""imirror-ctl: read and nudge the running iMirror app from a terminal.
+
+  imirror-ctl status [device] [-n N] [--json]
+  imirror-ctl restart <device> [--wait S]
+  imirror-ctl events [--device D] [--since 1h] [--json]
+
+It only reads the files the app publishes (devices.json, events.jsonl) and
+writes restart requests, as the README's "Files other tools read" describes.
+Standard library only, so it runs on the system python3 (3.9).
+
+Exit codes: 0 ok / accepted, 1 error, 2 usage, 3 cooldown, 4 timeout.
+"""
+
+import argparse
+import json
+import os
+import re
+import sys
+import time
+from datetime import datetime, timedelta, timezone
+
+DEFAULT_DEVICES = "~/Library/Application Support/iMirror/devices.json"
+RESTART_WAIT_S = 30.0
+
+
+class CtlError(Exception):
+    pass
+
+
+def devices_file(env=os.environ):
+    """IMIRROR_DEVICES_FILE moves every shared file, as in the app and MCP."""
+    return env.get("IMIRROR_DEVICES_FILE") or os.path.expanduser(DEFAULT_DEVICES)
+
+
+def load_registry(path):
+    try:
+        with open(path, encoding="utf-8") as f:
+            data = json.load(f)
+    except FileNotFoundError:
+        raise CtlError(f"no {path}: is iMirror running with Automation on?")
+    except (OSError, ValueError) as e:
+        raise CtlError(f"can't read {path}: {e}")
+    if not isinstance(data, dict) or not isinstance(data.get("devices"), list):
+        raise CtlError(f"{path} has no device list")
+    return data
+
+
+def owner_alive(registry):
+    pid = registry.get("owner_pid")
+    if not isinstance(pid, int) or isinstance(pid, bool) or pid <= 0:
+        return False
+    try:
+        os.kill(pid, 0)
+    except PermissionError:
+        return True
+    except OSError:
+        return False
+    return True
+
+
+def _norm(s):
+    return s.replace("-", "").lower()
+
+
+def resolve(query, devices):
+    """Same rules as the MCP server's _match: alias, then UDID, then a unique
+    UDID prefix, then a unique suffix (4+ characters, dashes ignored). A
+    query that fits two phones is refused: both test phones end in 401C."""
+    q = query.strip().lower()
+    listing = ", ".join(f"{d.get('alias')} ({d.get('udid')})" for d in devices) or "none"
+    for d in devices:
+        if str(d.get("alias", "")).lower() == q:
+            return d
+    for d in devices:
+        if str(d.get("udid", "")).lower() == q:
+            return d
+    qn = _norm(q)
+    if len(qn) >= 4:
+        for how, test in (("prefix", str.startswith), ("suffix", str.endswith)):
+            hits = [d for d in devices if d.get("udid") and test(_norm(d["udid"]), qn)]
+            if len(hits) == 1:
+                return hits[0]
+            if hits:
+                raise CtlError(f"{query!r} is a UDID {how} of several devices. Devices: {listing}")
+    raise CtlError(f"{query!r} matches no device. Devices: {listing}")
+
+
+def parse_iso(s):
+    if not isinstance(s, str):
+        return None
+    try:
+        d = datetime.fromisoformat(s.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    return d if d.tzinfo else d.replace(tzinfo=timezone.utc)
+
+
+def iso(d):
+    """UTC with milliseconds, as events.jsonl writes it."""
+    return d.astimezone(timezone.utc).isoformat(timespec="milliseconds").replace("+00:00", "Z")
+
+
+def parse_since(text, now):
+    """'90s', '30m', '1h', '2d', or an ISO-8601 time."""
+    m = re.fullmatch(r"\s*(\d+(?:\.\d+)?)\s*([smhd])\s*", text or "")
+    if m:
+        unit = {"s": 1, "m": 60, "h": 3600, "d": 86400}[m.group(2)]
+        return now - timedelta(seconds=float(m.group(1)) * unit)
+    d = parse_iso(text)
+    if d is None:
+        raise CtlError(f"--since {text!r}: use 90s, 30m, 1h, 2d or an ISO-8601 time")
+    return d
+
+
+def read_events(folder, udid=None, since=None):
+    """Every events line, oldest first (the rotated .1 file, then the live
+    one). Bad lines are skipped: a crash can leave half of one."""
+    out = []
+    for name in ("events.jsonl.1", "events.jsonl"):
+        try:
+            with open(os.path.join(folder, name), encoding="utf-8", errors="replace") as f:
+                lines = f.readlines()
+        except OSError:
+            continue
+        for raw in lines:
+            try:
+                e = json.loads(raw)
+            except ValueError:
+                continue
+            if not isinstance(e, dict) or (udid and e.get("udid") != udid):
+                continue
+            if since is not None:
+                ts = parse_iso(e.get("ts"))
+                if ts is None or ts < since:
+                    continue
+            out.append(e)
+    return out
+
+
+def format_event(e):
+    what = str(e.get("event", "?"))
+    if e.get("from") or e.get("to"):
+        what += f" {e.get('from') or '-'} -> {e.get('to') or '-'}"
+    for k in ("reason", "detail"):
+        if e.get(k):
+            what += f" {k}={e[k]}"
+    if e.get("expected") is True:
+        what += " expected"
+    return f"{e.get('ts', '?')}  {e.get('alias') or e.get('udid', '?')}  {what}"
+
+
+def format_device(d):
+    rows = [("state", d.get("state")), ("reason", d.get("reason")), ("state_since", d.get("state_since")),
+            ("chain_epoch", d.get("chain_epoch")), ("next_retry_at", d.get("next_retry_at")),
+            ("last_error", d.get("last_error")), ("detail", d.get("detail"))]
+    lines = [f"{d.get('alias')} ({d.get('udid')}, {d.get('kind', 'device')})"]
+    lines += [f"  {k:<14}{'-' if v is None else v}" for k, v in rows]
+    return "\n".join(lines)
+
+
+def format_summary(d):
+    extra = f" retry at {d['next_retry_at']}" if d.get("next_retry_at") else ""
+    return (f"{str(d.get('alias')):<10} {str(d.get('state')):<11} {str(d.get('reason') or '-'):<15}"
+            f" since {d.get('state_since') or '-'}  epoch {d.get('chain_epoch', '-')}{extra}")
+
+
+def write_request(folder, udid, now, by="imirror-ctl"):
+    """Temp file then rename, so the app never reads half a request."""
+    if not re.fullmatch(r"[A-Za-z0-9-]{1,64}", udid or ""):
+        raise CtlError(f"not a usable UDID: {udid!r}")
+    reqs = os.path.join(folder, "requests")
+    os.makedirs(reqs, mode=0o700, exist_ok=True)
+    path = os.path.join(reqs, f"restart-{udid}.json")
+    tmp = f"{path}.{os.getpid()}.tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump({"udid": udid, "requested_at": iso(now), "requested_by": by}, f)
+    os.replace(tmp, path)
+    return path
+
+
+def request_outcome(events, udid, since):
+    """The app's answer to a request made at `since`: 'accepted', 'cooldown',
+    another detail it logged (stale, not_attached), or None for no answer yet."""
+    for e in reversed(events):
+        ts = parse_iso(e.get("ts"))
+        if e.get("event") == "request" and e.get("udid") == udid and ts is not None and ts >= since:
+            return e.get("detail") or None
+    return None
+
+
+def restart(dev, path, wait_s=RESTART_WAIT_S, clock=time.monotonic, sleep=time.sleep, now=None):
+    """Ask for a restart, then wait for chain_epoch to move. Returns
+    ('accepted' | 'cooldown' | 'timeout' | another app answer, latest entry)."""
+    folder = os.path.dirname(path)
+    udid = dev["udid"]
+    since = now or datetime.now(timezone.utc)
+    since = since.replace(microsecond=since.microsecond // 1000 * 1000)   # the app logs ms
+    start_epoch = dev.get("chain_epoch")
+    req = write_request(folder, udid, since)
+    deadline = clock() + wait_s
+    latest = dev
+    answer = None
+    while True:
+        answer = request_outcome(read_events(folder, udid, since), udid, since) or answer
+        try:
+            latest = next((d for d in load_registry(path)["devices"] if d.get("udid") == udid), latest)
+        except CtlError:
+            pass
+        if answer not in (None, "accepted"):
+            return answer, latest
+        if start_epoch is not None and latest.get("chain_epoch") not in (None, start_epoch):
+            return "accepted", latest
+        if clock() >= deadline:
+            break
+        sleep(0.5)
+    if answer == "accepted":
+        return answer, latest
+    try:
+        os.unlink(req)   # an old app must not act on it later
+    except OSError:
+        pass
+    return "timeout", latest
+
+
+EXIT = {"accepted": 0, "cooldown": 3, "timeout": 4}
+
+
+def main(argv=None):
+    p = argparse.ArgumentParser(prog="imirror-ctl", description=__doc__.split("\n\n")[0])
+    sub = p.add_subparsers(dest="cmd", required=True)
+    s = sub.add_parser("status", help="each phone's state, or one phone's state and last events")
+    s.add_argument("device", nargs="?")
+    s.add_argument("-n", type=int, default=10, help="events to show for one phone (default 10)")
+    s.add_argument("--json", action="store_true")
+    r = sub.add_parser("restart", help="ask iMirror to restart a phone's WDA chain")
+    r.add_argument("device")
+    r.add_argument("--wait", type=float, default=RESTART_WAIT_S, help="seconds to wait (default 30)")
+    e = sub.add_parser("events", help="print events.jsonl lines")
+    e.add_argument("--device")
+    e.add_argument("--since", help="90s, 30m, 1h, 2d or ISO-8601")
+    e.add_argument("--json", action="store_true")
+    a = p.parse_args(argv)
+
+    path = devices_file()
+    folder = os.path.dirname(path)
+    try:
+        if a.cmd == "events":
+            udid = resolve(a.device, load_registry(path)["devices"])["udid"] if a.device else None
+            since = parse_since(a.since, datetime.now(timezone.utc)) if a.since else None
+            for ev in read_events(folder, udid, since):
+                print(json.dumps(ev, sort_keys=True) if a.json else format_event(ev))
+            return 0
+        reg = load_registry(path)
+        if not owner_alive(reg):
+            print(f"warning: iMirror (pid {reg.get('owner_pid')}) is not running; {path} is stale",
+                  file=sys.stderr)
+            if a.cmd == "restart":
+                return 1
+        devices = reg["devices"]
+        if a.cmd == "status":
+            if not a.device:
+                print(json.dumps(devices, indent=2) if a.json else "\n".join(map(format_summary, devices)))
+                return 0
+            d = resolve(a.device, devices)
+            evs = read_events(folder, d.get("udid"))[-max(a.n, 0):] if a.n > 0 else []
+            if a.json:
+                print(json.dumps({"device": d, "events": evs}, indent=2))
+            else:
+                print(format_device(d))
+                print(f"last {len(evs)} events:")
+                print("\n".join("  " + format_event(ev) for ev in evs) or "  (none)")
+            return 0
+        d = resolve(a.device, devices)
+        if d.get("kind") == "simulator":
+            raise CtlError(f"{d.get('alias')} is a Simulator; requests only restart phones")
+        result, latest = restart(d, path, wait_s=a.wait)
+        print(f"{result}: {latest.get('alias')} is {latest.get('state')}"
+              f" (reason {latest.get('reason') or '-'}, epoch {latest.get('chain_epoch', '-')})")
+        if result == "cooldown":
+            print("a restart ran in the last minute; wait for it instead of asking again")
+        elif result == "timeout":
+            print("iMirror did not answer; an older build ignores requests. Tap the phone's WDA status.")
+        return EXIT.get(result, 1)
+    except CtlError as err:
+        print(f"imirror-ctl: {err}", file=sys.stderr)
+        return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())

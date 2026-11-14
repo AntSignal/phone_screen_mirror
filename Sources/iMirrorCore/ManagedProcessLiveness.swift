@@ -14,6 +14,8 @@ import Foundation
 ///     wall-clock `Date()`, which a Mac sleep can skew).
 ///   - readySeen: whether the readiness check has already returned true for this spawn.
 ///   - readyWithin: the deadline in seconds; 0 (or negative) disables the check.
-public func managedProcessShouldKillForUnreadiness(uptime: TimeInterval, readySeen: Bool, readyWithin: TimeInterval) -> Bool {
-    readyWithin > 0 && !readySeen && uptime >= readyWithin
+///   - held: the child waits on a person (PasscodeHold); never kill it then.
+public func managedProcessShouldKillForUnreadiness(uptime: TimeInterval, readySeen: Bool,
+                                                   readyWithin: TimeInterval, held: Bool = false) -> Bool {
+    !held && readyWithin > 0 && !readySeen && uptime >= readyWithin
 }

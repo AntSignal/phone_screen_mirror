@@ -48,7 +48,11 @@ Features:
 - **Auto-installs the runner** — on connect, the app checks whether the
   WebDriverAgent app is on the connected iPhone and installs the bundled build if
   it's missing, with progress and actionable errors (e.g. "not signed for this
-  iPhone — re-sign for this device"). A pre-provisioned device just works.
+  iPhone — re-sign for this device"). A pre-provisioned device just works. A
+  runner older than the bundled one (its `CFBundleShortVersionString`, which
+  `build-wda.sh` stamps) is reinstalled; a newer one is kept, and a failed
+  upgrade keeps the old runner running. The new runner may ask for the
+  phone's passcode once ("Enable UI Automation").
 - **iOS Simulator support** — no physical phone required: enable any number of
   simulators (from **Settings (⚙) → iOS Simulator**, a shell, or the MCP server's
   `sim_enable`) and iMirror brings WebDriverAgent up on each, so an agent can drive
@@ -125,8 +129,8 @@ exact commits and scan results:
 
 ```bash
 mkdir -p tools && cd tools
-git clone --depth 1 --branch v1.1.0 https://github.com/danielpaulus/go-ios
-git clone --depth 1 --branch v9.9.0 https://github.com/appium/WebDriverAgent
+git clone --depth 1 --branch v1.3.2 https://github.com/danielpaulus/go-ios
+git clone --depth 1 --branch v16.14.2 https://github.com/appium/WebDriverAgent
 
 # (optional but recommended) scan before building:
 osv-scanner scan source -r --no-ignore --include-git-root go-ios
@@ -134,7 +138,8 @@ osv-scanner scan source -r --no-ignore --include-git-root WebDriverAgent
 
 # build the go-ios CLI from source as a universal2 (arm64 + x86_64) binary,
 # patching vulnerable transitive deps — one helper that runs on both Intel and
-# Apple Silicon, so the packaged DMG does too:
+# Apple Silicon, so the packaged DMG does too. It refuses any go-ios revision
+# but the audited v1.3.2:
 cd ..            # back to repo root
 ./scripts/build-go-ios.sh
 ```
@@ -162,7 +167,14 @@ Then install WebDriverAgent on the device once (Xcode):
    re-sign). So it installs as a first-class "iMirror" app under your own identity
    rather than `com.facebook.*`. Run it with your paid Team:
    `DEVELOPMENT_TEAM=<TEAMID> ./scripts/build-wda.sh`, then install with
-   `tools/go-ios/bin/ios install --path=build/WebDriverAgent.ipa`. See the
+   `tools/go-ios/bin/ios install --udid=<UDID> --path=build/WebDriverAgent.ipa`.
+   The re-sign uses the certificate Xcode signed with (or `WDA_SIGN_IDENTITY=<sha1>`),
+   and the script stops unless the runner and its `.xctest` both report
+   `TeamIdentifier=$DEVELOPMENT_TEAM`, so a Mac with two "Apple Development"
+   identities can no longer produce an ipa iOS refuses (0xe8008015). It also
+   stamps the WDA release (from `package.json`) into the runner's
+   `CFBundleShortVersionString`, and patches WDA so typed text is redacted
+   (`scripts/lib/wda-patches.sh`; `sim-wda-up.sh` applies the same patch). See the
    [rebrand design](docs/2026-07-03-rebrand-wda-and-improvements-design.md) for the
    why/how. (The macOS app's `runwda` is already wired to launch the branded id.)
 
@@ -245,12 +257,23 @@ it skips the CFNetwork relay entirely — only the WDA HTTP path needs the relay
 Children run with a writable working dir (`~/Library/Application Support/iMirror`)
 and auto-restart on crash. `runwda` carries a readiness deadline: if WDA isn't
 serving within ~40 s the runner is killed and respawned, since a wedged runner
-otherwise never exits on its own. If that keeps failing, an escalation ladder
-does a full chain restart (fresh tunnel, runner, and both forwards); if the
-chain still won't come up, the app stops retrying and shows a "tap WDA to
-retry" state instead of looping forever. A separate MJPEG no-frame watchdog
-covers the case where WDA is healthy but no video frames arrive — it bounces
-the MJPEG forward first, then escalates the same way. Before each bring-up the
+otherwise never exits on its own. Each child's output is kept in a 16 KB ring
+(`IMIRROR_DEBUG=1` also writes it to `<label>.log`), and runwda's is read line
+by line: "cannot initiate a IDE session … Timed out" means the XCTest "Enable UI
+Automation" passcode sheet is up (`reason: needs_passcode`). Restarting the
+runner then only raises the sheet again, so for up to 10 minutes the readiness
+kill and the ladder's restarts pause, and runwda retries every 15 s so WDA comes
+up soon after someone enters the passcode. A locked or untrusting phone is
+named the same way (`locked`, `untrusted`). A phone is called down only after two
+failed health probes in a row, and a probe that times out while other requests
+(say an agent's slow `/source`) are already waiting on WDA counts as busy, not
+failed. If WDA stays down, a ladder restarts that phone's own chain first, then
+the shared tunnel; each restart gets its full grace from the moment it starts. If it still won't come up, the app stops the chain and
+retries by itself after 2 min, then 5 min, then every 10 min; tapping the WDA
+dot retries at once. Those retries never restart the shared tunnel while
+another phone is working. A separate MJPEG no-frame watchdog covers the case where
+WDA is healthy but no video frames arrive: it bounces the MJPEG forward (at
+most once a minute) and never restarts a WDA that still answers `/status`. Before each bring-up the
 app also sweeps any stray go-ios children left by a previously crashed
 instance — most often a tunnel reparented to `launchd` that would otherwise
 keep holding the device's RSD state and port 60105 and pin the dot on red. The
@@ -262,6 +285,82 @@ clients work). The loopback relay normalises the connection, keeping the USB
 transport and loopback-only security. If the bundled go-ios is ever missing,
 `scripts/wda-up.sh` + `scripts/wda_relay.py` are a manual fallback.
 
+## Files other tools read
+
+All live in `~/Library/Application Support/iMirror/` (with
+`IMIRROR_DEVICES_FILE` set, next to that file instead). None of them ever holds
+a secret.
+
+**`devices.json`** — every phone and Simulator the app drives, rewritten
+atomically on each change (format: `Sources/iMirrorCore/DeviceRegistry.swift`).
+Top level: `schema` (1), `owner_pid`, `owner_uniqueid` (the app's kernel
+`p_uniqueid`, never reused within a boot: a reader that finds a live `owner_pid`
+with a different uniqueid knows the file is stale), `app_version`, `updated_at`,
+`goios`, `devices`. Each device has `udid`, `alias`, `kind`, `wda_url`, `state`
+(`starting|installing|ready|down|failed`), `detail`, and:
+
+| key | meaning |
+|---|---|
+| `reason` | absent/null when ready; else one of `usb_reset`, `wda_wedged`, `needs_passcode`, `locked`, `tunnel_down`, `mac_asleep`, `gave_up`, `recovering`, `booting`, `untrusted` (the phone doesn't trust this Mac, or WDA's developer). Accept values you don't know. |
+| `state_since` | UTC ISO-8601: when `state` or `reason` last changed |
+| `chain_epoch` | +1 each time the phone's chain (runwda + forwards) starts |
+| `last_error` | go-ios's last error line for this phone (`msg: error`, ≤200 chars), or absent |
+| `next_retry_at` | UTC ISO-8601 while the ladder has given up: when it retries by itself |
+
+**`events.jsonl`** — one JSON object per line, appended; at 5 MB it moves to
+`events.jsonl.1` (one old file kept). Keys: `ts` (UTC ISO-8601 with ms),
+`udid`, `alias`, `event`, and optionally `from`, `to`, `reason`, `detail`,
+`expected` (bool). `event` is one of `state` (`from`/`to` are states),
+`restart`, `give_up`, `auto_retry`, `usb_reset` (a reset the app is checking),
+`usb_reset_ignored` (its own start/stop did it, or WDA was not up), `request`,
+`wake`, `sleep`, `passcode`, `runner_upgrade` (the phone's WebDriverAgent
+runner is older than the bundled one and is reinstalled; `from`/`to` are
+versions; the new runner may raise the passcode sheet once). The same lines go to the unified log, subsystem
+`com.local.imirror`, category `events`, in the clear.
+
+**`expected-resets/<udid>.json`** — written by a client, not the app. Before
+`devicectl device install|launch`, write `{"until": <now + 90 s, ISO-8601>,
+"by": "devicectl install"}`. A USB reset of that phone before `until` is logged
+with `"expected": true`. Recovery still runs as usual; the note only stops the
+reset reading as a fault. A note more than 10 min ahead is ignored.
+
+**`requests/restart-<udid>.json`** — written by a client to restart a phone's
+chain: `{"udid", "requested_at": ISO-8601, "requested_by": "<short name>"}`.
+Write a temp file and rename it in; other names in the folder are ignored. The
+app deletes the file, then logs an event `request` whose `detail` is
+`accepted` (the chain restarts now; `chain_epoch` goes up), `cooldown` (a
+request for this phone was honoured in the last 60 s, so nothing happens),
+`stale` (`requested_at` more than 2 min off) or `not_attached`. A request acts
+like Settings → Restart: this phone's chain only, never the shared tunnel. It
+never types a passcode. While the phone shows `needs_passcode`, don't send one:
+a new runner raises the sheet again.
+
+**`scripts/imirror-ctl`** reads and writes these files (system `python3`, no
+dependencies). `device` is an alias, a UDID, or a unique UDID prefix/suffix of
+4+ characters, as in the MCP server.
+
+```bash
+scripts/imirror-ctl status                 # every phone: state, reason, since, epoch
+scripts/imirror-ctl status phone2 -n 20    # one phone, with its last 20 events
+scripts/imirror-ctl restart phone2         # exit 0 accepted, 3 cooldown, 4 timeout
+scripts/imirror-ctl events --device phone2 --since 1h
+```
+
+### Sleep and wake
+
+A sleeping Mac drops every phone's USB link. While Automation is on, iMirror
+holds a `PreventSystemSleep` power assertion, but only while a client sent a
+request through a phone's WDA port in the last 5 minutes, or a phone is
+recovering (any `reason` but `gave_up` or `mac_asleep`, and the ladder has
+not given up). Otherwise it lets the Mac sleep.
+`pmset -g assertions` shows it as "iMirror: …".
+
+**macOS honours that assertion on AC power only.** On battery, idle sleep and a
+lid close still sleep the Mac. When the Mac goes to sleep, every phone shows
+`reason: mac_asleep` and gets a `sleep` event. On wake, each phone logs `wake`
+and its chain restarts at once (`chain_epoch` goes up), without waiting for a
+probe to fail.
+
 ## Dependency security policy
 
 Supply-chain risk is treated as a first-class constraint:
@@ -272,8 +371,13 @@ Supply-chain risk is treated as a first-class constraint:
   transitive deps patched, and **built from source** (no prebuilt-binary trust).
 - **No `curl | sh`, no unsigned binaries.** Anything executable is subject to
   macOS Gatekeeper / notarization.
-- WebDriverAgent has no auth on the wire, so it is reached over **loopback only**;
-  the go-ios host identity (`selfIdentity.plist`) is gitignored.
+- WebDriverAgent has no auth on the wire, so it is reached over **loopback only**:
+  `scripts/build-go-ios.sh` patches go-ios's `forward` to bind 127.0.0.1 (upstream
+  binds 0.0.0.0) and refuses to build if the patch did not apply. The go-ios host
+  identity (`selfIdentity.plist`) is gitignored.
+- WebDriverAgent's text typing names its XCTest event after the typed text and
+  does not redact it, so a typed passcode would enter testmanagerd's event
+  record. The build scripts patch it to a fixed name with redaction on.
 
 ## MCP server (drive the phone from Claude)
 
@@ -309,7 +413,9 @@ walkthrough.
 **Headless automation.** The MCP server can also bring WebDriverAgent up on its
 own, without the Mac app: set `IMIRROR_AUTOWDA=1` and it runs the same go-ios
 tunnel / runwda / forward chain and talks to WDA directly. Useful for driving
-the phone from an agent without launching the GUI.
+the phone from an agent without launching the GUI. A bring-up that fails stops
+the children it started, and only those: it never sweeps other go-ios processes,
+so the app's other phones are left alone.
 
 **iOS Simulators (optional).** No phone handy, or testing a simulator build?
 Enable one or more simulators and iMirror boots each and brings WebDriverAgent up
@@ -409,13 +515,14 @@ distribute the notarized DMG directly.
   Apple's private wire protocols, so a new iOS major version can break the chain
   until those projects catch up. Pinned versions in
   [SECURITY-AUDIT.md](SECURITY-AUDIT.md) are what's actually tested.
-- **Landscape** adapts via WDA `window/size` (refreshed each poll) but hasn't been
-  physically rotation-tested.
+- **Landscape** adapts via WDA `window/size` (refreshed each poll, and at once
+  when the video changes shape; the video follows the rotation through WDA's
+  `mjpegFixOrientation`) but hasn't been physically rotation-tested.
 - Relaunching the app in quick succession can still briefly wedge the device's
   `testmanagerd`. Recovery now escalates in stages: a readiness-deadline
-  auto-restart of the runner, then a full chain restart, then (if the chain
-  still won't come up) a hard-stop "tap WDA to retry" state rather than
-  looping forever. A hard crash (rather than a clean quit) can orphan a go-ios
+  auto-restart of the runner, then a chain restart, then a tunnel restart, then
+  (if the chain still won't come up) a pause that retries by itself with a
+  growing backoff (2 min, 5 min, then every 10 min). A hard crash (rather than a clean quit) can orphan a go-ios
   child; the next launch sweeps it automatically.
 
 ## Credits
