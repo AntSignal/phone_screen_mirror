@@ -365,6 +365,12 @@ final class LocalRelay {
         return waiting.count
     }
 
+    /// Requests ever relayed, ours and clients'.
+    var requestsSeen: Int {
+        lock.lock(); defer { lock.unlock() }
+        return waiting.started
+    }
+
     func start() throws {
         let params = NWParameters.tcp
         params.allowLocalEndpointReuse = true

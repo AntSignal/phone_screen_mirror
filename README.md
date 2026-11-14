@@ -332,6 +332,20 @@ scripts/imirror-ctl restart phone2         # exit 0 accepted, 3 cooldown, 4 time
 scripts/imirror-ctl events --device phone2 --since 1h
 ```
 
+### Sleep and wake
+
+A sleeping Mac drops every phone's USB link. While Automation is on, iMirror
+holds a `PreventSystemSleep` power assertion, but only while a client sent a
+request through a phone's WDA port in the last 5 minutes, or a phone is
+recovering (any `reason` but `gave_up`). Otherwise it lets the Mac sleep.
+`pmset -g assertions` shows it as "iMirror: …".
+
+**macOS honours that assertion on AC power only.** On battery, idle sleep and a
+lid close still sleep the Mac. When the Mac goes to sleep, every phone shows
+`reason: mac_asleep` and gets a `sleep` event. On wake, each phone logs `wake`
+and its chain restarts at once (`chain_epoch` goes up), without waiting for a
+probe to fail.
+
 ## Dependency security policy
 
 Supply-chain risk is treated as a first-class constraint:
