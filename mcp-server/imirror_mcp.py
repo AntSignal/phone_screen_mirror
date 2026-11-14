@@ -1088,25 +1088,29 @@ def _lost_session(t: _Target, j: dict[str, Any], sid: str) -> str:
 
     The reply's top-level sessionId says what replaced it: null means WDA
     restarted, so check /status and create if still none; another id means
-    another client made a session, so adopt it. A second loss within a
-    minute means something keeps doing that, and recreating would only start
-    a fight over the phone, so raise SESSION_CONTESTED instead."""
+    another client made a session, so adopt it. A second such takeover
+    within a minute means something keeps doing that, and recreating would
+    only start a fight over the phone, so raise SESSION_CONTESTED instead.
+    A restart is not a takeover, and iMirror's recovery can restart WDA
+    twice in a minute."""
     active = _body_session_id(j)
-    if _count_lost_session(t, sid) >= 2:
+    rival = active is not None and active != sid
+    if _count_lost_session(t, sid, rival) >= 2:
         raise _session_contested(t, active)
     if active and active != sid:
         return _adopt_session(t, active, "lost")
     return _ensure_session()
 
 
-def _count_lost_session(t: _Target, sid: str) -> int:
-    """Forget session `sid` and return how many were lost in the window."""
+def _count_lost_session(t: _Target, sid: str, rival: bool = True) -> int:
+    """Forget session `sid` and return how many were taken in the window.
+    Only a loss to a `rival` session counts toward that."""
     if t.session["id"] == sid:
         t.session["id"] = None
+    t.session_stats["lost"] += 1
     now = time.monotonic()
     t.session_losses[:] = [x for x in t.session_losses
-                           if now - x < _SESSION_CONTEST_WINDOW_S] + [now]
-    t.session_stats["lost"] += 1
+                           if now - x < _SESSION_CONTEST_WINDOW_S] + ([now] if rival else [])
     return len(t.session_losses)
 
 

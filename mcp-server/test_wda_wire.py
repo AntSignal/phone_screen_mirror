@@ -211,6 +211,28 @@ def test_two_lost_sessions_within_a_minute_raise_session_contested(m, fake):
     assert fake.count("POST", "/session") == 1                   # and no fight
 
 
+def test_wda_restarting_twice_in_a_minute_is_not_a_contest(m, fake):
+    """A restart leaves no session on the phone, so nobody took ours.
+    iMirror's recovery can restart WDA twice in a minute; the second
+    restart used to fail the call as SESSION_CONTESTED."""
+    m.ios_tap(1, 1)
+    fake.restart()
+    m.ios_tap(2, 2)
+    fake.restart()
+    m.ios_tap(3, 3)
+    assert fake.count("POST", "/session") == 3
+    assert fake.count("POST", f"/session/{fake.active}/actions") == 1
+
+
+def test_a_takeover_after_a_restart_is_still_adopted(m, fake):
+    m.ios_tap(1, 1)
+    fake.restart()
+    m.ios_tap(2, 2)
+    theirs = fake.new_session()
+    m.ios_tap(3, 3)
+    assert fake.count("POST", f"/session/{theirs}/actions") == 1
+
+
 def test_lost_sessions_a_minute_apart_are_just_adopted(m, fake, monkeypatch):
     import time
     monkeypatch.setattr(m, "_SESSION_CONTEST_WINDOW_S", 0.2)
