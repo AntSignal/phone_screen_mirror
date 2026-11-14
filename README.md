@@ -245,7 +245,14 @@ it skips the CFNetwork relay entirely — only the WDA HTTP path needs the relay
 Children run with a writable working dir (`~/Library/Application Support/iMirror`)
 and auto-restart on crash. `runwda` carries a readiness deadline: if WDA isn't
 serving within ~40 s the runner is killed and respawned, since a wedged runner
-otherwise never exits on its own. A phone is called down only after two
+otherwise never exits on its own. Each child's output is kept in a 16 KB ring
+(`IMIRROR_DEBUG=1` also writes it to `<label>.log`), and runwda's is read line
+by line: "cannot initiate a IDE session … Timed out" means the XCTest "Enable UI
+Automation" passcode sheet is up (`reason: needs_passcode`). Restarting the
+runner then only raises the sheet again, so for up to 10 minutes the readiness
+kill and the ladder's restarts pause, and runwda retries every 15 s so WDA comes
+up soon after someone enters the passcode. A locked or untrusting phone is
+named the same way (`locked`, `untrusted`). A phone is called down only after two
 failed health probes in a row, and a probe that times out while other requests
 (say an agent's slow `/source`) are already waiting on WDA counts as busy, not
 failed. If WDA stays down, a ladder restarts that phone's own chain first, then
@@ -282,10 +289,10 @@ with a different uniqueid knows the file is stale), `app_version`, `updated_at`,
 
 | key | meaning |
 |---|---|
-| `reason` | absent/null when ready; else one of `usb_reset`, `wda_wedged`, `needs_passcode`, `locked`, `tunnel_down`, `mac_asleep`, `gave_up`, `recovering`, `booting`. Accept values you don't know. |
+| `reason` | absent/null when ready; else one of `usb_reset`, `wda_wedged`, `needs_passcode`, `locked`, `tunnel_down`, `mac_asleep`, `gave_up`, `recovering`, `booting`, `untrusted` (the phone doesn't trust this Mac, or WDA's developer). Accept values you don't know. |
 | `state_since` | UTC ISO-8601: when `state` or `reason` last changed |
 | `chain_epoch` | +1 each time the phone's chain (runwda + forwards) starts |
-| `last_error` | short, or absent |
+| `last_error` | go-ios's last error line for this phone (`msg: error`, ≤200 chars), or absent |
 | `next_retry_at` | UTC ISO-8601 while the ladder has given up: when it retries by itself |
 
 **`events.jsonl`** — one JSON object per line, appended; at 5 MB it moves to

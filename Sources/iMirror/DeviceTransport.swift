@@ -200,6 +200,9 @@ final class DeviceChain {
     /// Goes up each time the chain starts (devices.json chain_epoch), so a
     /// client can tell "same WDA, slow" from "rebuilt under me".
     private(set) var epoch = 0
+    // Read by runwda's queues as well as main.
+    private let holdLock = NSLock()
+    private var hold = PasscodeHold()
 
     private let readinessSession: URLSession = {
         let cfg = URLSessionConfiguration.ephemeral
@@ -219,6 +222,34 @@ final class DeviceChain {
     /// Main thread. We started or stopped this phone's runner, which resets
     /// its USB; that reset is ours, not a fault (USBResetWatch).
     var onOwnUSBChange: (() -> Void)?
+    /// Main thread. runwda's output named a cause a person must fix, and/or
+    /// go-ios logged an error (short, for last_error).
+    var onRunwdaLog: ((RunwdaLogClass?, String?) -> Void)?
+
+    /// Is runwda waiting on the passcode sheet, within its cap? Any queue.
+    var passcodeHeld: Bool {
+        holdLock.lock(); defer { holdLock.unlock() }
+        return hold.holding(now: ProcessInfo.processInfo.systemUptime)
+    }
+
+    /// WDA answered, or a person asked for a retry: stop holding.
+    func clearPasscodeHold() {
+        holdLock.lock(); hold.clear(); holdLock.unlock()
+    }
+
+    /// Any queue: classify a batch of runwda lines.
+    private func runwdaSaid(_ lines: [String]) {
+        var cls: RunwdaLogClass?, err: String?
+        for line in lines {
+            if let c = classifyRunwdaLine(line) { cls = c }
+            if let e = runwdaErrorSummary(line) { err = e }
+        }
+        guard cls != nil || err != nil else { return }
+        if cls == .needsPasscode {
+            holdLock.lock(); hold.sheetSeen(now: ProcessInfo.processInfo.systemUptime); holdLock.unlock()
+        }
+        DispatchQueue.main.async { [weak self] in self?.onRunwdaLog?(cls, err) }
+    }
 
     // Bumped by every start/stop/restart; a delayed bring-up step aborts if it
     // moved, so a stop landing mid-bring-up can't spawn orphans afterwards.
@@ -321,6 +352,8 @@ final class DeviceChain {
             // against a raw go-ios forward port). 40s is past WDA's ~20s boot.
             readinessCheck: { [weak self] in self?.wdaReadyThroughRelay() ?? false },
             readyWithin: 40, readinessPollInterval: 2)
+        wda.holdCheck = { [weak self] in self?.passcodeHeld ?? false }
+        wda.onLines = { [weak self] lines in self?.runwdaSaid(lines) }
         wda.onGaveUp = { [weak self] _ in
             DispatchQueue.main.async { self?.onWDAUnrecoverable?() }
         }

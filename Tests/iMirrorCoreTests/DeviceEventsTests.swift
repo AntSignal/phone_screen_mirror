@@ -42,7 +42,7 @@ final class DeviceReasonTests: XCTestCase {
     func testRawValuesAreTheContractStrings() {
         XCTAssertEqual(DeviceReason.allCases.map(\.rawValue),
                        ["usb_reset", "wda_wedged", "needs_passcode", "locked", "tunnel_down",
-                        "mac_asleep", "gave_up", "recovering", "booting"])
+                        "mac_asleep", "gave_up", "recovering", "booting", "untrusted"])
     }
 }
 

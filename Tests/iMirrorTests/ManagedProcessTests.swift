@@ -179,6 +179,46 @@ final class ManagedProcessTests: XCTestCase {
         wait(for: [spawned], timeout: 5)
     }
 
+    /// Output used to go to /dev/null, which hid why runwda failed. Both
+    /// streams now reach the ring and the line callback.
+    func testOutputReachesTheRingAndTheLineCallback() {
+        let process = ManagedProcess(binary: URL(fileURLWithPath: "/bin/sh"),
+                                     args: ["-c", "echo out-line; echo err-line >&2; exec sleep 100"],
+                                     label: "test-output", restartDelay: 0.1, workDir: tempDir)
+        mp = process
+        let got = expectation(description: "both lines delivered")
+        let lock = NSLock()
+        var seen: [String] = []
+        process.onLines = { lines in
+            lock.lock(); seen += lines; let done = Set(seen).isSuperset(of: ["out-line", "err-line"]); lock.unlock()
+            if done { got.fulfill() }
+        }
+        process.start()
+        wait(for: [got], timeout: 3)
+        XCTAssertTrue(process.recentOutput.contains("out-line"))
+        XCTAssertTrue(process.recentOutput.contains("err-line"))
+    }
+
+    /// While the passcode sheet waits, killing the runner only raises it
+    /// again, so a held child outlives its readiness deadline.
+    func testAHeldChildIsNotKilledAtTheReadinessDeadline() {
+        let process = ManagedProcess(binary: URL(fileURLWithPath: "/bin/sh"), args: ["-c", "sleep 100"],
+                                     label: "test-held", restartDelay: 0.1, workDir: tempDir,
+                                     readinessCheck: { false }, readyWithin: 0.3,
+                                     readinessPollInterval: 0.1)
+        process.holdCheck = { true }
+        mp = process
+        process.start()
+        let firstPid = waitForPid(process)
+        XCTAssertNotNil(firstPid, "child never started")
+        let stillSame = expectation(description: "pid unchanged well past the deadline")
+        DispatchQueue.global().asyncAfter(deadline: .now() + 1.5) {
+            XCTAssertEqual(process.currentPidForTesting, firstPid, "held child was killed anyway")
+            stillSame.fulfill()
+        }
+        wait(for: [stillSame], timeout: 3)
+    }
+
     // MARK: - helpers
 
     private func waitForPid(_ process: ManagedProcess, timeout: TimeInterval = 2) -> pid_t? {

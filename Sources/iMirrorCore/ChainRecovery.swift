@@ -292,8 +292,11 @@ public struct ChainLadderState: Equatable, Sendable {
     }
 
     /// Decide what to do now. Call only while this phone's health is down.
+    /// `held`: runwda waits on the passcode sheet (PasscodeHold); a restart
+    /// would only raise the sheet again, so the climb pauses.
     public mutating func tick(now: TimeInterval, othersHealthy: Bool,
-                              tunnelHasDevice: Bool) -> DeviceRecoveryAction {
+                              tunnelHasDevice: Bool, held: Bool = false) -> DeviceRecoveryAction {
+        if held, !hardStopped { return .wait }
         if hardStopped {
             guard let at = nextAutoRetryAt, now >= at else { return .wait }
             forceRetry(now: now)
