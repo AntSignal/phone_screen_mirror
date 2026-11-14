@@ -173,7 +173,9 @@ public struct ChainLadderState: Equatable, Sendable {
         wedgeSince = now
     }
 
-    /// Something outside the ladder (the MJPEG watchdog) restarted the chain.
+    /// Something outside the ladder (a USB-reset restart, the MJPEG
+    /// watchdog) restarted the chain. The new runner needs the full boot
+    /// grace; stage 0's 30 s would restart it again mid-boot.
     public mutating func noteOutsideRestart() { stage = max(stage, 1) }
 
     public mutating func hardStop(now: TimeInterval) {

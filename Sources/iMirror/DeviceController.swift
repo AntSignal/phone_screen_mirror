@@ -162,6 +162,7 @@ final class DeviceController {
 
     /// A reset killed WDA: rebuild now instead of waiting out the ladder's grace.
     private func restartAfterUSBReset() {
+        ladder.noteOutsideRestart()             // a fresh chain needs 90 s to boot
         status("\(alias)'s USB connection reset — reconnecting…")
         chain?.restart()
         onChange?()

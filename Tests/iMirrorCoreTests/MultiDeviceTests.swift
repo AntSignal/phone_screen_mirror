@@ -248,6 +248,18 @@ final class DeviceRecoveryTests: XCTestCase {
         XCTAssertEqual(ladder.stage, 1)
     }
 
+    /// A USB-reset restart mid-session: the fresh runner gets 90 s to boot,
+    /// not the 30 s meant for a runner that hung.
+    func testARestartOutsideTheLadderGetsTheFullBootGrace() {
+        var ladder = ChainLadderState()
+        ladder.onConnected()
+        ladder.onDown(now: 500)
+        ladder.noteOutsideRestart()
+        ladder.onRunwdaStarted(now: 505)
+        XCTAssertEqual(ladder.tick(now: 594, othersHealthy: true, tunnelHasDevice: true), .wait)
+        XCTAssertEqual(ladder.tick(now: 595, othersHealthy: true, tunnelHasDevice: true), .giveUp)
+    }
+
     func testFirstBootDownDoesNotStartTheClock() {
         var ladder = ChainLadderState()
         ladder.onDown(now: 5)
