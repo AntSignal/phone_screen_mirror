@@ -71,7 +71,7 @@ echo "  (auth_value: 0=denied 2=allowed; 'unable to open' => give Terminal Full 
 section "4. SUBSYSTEM B — control (go-ios chain)"
 echo "--- iMirror apps (a second one fights the owner for every phone) ---"
 ps -axo pid=,comm= | imirror_audit_app_instances "$OWNER_PID"
-echo "--- MCP servers (only the frozen install under iMirror/mcp/ obeys device leases) ---"
+echo "--- MCP servers (any not under iMirror/mcp/ runs a git tree as it is now) ---"
 ps -axo pid=,args= | imirror_audit_mcp_servers "$SUPPORT"
 echo "--- stray/orphaned go-ios children (a leftover tunnel blocks a fresh one) ---"
 pgrep -fl "ios tunnel|ios runwda|ios forward" 2>/dev/null || echo "(none running)"
