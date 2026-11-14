@@ -166,6 +166,14 @@ The extra values ride in the error's tail, e.g.
 per phone per minute (`cooldown` otherwise), so several agents asking at once
 restart it once. It never types a passcode.
 
+**Installs reset the phone's USB link.** `ios_install_app` on a phone takes
+`devicectl.lock` next to `devices.json`, the same flock `antsignalctl device
+install|launch` takes, so two sessions never install at once and reset each
+other. It waits up to 15 minutes, then goes ahead. While it holds the lock it
+writes `expected-resets/<udid>.json` (`{"until": now+90 s, "by": "go-ios
+install"}`) before and after go-ios runs, so iMirror logs the reset that follows
+as expected. A Simulator install takes neither.
+
 ## Setup
 
 The app's one-click install (Settings → MCP server) does all of this for you, and

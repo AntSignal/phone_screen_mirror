@@ -28,9 +28,11 @@ __version__ = "1.3.0"
 import atexit
 import base64
 import concurrent.futures
+import contextlib
 import contextvars
 import ctypes
 import dataclasses
+import fcntl
 import functools
 import html
 import http.client
@@ -52,7 +54,7 @@ import time
 import urllib.error
 import urllib.request
 import xml.etree.ElementTree as ET
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Annotated, Any
 from urllib.parse import urlsplit
 
@@ -3009,20 +3011,100 @@ def ios_install_app(path: str) -> str:
     return f"installed {os.path.basename(path)}"
 
 
+# ---- One phone install at a time, Mac-wide ------------------------------------
+
+_EXPECTED_RESET_S = 90              # same window antsignalctl gives
+_INSTALL_LOCK_PATIENCE_S = 15 * 60  # longer than any install
+_INSTALL_LOCK_POLL_S = 1.0
+_INSTALL_BY = "go-ios install"
+
+
+def _expected_reset_note(now: datetime) -> dict[str, str]:
+    """The note's body: a USB reset on this phone before `until` is ours.
+    The app reads only `until`; `by` is for a human reading the file."""
+    return {"until": _iso(now + timedelta(seconds=_EXPECTED_RESET_S)), "by": _INSTALL_BY}
+
+
+def _write_expected_reset(udid: str | None) -> None:
+    """Tell iMirror a USB reset is coming, as
+    expected-resets/<udid>.json, so it logs that reset as expected. Written
+    to a temp name and renamed, so the app never reads half a file. Best
+    effort: an app that does not read the note just ignores it."""
+    if not udid or not re.fullmatch(r"[A-Za-z0-9-]{1,64}", udid):
+        return                         # unknown phone, or a name that escapes
+    folder = os.path.join(_support_dir(), "expected-resets")
+    path = os.path.join(folder, f"{udid}.json")
+    tmp = f"{path}.{os.getpid()}.{threading.get_ident()}.tmp"
+    try:
+        os.makedirs(folder, mode=0o700, exist_ok=True)
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(_expected_reset_note(datetime.now(timezone.utc)), f)
+        os.replace(tmp, path)
+    except OSError:
+        with contextlib.suppress(OSError):
+            os.unlink(tmp)
+
+
+@contextlib.contextmanager
+def _mac_wide_install_lock():
+    """Hold devicectl.lock, the flock every session on this Mac shares
+    (antsignalctl takes the same file around devicectl install/launch).
+    An install resets the phone's USB link; two at once reset each other.
+    The kernel drops the lock when the process dies, so a crash never leaves
+    the Mac locked. After _INSTALL_LOCK_PATIENCE_S we go ahead anyway: no
+    lock beats no install."""
+    fd = -1
+    path = os.path.join(_support_dir(), "devicectl.lock")
+    try:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        fd = os.open(path, os.O_CREAT | os.O_RDWR | os.O_CLOEXEC, 0o644)
+    except OSError:
+        pass                           # no lock beats no install
+    if fd >= 0:
+        deadline = time.monotonic() + _INSTALL_LOCK_PATIENCE_S
+        told = False
+        while True:
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except BlockingIOError:
+                if time.monotonic() >= deadline:
+                    print(f"imirror_mcp: {path} is still held; going ahead",
+                          file=sys.stderr, flush=True)
+                    break
+                if not told:
+                    print("imirror_mcp: waiting for another session's install",
+                          file=sys.stderr, flush=True)
+                    told = True
+                time.sleep(_INSTALL_LOCK_POLL_S)
+    try:
+        yield
+    finally:
+        if fd >= 0:
+            os.close(fd)               # closing drops the flock
+
+
 def _install_on_device(path: str) -> None:
     """Install `path` on the current device via go-ios (resolved by _ios_bin).
     Passes --udid whenever the phone is known: without it go-ios installs on
-    whichever phone it lists first, which with two attached is a coin toss."""
+    whichever phone it lists first, which with two attached is a coin toss.
+    Runs under the Mac-wide install lock, with an expected-reset note
+    written before and after (the reset can come late)."""
     args = [_ios_bin(), "install", f"--path={path}"]
     t = _cur_or_none()
-    if t is not None and t.udid:
-        args.append(f"--udid={t.udid}")
-    try:
-        subprocess.run(args, check=True, capture_output=True, text=True)
-    except FileNotFoundError as e:
-        raise RuntimeError("go-ios 'ios' binary not found (set IMIRROR_IOS_BIN).") from e
-    except subprocess.CalledProcessError as e:
-        raise RuntimeError(f"install failed: {(e.stderr or '').strip() or e}") from e
+    udid = t.udid if t is not None else None
+    if udid:
+        args.append(f"--udid={udid}")
+    with _mac_wide_install_lock():
+        _write_expected_reset(udid)
+        try:
+            subprocess.run(args, check=True, capture_output=True, text=True)
+        except FileNotFoundError as e:
+            raise RuntimeError("go-ios 'ios' binary not found (set IMIRROR_IOS_BIN).") from e
+        except subprocess.CalledProcessError as e:
+            raise RuntimeError(f"install failed: {(e.stderr or '').strip() or e}") from e
+        finally:
+            _write_expected_reset(udid)  # the reset can come after
 
 
 def _install_on_simulator(path: str) -> None:

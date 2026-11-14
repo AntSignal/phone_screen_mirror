@@ -16,9 +16,11 @@ import pytest
 
 
 @pytest.fixture()
-def mod(monkeypatch):
+def mod(monkeypatch, tmp_path):
     """Import a fresh copy of the module with a clean session, on a loopback target."""
     monkeypatch.setenv("IMIRROR_WDA", "http://127.0.0.1:8100")
+    # Installs take a Mac-wide lock there; keep tests off the real one.
+    monkeypatch.setenv("IMIRROR_DEVICES_FILE", str(tmp_path / "devices.json"))
     monkeypatch.delenv("IMIRROR_TARGET", raising=False)  # default (device) mode
     sys.modules.pop("imirror_mcp", None)
     m = importlib.import_module("imirror_mcp")
@@ -84,9 +86,10 @@ def wda(mod, monkeypatch):
 
 
 @pytest.fixture()
-def sim_mod(monkeypatch):
+def sim_mod(monkeypatch, tmp_path):
     """A fresh module imported in simulator mode (IMIRROR_TARGET=simulator)."""
     monkeypatch.setenv("IMIRROR_WDA", "http://127.0.0.1:8100")
+    monkeypatch.setenv("IMIRROR_DEVICES_FILE", str(tmp_path / "devices.json"))
     monkeypatch.setenv("IMIRROR_TARGET", "simulator")
     sys.modules.pop("imirror_mcp", None)
     m = importlib.import_module("imirror_mcp")
