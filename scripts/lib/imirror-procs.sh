@@ -116,8 +116,8 @@ imirror_launch_bundle() {
 # ---- audits for diagnose.sh; each reads command output on stdin ----
 
 # stdin: `ps -axo pid=,args=`. $1: the iMirror Application Support dir.
-# Flags MCP servers not run from the frozen install in $1/mcp/: a dev
-# checkout or the old upstream app, which ignore device leases. Only the
+# Flags MCP servers not run from the frozen install in $1/mcp/: a git
+# tree, which can change under them, or the old upstream app. Only the
 # script path is judged, since the venv's python is also under $1/mcp/.
 imirror_audit_mcp_servers() {
     awk -v want="$1/mcp/" '
