@@ -4,7 +4,7 @@
 # that moves the patched code fails the build instead of shipping a leak.
 
 WDA_TYPING_FILE="WebDriverAgentLib/Categories/XCUIElement+FBTyping.m"
-# The event name each typing call must carry after the patch.
+# The fixed event name the patch gives typing.
 WDA_TYPING_NAME='NSString *name = @"Type text";'
 
 # True when FBTypeText's event has a fixed name and is redacted.
@@ -24,7 +24,7 @@ wda_patch_redact_typing() {
         echo "WDA patch: $f not found" >&2
         return 1
     fi
-    # Leave a patched file alone, so Xcode does not rebuild it every run.
+    # Skip a patched file so Xcode need not rebuild it.
     if ! wda_typing_is_redacted "$f"; then
         /usr/bin/perl -0pi -e '
             s/NSString \*name = text\.length <= MAX_TEXT_ABBR_LEN\b.*?;\n/NSString *name = \@"Type text";\n/s;

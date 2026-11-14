@@ -17,7 +17,7 @@ source "$ROOT/scripts/lib/goios-patches.sh"
 [[ -d "$SRC" ]] || { echo "tools/go-ios not found — clone it first (see README)" >&2; exit 1; }
 cd "$SRC"
 
-# Refuse any other revision: the audit and the patch are for this one.
+# Only this revision is audited and patch-checked.
 EXPECTED_GOIOS_REV="2fb34682ef12db97c9fafdf99f1dd1d3522604ad"   # v1.3.2
 got_rev="$(git rev-parse HEAD 2>/dev/null || true)"
 if [[ "$got_rev" != "$EXPECTED_GOIOS_REV" ]]; then

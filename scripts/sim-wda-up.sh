@@ -58,7 +58,7 @@ wda_deployment_setting() {  # $1 = sdk name: iphonesimulator | iphoneos
     sdk_min="$(/usr/libexec/PlistBuddy -c "Print :SupportedTargets:$sdk:MinimumDeploymentTarget" "$plist" 2>/dev/null)" || return 0
     [[ -n "$sdk_min" ]] || return 0
     lowest="$(printf '%s\n%s\n' "$proj_floor" "$sdk_min" | sort -V | head -1)"
-    # Vendored targets may still say 12.0, so set it at 15.0 too.
+    # Vendored targets may say 12.0; override at 15.0 too.
     if [[ "$lowest" == "$proj_floor" ]]; then
         echo "IPHONEOS_DEPLOYMENT_TARGET=$sdk_min"
     fi
