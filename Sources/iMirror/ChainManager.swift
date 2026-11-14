@@ -166,9 +166,13 @@ final class ChainManager {
         // their slots in a repeatable order.
         for device in usb where present[device.udid] == device {
             let udid = device.udid
+            let missedAPoll = missingPolls[udid] != nil
             missingPolls[udid] = nil
             if let c = controller(udid) {
                 c.attached = device                   // e.g. an iOS update
+                // Gone for one poll, then back: its USB reset (the 16e does
+                // this under load), which kills the chain's forwards.
+                if missedAPoll { c.restartAfterUSBReset() }
                 continue
             }
             // New (or still-blocked) phone: try to give it its slot.
@@ -210,7 +214,7 @@ final class ChainManager {
             self?.controllers.contains { $0 !== c && $0.health == .connected } ?? false
         }
         c.tunnelHasDevice = { [weak self] in self?.tunnelUDIDs.contains(device.udid) ?? false }
-        c.requestTunnelRestart = { [weak self] in self?.requestTunnelRestart(coalesce: true) }
+        c.requestTunnelRestart = { [weak self] in self?.requestTunnelRestart(coalesce: true) ?? true }
         c.onChange = { [weak self, weak c] in
             guard let self, let c else { return }
             self.scheduleWrite()
@@ -239,13 +243,15 @@ final class ChainManager {
     /// Restart the tunnel and, with it, every phone's chain. From a phone's
     /// ladder this is rate-limited: two phones reaching their grace together
     /// would otherwise knock each other's fresh chains down again. A request
-    /// inside the cooldown restarts only that phone's chain.
-    func requestTunnelRestart(coalesce: Bool) {
-        guard running, let tunnel else { return }
+    /// inside the cooldown restarts nothing and returns false, so the caller
+    /// restarts its own chain.
+    @discardableResult
+    func requestTunnelRestart(coalesce: Bool) -> Bool {
+        guard running, let tunnel else { return true }
         let now = ProcessInfo.processInfo.systemUptime
         if coalesce, !shouldRestartTunnel(lastAt: lastTunnelRestart, now: now) {
             NSLog("iMirror: tunnel restarted \(Int(now - (lastTunnelRestart ?? now)))s ago — not again yet")
-            return
+            return false
         }
         lastTunnelRestart = now
         NSLog("iMirror: restarting the USB tunnel and every phone's chain")
@@ -257,6 +263,7 @@ final class ChainManager {
                 c.chain?.start()
             }
         }
+        return true
     }
 
     // MARK: Aliases

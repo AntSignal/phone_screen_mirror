@@ -267,11 +267,51 @@ final class DeviceRecoveryTests: XCTestCase {
 
     func testForceRetryReArmsAfterGiveUp() {
         var ladder = ChainLadderState()
-        ladder.hardStop()
+        ladder.hardStop(now: 5)
         ladder.forceRetry(now: 10)
         XCTAssertFalse(ladder.hardStopped)
         XCTAssertEqual(ladder.stage, 0)
         XCTAssertEqual(ladder.wedgeSince, 10)
+    }
+
+    /// The 16e's USB resets mid-session. Giving up must not need a human:
+    /// a phone that has worked retries by itself, again after each give-up.
+    func testAPhoneThatWorkedRetriesAfterGivingUp() {
+        var ladder = ChainLadderState()
+        ladder.onRunwdaStarted(now: 0)
+        ladder.onConnected()
+        ladder.onDown(now: 100)
+        XCTAssertEqual(ladder.tick(now: 130, othersHealthy: false, tunnelHasDevice: true), .restartTunnelAndChains)
+        XCTAssertEqual(ladder.tick(now: 220, othersHealthy: false, tunnelHasDevice: true), .giveUp)
+        XCTAssertTrue(ladder.hardStopped)
+        XCTAssertEqual(ladder.tick(now: 339, othersHealthy: false, tunnelHasDevice: true), .wait)
+        XCTAssertEqual(ladder.tick(now: 340, othersHealthy: false, tunnelHasDevice: true), .restartDeviceChain)
+        XCTAssertFalse(ladder.hardStopped)
+        XCTAssertEqual(ladder.stage, 0)
+        XCTAssertEqual(ladder.wedgeSince, 340)
+        // Still down: the ladder climbs again, and the next give-up retries too.
+        XCTAssertEqual(ladder.tick(now: 370, othersHealthy: false, tunnelHasDevice: true), .restartTunnelAndChains)
+        XCTAssertEqual(ladder.tick(now: 460, othersHealthy: false, tunnelHasDevice: true), .giveUp)
+        XCTAssertEqual(ladder.tick(now: 580, othersHealthy: false, tunnelHasDevice: true), .restartDeviceChain)
+    }
+
+    /// Never connected (say, the phone wants its passcode for UI Automation):
+    /// retrying cannot help, so it still waits for the user.
+    func testAPhoneThatNeverWorkedStaysStopped() {
+        var ladder = ChainLadderState()
+        ladder.onRunwdaStarted(now: 0)
+        _ = ladder.tick(now: 90, othersHealthy: false, tunnelHasDevice: true)
+        XCTAssertEqual(ladder.tick(now: 180, othersHealthy: false, tunnelHasDevice: true), .giveUp)
+        XCTAssertEqual(ladder.tick(now: 10_000, othersHealthy: false, tunnelHasDevice: true), .wait)
+        XCTAssertTrue(ladder.hardStopped)
+    }
+
+    func testAStalledVideoStopRetriesToo() {
+        var ladder = ChainLadderState()
+        ladder.onConnected()
+        ladder.hardStop(now: 50)
+        XCTAssertEqual(ladder.tick(now: 169, othersHealthy: false, tunnelHasDevice: true), .wait)
+        XCTAssertEqual(ladder.tick(now: 170, othersHealthy: false, tunnelHasDevice: true), .restartDeviceChain)
     }
 
     func testTunnelRestartCooldown() {

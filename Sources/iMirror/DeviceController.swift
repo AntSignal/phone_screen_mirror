@@ -43,8 +43,9 @@ final class DeviceController {
     var othersHealthy: () -> Bool = { false }
     /// Does the shared tunnel list a route to this phone (last poll)?
     var tunnelHasDevice: () -> Bool = { true }
-    /// Ask for the shared tunnel (and so every chain) to restart.
-    var requestTunnelRestart: () -> Void = {}
+    /// Ask for the shared tunnel (and so every chain) to restart. False when
+    /// its cooldown refused, so nothing was restarted.
+    var requestTunnelRestart: () -> Bool = { false }
 
     // Observed by the window and the device file.
     var onChange: (() -> Void)?
@@ -134,9 +135,18 @@ final class DeviceController {
         chain?.restart()
     }
 
+    /// The phone dropped off USB for a moment, and its forwards died with it.
+    /// Rebuild now instead of waiting out the watchdog's grace.
+    func restartAfterUSBReset() {
+        guard running else { return }
+        status("\(alias)'s USB connection reset — reconnecting…")
+        chain?.restart()
+        onChange?()
+    }
+
     /// The window's video watchdog gave up for good.
     func hardStopForStalledVideo() {
-        ladder.hardStop()
+        ladder.hardStop(now: ProcessInfo.processInfo.systemUptime)
         chain?.stopChildren()
         status("No video from WebDriverAgent on \(alias). Tap WDA to retry.")
         onChange?()
@@ -228,7 +238,8 @@ final class DeviceController {
             chain?.restart()
         case .restartTunnelAndChains:
             status("WebDriverAgent on \(alias) is taking longer than usual — resetting the USB connection…")
-            requestTunnelRestart()
+            // The tunnel was just restarted: restart this phone's chain instead.
+            if !requestTunnelRestart() { chain?.restart() }
         case .giveUp:
             // Stop the children outright, or runwda keeps respawning (and being
             // killed by its readiness deadline) forever after a give-up. The
@@ -240,7 +251,7 @@ final class DeviceController {
     }
 
     private func restartOwnOrTunnel() {
-        if tunnelHasDevice() { chain?.restart() } else { requestTunnelRestart() }
+        if tunnelHasDevice() || !requestTunnelRestart() { chain?.restart() }
         onChange?()
     }
 
