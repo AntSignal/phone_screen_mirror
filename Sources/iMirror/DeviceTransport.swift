@@ -509,7 +509,7 @@ final class DeviceChain {
                              bundleId: WDAIdentity.runnerBundleId)
     }
 
-    // The ipa cannot change while the app runs, so read it once.
+    // The ipa never changes while the app runs.
     private static let bundledVersionLock = NSLock()
     private static var bundledVersionCache: String?
 

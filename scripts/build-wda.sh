@@ -31,7 +31,7 @@ wda_deployment_setting() {  # $1 = sdk name: iphonesimulator | iphoneos
     sdk_min="$(/usr/libexec/PlistBuddy -c "Print :SupportedTargets:$sdk:MinimumDeploymentTarget" "$plist" 2>/dev/null)" || return 0
     [[ -n "$sdk_min" ]] || return 0
     lowest="$(printf '%s\n%s\n' "$proj_floor" "$sdk_min" | sort -V | head -1)"
-    # Vendored targets may still say 12.0, so set it at 15.0 too.
+    # Vendored targets may say 12.0; override at 15.0 too.
     if [[ "$lowest" == "$proj_floor" ]]; then
         echo "IPHONEOS_DEPLOYMENT_TARGET=$sdk_min"
     fi
@@ -161,7 +161,7 @@ cp "$ASSETS/Assets.car" "$RUNNER/Assets.car"
 cp "$ASSETS"/AppIcon*.png "$RUNNER/" 2>/dev/null || true
 /usr/libexec/PlistBuddy -c "Add :CFBundleDisplayName string $DISPLAY_NAME" "$RUNNER/Info.plist" 2>/dev/null \
   || /usr/libexec/PlistBuddy -c "Set :CFBundleDisplayName $DISPLAY_NAME" "$RUNNER/Info.plist"
-# Stamp the WDA release: the app reinstalls a phone's older runner.
+# Stamp the WDA release; the app upgrades older runners.
 WDA_VERSION="$(/usr/bin/plutil -extract version raw "$WDA_SRC/package.json" 2>/dev/null || true)"
 [[ -n "$WDA_VERSION" ]] || { echo "could not read the WDA version from $WDA_SRC/package.json" >&2; exit 1; }
 /usr/libexec/PlistBuddy -c "Set :CFBundleShortVersionString $WDA_VERSION" "$RUNNER/Info.plist" 2>/dev/null \
@@ -170,7 +170,7 @@ WDA_VERSION="$(/usr/bin/plutil -extract version raw "$WDA_SRC/package.json" 2>/d
   || /usr/libexec/PlistBuddy -c "Add :CFBundleVersion string $WDA_VERSION" "$RUNNER/Info.plist"
 /usr/libexec/PlistBuddy -c "Merge '$ASSETS/partial.plist'" "$RUNNER/Info.plist"
 
-# Re-sign inside out with Xcode's identity: nested code, then the runner.
+# Re-sign with Xcode's identity: nested code first, runner last.
 SIGNID="$(wda_pick_identity "$RUNNER" "$ASSETS" "$DEVELOPMENT_TEAM" || true)"
 [[ -n "$SIGNID" ]] || { echo "no 'Apple Development' identity for team $DEVELOPMENT_TEAM found" >&2; exit 1; }
 echo "    signing identity $SIGNID"
