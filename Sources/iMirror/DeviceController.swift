@@ -330,6 +330,10 @@ final class DeviceController {
             break
         case .autoRetry:
             log(.autoRetry, detail: "after give-up \(ladder.giveUps)")
+            // The new runwda reports its own cause. A stale needs_passcode
+            // makes clients refuse every restart until WDA answers. The
+            // hold stays spent, so this retry is never paused.
+            runwdaClass = nil
             unrecoverable = false
             status("Retrying WebDriverAgent on \(alias)…")
             restartOwnOrTunnel(tunnelAllowed: ChainLadderState.retryMayRestartTunnel(

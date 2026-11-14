@@ -94,7 +94,7 @@ final class ManagedProcess {
     /// Asked on any queue: is the child waiting on a person? Then it is
     /// never readiness-killed and respawns at a steady pace (PasscodeHold).
     var holdCheck: (() -> Bool)?
-    // The last 16 KB of output, for diagnosis. Guarded by `lock`.
+    // Last 16 KB of output, for diagnosis. Guarded by `lock`.
     private var output = OutputRing()
 
     // Readiness deadline: a wedged `runwda` never exits, so the exit-triggered
