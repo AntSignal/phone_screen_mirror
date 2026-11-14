@@ -444,6 +444,29 @@ def test_recover_reports_a_cooldown_at_once(live):
     assert out["result"] == "cooldown" and time.monotonic() - t0 < 2
 
 
+def test_recover_takes_the_first_answer_after_its_request(live):
+    # A later cooldown answers another agent's request, not ours.
+    m, app = live
+    since = m._parse_iso("2026-11-13T10:00:00.000Z")
+    app.log(PHONE, "request", ts="2026-11-13T10:00:00.000Z", detail="accepted")
+    app.log(PHONE, "request", ts="2026-11-13T10:00:00.400Z", detail="cooldown")
+    assert m._request_outcome(PHONE, since) == "accepted"
+
+
+def test_recover_sees_an_answer_in_the_same_millisecond(live, monkeypatch):
+    m, app = live
+    monkeypatch.setattr(m, "_RECOVER_WAIT_S", 0.3)
+    real = m.datetime
+
+    class Clock(real):
+        @classmethod
+        def now(cls, tz=None):
+            return real(2026, 11, 13, 10, 0, 0, 123999, tzinfo=tz)
+    monkeypatch.setattr(m, "datetime", Clock)
+    app.log(PHONE, "request", ts="2026-11-13T10:00:00.123Z", detail="cooldown")
+    assert json.loads(m.ios_recover())["result"] == "cooldown"
+
+
 def test_recover_ignores_an_answer_to_an_older_request(live, monkeypatch):
     m, app = live
     monkeypatch.setattr(m, "_RECOVER_WAIT_S", 0.3)

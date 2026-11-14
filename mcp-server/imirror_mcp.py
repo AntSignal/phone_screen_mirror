@@ -884,8 +884,9 @@ def _write_restart_request(udid: str, requested_at: str) -> str:
 
 def _request_outcome(udid: str, since: datetime) -> str | None:
     """"accepted" or "cooldown" once the app has logged its answer to a
-    request made at `since`, else None."""
-    for e in reversed(_recent_events({udid}, n=10)[udid]):
+    request made at `since`, else None. The first answer after `since` is
+    ours: a later "cooldown" answers someone else's request."""
+    for e in _recent_events({udid}, n=50)[udid]:
         ts = _parse_iso(e.get("ts"))
         if e.get("event") == "request" and ts is not None and ts >= since:
             detail = e.get("detail")
@@ -1996,7 +1997,9 @@ def ios_recover() -> str:
             "app running? ios_devices shows the mode.",
             kind=ErrorKind.UNREACHABLE, code="DEVICE_FILE_INVALID")
     start_epoch = app.chain_epoch
-    since = datetime.now(timezone.utc)
+    clock = datetime.now(timezone.utc)
+    # Event times have whole milliseconds; match them.
+    since = clock.replace(microsecond=clock.microsecond // 1000 * 1000)
     path = _write_restart_request(app.udid, _iso(since))
     deadline = time.monotonic() + _RECOVER_WAIT_S
     result = "timeout"
