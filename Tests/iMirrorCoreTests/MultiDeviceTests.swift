@@ -282,7 +282,7 @@ final class DeviceRecoveryTests: XCTestCase {
         var ladder = ChainLadderState()
         ladder.onConnected()
         ladder.onDown(now: 500)
-        ladder.noteOutsideRestart()
+        ladder.noteOutsideRestart(now: 502)
         ladder.onRunwdaStarted(now: 505)
         XCTAssertEqual(ladder.tick(now: 594, othersHealthy: true, tunnelHasDevice: true), .wait)
         XCTAssertEqual(ladder.tick(now: 595, othersHealthy: true, tunnelHasDevice: true), .giveUp)

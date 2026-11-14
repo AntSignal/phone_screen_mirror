@@ -268,7 +268,7 @@ named the same way (`locked`, `untrusted`). A phone is called down only after tw
 failed health probes in a row, and a probe that times out while other requests
 (say an agent's slow `/source`) are already waiting on WDA counts as busy, not
 failed. If WDA stays down, a ladder restarts that phone's own chain first, then
-the shared tunnel. If it still won't come up, the app stops the chain and
+the shared tunnel; each restart gets its full grace from the moment it starts. If it still won't come up, the app stops the chain and
 retries by itself after 2 min, then 5 min, then every 10 min; tapping the WDA
 dot retries at once. Those retries never restart the shared tunnel while
 another phone is working. A separate MJPEG no-frame watchdog covers the case where
