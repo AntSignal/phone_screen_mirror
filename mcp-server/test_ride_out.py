@@ -195,6 +195,24 @@ def test_a_tap_waits_but_is_never_repeated(dead):
     assert "not retried" in str(e.value) and "retry_after_s=0" in str(e.value)
 
 
+def test_a_tap_cut_off_by_a_restart_waits_and_still_says_outcome_unknown(fake, live):
+    """WDA took the tap, then the chain restarted before it answered. The call
+    rides out the restart like any change, but keeps kind=outcome_unknown, so
+    the agent looks before tapping again, and the tap is not sent again."""
+    m, app = live
+    m.ios_tap(1, 1)
+    actions = f"/session/{fake.active}/actions"
+    fake.drops[actions] = 1
+    app.write("starting", reason="usb_reset", chain_epoch=2)
+    app.later(0.3, app.write, "ready", chain_epoch=2)
+    with pytest.raises(m.MCPToolError) as e:
+        m.ios_tap(10, 20)
+    assert e.value.error_kind == m.ErrorKind.OUTCOME_UNKNOWN
+    assert e.value.error_code == "RECOVERING"
+    assert "not retried" in str(e.value)
+    assert fake.count("POST", actions) == 2
+
+
 def test_still_recovering_after_the_budget_says_when_to_retry(dead, monkeypatch):
     m, app = dead
     monkeypatch.setattr(m, "_RIDE_OUT_S", 0.3)
