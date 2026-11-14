@@ -23,23 +23,23 @@ struct ClaudeCodeAdapter: MCPClientAdapter {
         guard let claude = resolveCLI() else { return .notInstalled }
         let r = run(claude, ["mcp", "get", profile.serverName])
         guard r.code == 0, r.out.contains(profile.serverName) else { return .notInstalled }
-        var stale = false
-        if let script = MCPPaths.scriptURL()?.path, !r.out.contains(script) { stale = true }
+        // Only the frozen copy is current, never a dev checkout.
+        var stale = !r.out.contains(MCPPaths.registeredScriptURL().path)
         for (k, v) in profile.env where !r.out.contains("\(k)=\(v)") { stale = true }
         return stale ? .stale : .installed
     }
 
-    /// Idempotent: remove any stale entry, then add fresh with the current
-    /// script path + env. A failed `claude mcp add` is reported as "nothing
-    /// registered" (nil), not as a fatal error — matches the original
-    /// behavior, where the whole install still succeeded via Claude Desktop
-    /// even if the Claude Code CLI call failed.
+    /// Idempotent: remove any stale entry, then add fresh with the frozen
+    /// script path (mcp/current) + env. A failed `claude mcp add` is reported
+    /// as "nothing registered" (nil), not as a fatal error — matches the
+    /// original behavior, where the whole install still succeeded via Claude
+    /// Desktop even if the Claude Code CLI call failed.
     func install(_ profile: MCPProfile) throws -> String? {
-        guard let claude = resolveCLI(), let script = MCPPaths.scriptURL() else { return nil }
+        guard let claude = resolveCLI() else { return nil }
         _ = run(claude, ["mcp", "remove", profile.serverName, "--scope", "user"])
         var addArgs = ["mcp", "add", profile.serverName, "--scope", "user"]
         for (k, v) in profile.env { addArgs += ["-e", "\(k)=\(v)"] }
-        addArgs += ["--", MCPPaths.venvPython.path, script.path]
+        addArgs += ["--", MCPPaths.venvPython.path, MCPPaths.registeredScriptURL().path]
         guard run(claude, addArgs).code == 0 else { return nil }
         return displayName
     }
