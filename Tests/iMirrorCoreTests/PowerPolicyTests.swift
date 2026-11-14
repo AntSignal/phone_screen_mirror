@@ -52,11 +52,20 @@ final class SleepPolicyTests: XCTestCase {
     }
 
     func testWhichReasonsAreRecovery() {
-        XCTAssertFalse(SleepPolicy.isRecovering(nil))
-        XCTAssertFalse(SleepPolicy.isRecovering(.gaveUp))
-        XCTAssertFalse(SleepPolicy.isRecovering(.macAsleep))
+        XCTAssertFalse(SleepPolicy.isRecovering(nil, gaveUp: false))
+        XCTAssertFalse(SleepPolicy.isRecovering(.gaveUp, gaveUp: true))
+        XCTAssertFalse(SleepPolicy.isRecovering(.macAsleep, gaveUp: false))
         for r in [DeviceReason.usbReset, .recovering, .booting, .wdaWedged, .needsPasscode] {
-            XCTAssertTrue(SleepPolicy.isRecovering(r), r.rawValue)
+            XCTAssertTrue(SleepPolicy.isRecovering(r, gaveUp: false), r.rawValue)
+        }
+    }
+
+    func testAGivenUpPhoneWaitingOnAPersonLetsTheMacSleep() {
+        // runwda's cause outranks gave_up, so the reason alone says "locked".
+        for cls in [RunwdaLogClass.locked, .needsPasscode, .untrusted] {
+            let reason = deviceReason(DeviceReasonInputs(ready: false, runwda: cls, gaveUp: true))
+            XCTAssertNotEqual(reason, .gaveUp)
+            XCTAssertFalse(SleepPolicy.isRecovering(reason, gaveUp: true), "\(cls)")
         }
     }
 }

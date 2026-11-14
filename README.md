@@ -337,7 +337,8 @@ scripts/imirror-ctl events --device phone2 --since 1h
 A sleeping Mac drops every phone's USB link. While Automation is on, iMirror
 holds a `PreventSystemSleep` power assertion, but only while a client sent a
 request through a phone's WDA port in the last 5 minutes, or a phone is
-recovering (any `reason` but `gave_up`). Otherwise it lets the Mac sleep.
+recovering (any `reason` but `gave_up` or `mac_asleep`, and the ladder has
+not given up). Otherwise it lets the Mac sleep.
 `pmset -g assertions` shows it as "iMirror: …".
 
 **macOS honours that assertion on AC power only.** On battery, idle sleep and a

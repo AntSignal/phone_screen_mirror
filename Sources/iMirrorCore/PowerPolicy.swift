@@ -42,8 +42,11 @@ public enum SleepPolicy {
 
     /// Is a phone with this reason mid-recovery? A give-up waits minutes for
     /// its retry, so it doesn't count; the ladder bounds all the others.
-    public static func isRecovering(_ reason: DeviceReason?) -> Bool {
-        guard let reason else { return false }
+    /// `gaveUp` is asked apart from the reason: a cause runwda named
+    /// (needs_passcode, locked, untrusted) outranks gave_up in the reason,
+    /// and a phone left locked overnight would keep the Mac awake for good.
+    public static func isRecovering(_ reason: DeviceReason?, gaveUp: Bool) -> Bool {
+        guard let reason, !gaveUp else { return false }
         return reason != .gaveUp && reason != .macAsleep
     }
 }

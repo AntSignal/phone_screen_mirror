@@ -100,7 +100,7 @@ final class ChainManager {
     private func updateSleepAssertion() {
         let now = ProcessInfo.processInfo.systemUptime
         let lastTraffic = controllers.compactMap { $0.sampleTraffic(now: now) }.max()
-        let recovering = controllers.contains { SleepPolicy.isRecovering($0.reason) }
+        let recovering = controllers.contains { SleepPolicy.isRecovering($0.reason, gaveUp: $0.ladder.hardStopped) }
         sleepAssertion.set(SleepPolicy.keepAwake(automationOn: running, lastTrafficAt: lastTraffic,
                                                  recovering: recovering, now: now))
     }
