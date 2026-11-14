@@ -3459,6 +3459,83 @@ _REPORT_CSS = """
 """
 
 
+def _exit_reason(start_ppid: int, now_ppid: int, stdin_closed: bool) -> str | None:
+    """Why this server should stop now, or None to keep serving.
+
+    A server whose client is gone can never be called again, yet such
+    servers stayed alive: another process can hold the client's stdin
+    pipe open after the client dies, and a tool stuck on WDA keeps the
+    process up after EOF. A new parent pid means we were orphaned, and
+    so does pid 1 (launchd), which adopts orphans: a parent can die
+    before this server is up far enough to note its pid.
+    """
+    if stdin_closed:
+        return "stdin closed"
+    if now_ppid != start_ppid or now_ppid == 1:
+        return f"parent {start_ppid} is gone"
+    return None
+
+
+def _stdin_eof_queue(fd: int):
+    """A kqueue that fires when fd's writer hangs up, or None.
+
+    kqueue reports EV_EOF without reading, so FastMCP still gets every
+    byte of stdin. EV_CLEAR makes it fire once per change, not spin
+    while a message waits to be read. None off macOS, or when fd is
+    not something kqueue can watch.
+    """
+    import select
+    if not hasattr(select, "kqueue"):
+        return None
+    kq = select.kqueue()
+    try:
+        flags = select.KQ_EV_ADD | select.KQ_EV_CLEAR
+        kq.control([select.kevent(fd, select.KQ_FILTER_READ, flags)], 0, 0)
+    except OSError:
+        kq.close()
+        return None
+    return kq
+
+
+def _watch_client(fd: int, start_ppid: int, on_exit, interval: float = 2.0) -> None:
+    """Call on_exit(reason) once stdin closes or the parent changes.
+
+    Runs on its own thread. It checks the parent every interval
+    seconds and wakes at once when the stdin pipe closes.
+    """
+    import select
+    kq = _stdin_eof_queue(fd)
+    while True:
+        closed = False
+        if kq is None:
+            time.sleep(interval)
+        else:
+            events = kq.control(None, 1, interval)
+            closed = any(e.flags & select.KQ_EV_EOF for e in events)
+        reason = _exit_reason(start_ppid, os.getppid(), closed)
+        if reason:
+            on_exit(reason)
+            return
+
+
+def _exit_now(reason: str) -> None:
+    """Stop the whole process, even with a tool thread stuck on WDA.
+
+    os._exit skips atexit, so run those hooks first: one stops a
+    Simulator recording that would otherwise run forever.
+    """
+    print(f"imirror_mcp: exiting, {reason}", file=sys.stderr, flush=True)
+    try:
+        atexit._run_exitfuncs()
+    finally:
+        os._exit(0)
+
+
+def _start_client_watch() -> None:
+    threading.Thread(target=_watch_client, name="client-watch", daemon=True,
+                     args=(sys.stdin.fileno(), os.getppid(), _exit_now)).start()
+
+
 def _autowda_bring_up() -> None:
     """Bring WDA up ourselves before serving, when IMIRROR_AUTOWDA is set.
 
@@ -3496,5 +3573,8 @@ def _autowda_bring_up() -> None:
 
 
 if __name__ == "__main__":
+    _start_client_watch()
     _autowda_bring_up()
     mcp.run()
+    # Don't wait on a tool thread still blocked on WDA.
+    _exit_now("stdin closed")

@@ -121,6 +121,10 @@ mirror, every agent's MCP server), so this server avoids creating one:
 Nothing here orders two servers' calls to one phone: calls are serialised per
 phone only within one server process.
 
+A server exits as soon as its client is gone: when its stdin closes, or when
+its parent process changes (it was orphaned). It does not wait for a tool
+call still blocked on WDA.
+
 ## Setup
 
 ```bash
