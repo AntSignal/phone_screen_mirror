@@ -82,6 +82,14 @@ final class DeviceEventCodecTests: XCTestCase {
                            + #""ts":"2026-09-28T21:30:00.250Z","udid":"U-1"}"# + "\n")
     }
 
+    func testRunnerUpgradeEventCarriesVersions() {
+        let e = DeviceEvent(at: Date(timeIntervalSince1970: 0), udid: "U", alias: "phone1",
+                            event: .runnerUpgrade, from: "1.0", to: "16.14.2")
+        let text = String(decoding: DeviceEventCodec.line(e), as: UTF8.self)
+        XCTAssertEqual(text, #"{"alias":"phone1","event":"runner_upgrade","from":"1.0","#
+                           + #""to":"16.14.2","ts":"1970-01-01T00:00:00.000Z","udid":"U"}"# + "\n")
+    }
+
     func testStateEventCarriesFromToReason() throws {
         let e = DeviceEvent(at: Date(timeIntervalSince1970: 0), udid: "U", alias: "a", event: .state,
                             from: "ready", to: "down", reason: "wda_wedged")

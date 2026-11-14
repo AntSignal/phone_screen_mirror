@@ -441,6 +441,16 @@ final class DeviceController {
         case .installing:
             installingRunner = true
             status("Installing WebDriverAgent on \(alias)… (first time can take ~30s)")
+        case .upgrading(let from, let to):
+            installingRunner = true
+            // May raise the passcode sheet; B1b's hold covers it.
+            log(.runnerUpgrade, from: from, to: to,
+                detail: "reinstalling the runner; the phone may ask for its passcode once")
+            status("Updating WebDriverAgent on \(alias) to \(to)… the phone may ask for its "
+                 + "passcode to Enable UI Automation.")
+        case .upgradeFailed(let kept, let raw):
+            log(.runnerUpgrade, from: kept, detail: "upgrade failed, keeping \(kept): \(raw)")
+            status("Couldn’t update WebDriverAgent on \(alias); starting the installed one.")
         case .done(let result):
             installingRunner = false
             lastRunnerInstall = result

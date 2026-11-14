@@ -14,6 +14,13 @@ public enum RunnerInstallError: Equatable {
     case notProvisioned(raw: String)   // ipa isn't code-signed for this device's UDID
     case deviceLocked(raw: String)     // phone is locked / needs the passcode
     case other(raw: String)            // anything we can't confidently classify
+
+    /// go-ios's own words, trimmed and capped.
+    public var raw: String {
+        switch self {
+        case .notProvisioned(let r), .deviceLocked(let r), .other(let r): return r
+        }
+    }
 }
 
 /// Progress of the runner check/install, emitted to the app so it can reflect
@@ -21,6 +28,11 @@ public enum RunnerInstallError: Equatable {
 public enum RunnerInstallEvent: Equatable {
     case checking
     case installing
+    /// Replacing an older runner. The new one can raise the XCTest
+    /// "Enable UI Automation" passcode sheet once.
+    case upgrading(from: String, to: String)
+    /// The upgrade failed; the older runner stays and is used.
+    case upgradeFailed(kept: String, raw: String)
     case done(RunnerInstall)
 }
 
@@ -60,6 +72,59 @@ public func shouldSpawnRunwda(after result: RunnerInstall) -> Bool {
     case .failed:
         return false
     }
+}
+
+// MARK: - Runner upgrade
+
+/// What to do about the phone's runner.
+public enum RunnerAction: Equatable {
+    case install    // not on the phone
+    case upgrade    // the phone's copy is older than the bundled one
+    case keep       // up to date, newer, or nothing to compare against
+}
+
+/// The version of `bundleId` in `ios apps --list` output, whose lines are
+/// "<bundle id> <name> <short version>". The name may hold spaces, so the
+/// version is what follows the last space. nil when the app is not listed;
+/// "" when it is listed without a version.
+public func runnerVersion(inAppsList out: String, bundleId: String) -> String? {
+    for line in out.split(whereSeparator: \.isNewline) {
+        let fields = line.split(separator: " ", omittingEmptySubsequences: false)
+        guard fields.first.map(String.init) == bundleId else { continue }
+        return fields.count >= 3 ? String(fields[fields.count - 1]) : ""
+    }
+    return nil
+}
+
+/// Install, upgrade or keep. Never downgrades, so two app builds with
+/// different bundled runners do not reinstall back and forth. A version
+/// whose upgrade already failed on this chain is not tried again: each
+/// attempt can reset the phone's USB and raise the passcode sheet.
+public func runnerAction(installed: String?, bundled: String?,
+                         failedUpgradeTo: String? = nil) -> RunnerAction {
+    guard let installed else { return .install }
+    guard let bundled, !bundled.isEmpty, bundled != failedUpgradeTo else { return .keep }
+    return isVersion(installed, olderThan: bundled) ? .upgrade : .keep
+}
+
+/// Dotted numeric compare. A missing or non-numeric part counts as 0, so
+/// "16.14.2" equals "16.14.2.0" and "" is older than "1".
+public func isVersion(_ a: String, olderThan b: String) -> Bool {
+    let pa = a.split(separator: ".", omittingEmptySubsequences: false).map { Int($0) ?? 0 }
+    let pb = b.split(separator: ".", omittingEmptySubsequences: false).map { Int($0) ?? 0 }
+    for i in 0..<max(pa.count, pb.count) {
+        let x = i < pa.count ? pa[i] : 0
+        let y = i < pb.count ? pb[i] : 0
+        if x != y { return x < y }
+    }
+    return false
+}
+
+/// The result of an upgrade attempt. A failed upgrade leaves the older
+/// runner on the phone, so runwda can still start with it.
+public func upgradeResult(_ install: RunnerInstall) -> RunnerInstall {
+    if case .failed = install { return .alreadyPresent }
+    return install
 }
 
 /// Trim whitespace and cap length so a runaway error string can't bloat the UI.
