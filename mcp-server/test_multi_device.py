@@ -43,12 +43,14 @@ PHONE_AND_SIM = [entry(PHONE_16E, "phone1", port=8100),
                  entry(SIM, "sim", kind="simulator", port=8201)]
 
 
-def write_devices(path, devices, owner_pid=None, schema=1, raw: str | None = None) -> None:
+def write_devices(path, devices, owner_pid=None, schema=1, raw: str | None = None,
+                  **top) -> None:
     """Write the device file the way the app does: a whole new file swapped in
-    atomically, so the server sees a new inode/mtime on every rewrite."""
+    atomically, so the server sees a new inode/mtime on every rewrite. `top`
+    adds top-level fields, such as owner_uniqueid."""
     doc = {"schema": schema, "owner_pid": os.getpid() if owner_pid is None else owner_pid,
            "app_version": "test", "updated_at": "2026-09-28T00:00:00Z",
-           "goios": "", "devices": devices}
+           "goios": "", "devices": devices, **top}
     tmp = f"{path}.tmp"
     with open(tmp, "w", encoding="utf-8") as f:
         f.write(raw if raw is not None else json.dumps(doc))
@@ -102,7 +104,9 @@ class RoutedWDA:
         for (a, suffix), status in list(self.fail_once.items()):
             if a == alias and path.endswith(suffix):
                 del self.fail_once[(a, suffix)]
-                return status, {"value": "no such session"}
+                error = "invalid session id" if status == 404 else "unknown error"
+                return status, {"value": {"error": error, "message": "Session does not exist",
+                                          "traceback": ""}, "sessionId": None}
         if path == "/session":
             return 200, {"value": {"sessionId": f"{alias}-s{next(self.ids)}"}}
         if path == "/status":
@@ -133,6 +137,19 @@ def dead_pid() -> int:
     p = subprocess.Popen(["true"])
     p.wait()
     return p.pid
+
+
+def own_uniqueid() -> int:
+    """This process's kernel uniqueid, read here without the server's code:
+    proc_pidinfo(PROC_PIDUNIQIDENTIFIERINFO=17) fills 56 bytes, with the
+    64-bit p_uniqueid at offset 16, after the executable's 16-byte UUID."""
+    import ctypes
+    lib = ctypes.CDLL("/usr/lib/libSystem.B.dylib", use_errno=True)
+    buf = (ctypes.c_uint8 * 56)()
+    n = lib.proc_pidinfo(ctypes.c_int(os.getpid()), ctypes.c_int(17), ctypes.c_uint64(0),
+                         buf, ctypes.c_int(56))
+    assert n == 56
+    return int.from_bytes(bytes(buf[16:24]), sys.byteorder)
 
 
 # ---- the `device` argument in the tool schema -------------------------------------
@@ -168,6 +185,7 @@ def test_tool_names_and_required_params_are_unchanged(reg):
         "ios_start_run": [], "ios_run_note": ["text"], "ios_run_section": ["title"],
         "ios_finish_run": [], "ios_assert_visible": ["text"],
         "ios_assert_not_visible": ["text"], "ios_run_sequence": ["steps"],
+        "ios_alert": [], "ios_recover": [],
     }
     got = {n: sorted(s.get("required", [])) for n, s in tool_schemas(reg.m).items()}
     assert got == {n: sorted(r) for n, r in expected.items()}
@@ -332,10 +350,13 @@ def test_valid_file_means_list_mode(reg):
     assert mode == "list" and [t.alias for t in targets] == ["phone1", "phone2"]
 
 
-@pytest.mark.parametrize("bad", ["dead-owner", "bad-json", "wrong-schema", "missing"])
+@pytest.mark.parametrize("bad", ["dead-owner", "huge-owner", "bad-json", "wrong-schema",
+                                 "missing"])
 def test_untrustworthy_file_falls_back_to_8100(reg, bad):
     if bad == "dead-owner":
         reg.write(TWO_PHONES, owner_pid=dead_pid())
+    elif bad == "huge-owner":                   # os.kill raises OverflowError
+        reg.write(TWO_PHONES, owner_pid=2 ** 40)
     elif bad == "bad-json":
         reg.write(TWO_PHONES, raw="{not json")
     elif bad == "wrong-schema":
@@ -347,10 +368,78 @@ def test_untrustworthy_file_falls_back_to_8100(reg, bad):
     assert targets == [reg.m._LEGACY] and reg.m._LEGACY.wda == "http://127.0.0.1:8100"
 
 
+def test_a_pin_without_a_device_file_refuses_the_8100_fallback(reg, wda, monkeypatch):
+    """run.sh pins each agent's server to one phone. Without a live device
+    file the server only knows :8100, which may be another phone."""
+    monkeypatch.setenv("IMIRROR_DEFAULT_DEVICE", PHONE_17)
+    os.remove(reg.path)
+    with pytest.raises(reg.m.MCPToolError) as e:
+        reg.m.ios_tap(1, 1)
+    assert e.value.error_code == "DEVICE_FILE_INVALID"
+    assert "no device file" in str(e.value) and "127.0.0.1:8100" in str(e.value)
+    assert wda.calls == []
+    monkeypatch.setattr(reg.m, "_probe_status", lambda t: {"wda_ready": True})
+    out = json.loads(reg.m.ios_devices())       # still answers, with no default
+    assert out["mode"] == "fallback" and out["default"] is None
+
+
+@pytest.mark.parametrize("pin", ["default", PHONE_17])
+def test_a_pin_that_names_the_fallback_target_still_drives_it(reg, wda, monkeypatch, pin):
+    monkeypatch.setenv("IMIRROR_DEFAULT_DEVICE", pin)
+    monkeypatch.setattr(reg.m._LEGACY, "udid", PHONE_17)   # as IMIRROR_UDID sets it
+    os.remove(reg.path)
+    reg.m.ios_tap(1, 1)
+    assert wda.aliases_for("/actions") == ["default"]
+
+
 def test_owner_dying_after_the_file_was_read_is_noticed(reg, monkeypatch):
     assert reg.m._targets()[0] == "list"
-    monkeypatch.setattr(reg.m, "_pid_alive", lambda pid: False)
+    monkeypatch.setattr(reg.m, "_pid_alive", lambda pid, uniqueid=None: False)
     assert reg.m._targets()[0] == "fallback"
+
+
+def test_a_zombie_owner_counts_as_gone(reg):
+    """kill(pid, 0) succeeds on a zombie: an app that died unreaped would
+    otherwise keep its stale ports trusted."""
+    p = subprocess.Popen(["true"])
+    try:
+        while os.waitid(os.P_PID, p.pid, os.WEXITED | os.WNOHANG | os.WNOWAIT) is None:
+            time.sleep(0.01)                    # exited, not yet reaped
+        reg.write(TWO_PHONES, owner_pid=p.pid)
+        assert reg.m._targets()[0] == "fallback"
+    finally:
+        p.wait()
+
+
+def test_an_owner_uniqueid_that_matches_is_trusted(reg):
+    reg.write(TWO_PHONES, owner_uniqueid=own_uniqueid())
+    assert reg.m._targets()[0] == "list"
+
+
+def test_an_owner_uniqueid_that_differs_means_the_pid_was_reused(reg):
+    """The app crashed and the system gave its pid to another process: the
+    pid is alive, but it is not the app that wrote the file."""
+    reg.write(TWO_PHONES, owner_uniqueid=own_uniqueid() + 1)
+    assert reg.m._targets()[0] == "fallback"
+    assert "gone" in reg.m._REGISTRY.problem
+
+
+@pytest.mark.parametrize("bad", ["123", 0, -1, True, 1.5])
+def test_a_malformed_owner_uniqueid_is_not_trusted(reg, bad):
+    reg.write(TWO_PHONES, owner_uniqueid=bad)
+    assert reg.m._targets()[0] == "fallback"
+    assert "owner_uniqueid" in reg.m._REGISTRY.problem
+
+
+def test_the_unchanged_file_recheck_uses_the_uniqueid_too(reg, monkeypatch):
+    uniq = own_uniqueid()
+    reg.write(TWO_PHONES, owner_uniqueid=uniq)
+    assert reg.m._targets()[0] == "list"
+    seen = []
+    monkeypatch.setattr(reg.m, "_pid_alive",
+                        lambda pid, uniqueid=None: seen.append((pid, uniqueid)) or False)
+    assert reg.m._targets()[0] == "fallback"
+    assert seen == [(os.getpid(), uniq)]
 
 
 def test_non_loopback_entry_is_dropped(reg):
@@ -376,6 +465,15 @@ def test_rewrite_keeps_sessions_and_a_port_change_drops_them(reg):
     reg.write([dict(TWO_PHONES[0], wda_url="http://127.0.0.1:8120"), TWO_PHONES[1]])
     assert reg.m._resolve("phone1").session["id"] is None
     assert reg.m._resolve("phone1").wda == "http://127.0.0.1:8120"
+
+
+def test_a_port_change_forgets_what_the_old_wda_supported(reg):
+    t = reg.m._resolve("phone1")
+    t.json_source = False
+    reg.write([dict(TWO_PHONES[0], state="down"), TWO_PHONES[1]])
+    assert reg.m._resolve("phone1").json_source is False      # same WDA
+    reg.write([dict(TWO_PHONES[0], wda_url="http://127.0.0.1:8120"), TWO_PHONES[1]])
+    assert reg.m._resolve("phone1").json_source is None
 
 
 def test_pinned_mode_ignores_the_file_and_rejects_other_devices(monkeypatch, tmp_path):
@@ -490,6 +588,13 @@ def test_ios_bin_comes_from_the_device_file(reg, monkeypatch, tmp_path):
 def test_status_names_the_phone_in_list_mode(reg, wda):
     out = json.loads(reg.m.ios_status(device="phone2"))
     assert out["alias"] == "phone2" and out["udid"] == PHONE_17 and out["ready"] is True
+
+
+def test_status_says_which_endpoint_answered_for_each_phone(reg, wda):
+    for alias, udid, port in (("phone1", PHONE_16E, 8100), ("phone2", PHONE_17, 8110)):
+        out = json.loads(reg.m.ios_status(device=alias))
+        assert (out["target"], out["wda_endpoint"], out["selected_udid"]) == (
+            "device", f"http://127.0.0.1:{port}", udid)
 
 
 # ---- parallel across phones, in order on one phone --------------------------------

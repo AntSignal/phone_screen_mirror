@@ -28,8 +28,11 @@ __version__ = "1.3.0"
 import atexit
 import base64
 import concurrent.futures
+import contextlib
 import contextvars
+import ctypes
 import dataclasses
+import fcntl
 import functools
 import html
 import http.client
@@ -39,6 +42,7 @@ import json
 import math
 import os
 import re
+import select
 import shutil
 import signal
 import socket
@@ -50,6 +54,7 @@ import time
 import urllib.error
 import urllib.request
 import xml.etree.ElementTree as ET
+from datetime import datetime, timedelta, timezone
 from typing import Annotated, Any
 from urllib.parse import urlsplit
 
@@ -58,8 +63,14 @@ from mcp.server.fastmcp import FastMCP, Image
 from mcp.types import ToolAnnotations
 from pydantic import Field
 
-import sim_control
-import wda_bringup
+# A __pycache__ in the signed bundle breaks its seal.
+_saved_dont_write_bytecode = sys.dont_write_bytecode
+sys.dont_write_bytecode = True
+try:
+    import sim_control
+    import wda_bringup
+finally:
+    sys.dont_write_bytecode = _saved_dont_write_bytecode
 
 
 class ErrorKind:
@@ -74,11 +85,13 @@ class ErrorKind:
     WEDGED = "wedged"
     TIMEOUT = "timeout"
     UNSUPPORTED = "unsupported"
+    # A change may have reached WDA; its reply was lost.
+    OUTCOME_UNKNOWN = "outcome_unknown"
 
 
 _ERROR_KINDS = {ErrorKind.VALIDATION, ErrorKind.NOT_FOUND, ErrorKind.WDA_HTTP,
                 ErrorKind.UNREACHABLE, ErrorKind.WEDGED, ErrorKind.TIMEOUT,
-                ErrorKind.UNSUPPORTED}
+                ErrorKind.UNSUPPORTED, ErrorKind.OUTCOME_UNKNOWN}
 
 
 class MCPToolError(RuntimeError):
@@ -97,18 +110,28 @@ class MCPToolError(RuntimeError):
     is additive, not a breaking change to the exception contract.
     """
 
-    def __init__(self, message: str, *, kind: str, code: str | None = None):
+    # WDA's W3C error name, e.g. "stale element reference", if any.
+    wda_error: str | None = None
+
+    def __init__(self, message: str, *, kind: str, code: str | None = None,
+                 fields: dict[str, Any] | None = None):
         if kind not in _ERROR_KINDS:
             raise ValueError(f"unknown MCPToolError kind: {kind!r}")
         super().__init__(message)
         self.human_message = message
         self.error_kind = kind
         self.error_code = code
+        # Extra key=value pairs for the tail, such as retry_after_s.
+        self.fields = {k: v for k, v in (fields or {}).items() if v is not None}
 
     def __str__(self) -> str:
-        tail = (f"[kind={self.error_kind}]" if self.error_code is None
-                else f"[kind={self.error_kind} code={self.error_code}]")
-        return f"{self.human_message} {tail}"
+        bits = [f"kind={self.error_kind}"]
+        if self.error_code is not None:
+            bits.append(f"code={self.error_code}")
+        # One token per value keeps the tail parseable.
+        bits += [f"{k}={re.sub(r'[^A-Za-z0-9_.:+-]', '_', str(v))}"
+                 for k, v in self.fields.items()]
+        return f"{self.human_message} [{' '.join(bits)}]"
 
 
 def _is_loopback_url(url: str) -> bool:
@@ -154,8 +177,8 @@ _IS_SIM = TARGET == "simulator"
 # ---- Targets: which phone a call drives -----------------------------------------
 #
 # A _Target is one WDA endpoint plus everything that must NOT be shared between
-# phones: the WDA session id, the cached window size, the gesture lock, and a
-# per-phone call lock. Three modes decide where targets come from:
+# phones: the WDA session id, the cached window size, and a per-phone call
+# lock. Three modes decide where targets come from:
 #
 #   pinned   — IMIRROR_WDA is set. Exactly one target (_LEGACY), exactly the
 #              pre-multi-device behaviour. Keeps the `imirror-sim` registration
@@ -176,17 +199,30 @@ class _Target:
         default_factory=lambda: {"id": None})
     window: dict[str, Any] = dataclasses.field(
         default_factory=lambda: {"size": None, "t": 0.0})
-    # Serialises /actions posts on this phone. WDA has one XCUITest queue per
-    # phone; two overlapping gestures stall it and can wedge the wire.
-    gesture_lock: Any = dataclasses.field(default_factory=threading.Lock)
     # Held for a whole tool call, so calls to ONE phone run in order (as they
     # always did) while calls to different phones run side by side. Re-entrant
-    # so ios_run_sequence's steps can run inside the sequence's own hold.
+    # so ios_run_sequence's steps can run inside the sequence's own hold. This
+    # is also what keeps two gestures from overlapping on one phone's single
+    # XCUITest queue, but only within this process: nothing orders calls from
+    # another MCP server until the device lease exists.
     call_lock: Any = dataclasses.field(default_factory=threading.RLock)
+    # When WDA said this server's session was gone.
+    session_losses: list[float] = dataclasses.field(default_factory=list)
+    # How this server got its sessions, shown by ios_devices.
+    session_stats: dict[str, int] = dataclasses.field(
+        default_factory=lambda: {"created": 0, "adopted": 0, "lost": 0})
+    # Whether this WDA serves /source?format=json; None until tried.
+    json_source: bool | None = None
     product_type: str | None = None
     ios_version: str | None = None
     state: str | None = None
     detail: str | None = None
+    # Why the app's chain is not ready (devices.json).
+    reason: str | None = None
+    state_since: str | None = None
+    chain_epoch: int | None = None    # +1 each time the app starts the chain
+    last_error: str | None = None
+    next_retry_at: str | None = None  # set while the app has given up
 
     @property
     def is_sim(self) -> bool:
@@ -216,17 +252,80 @@ def _devices_file() -> str:
     return os.environ.get("IMIRROR_DEVICES_FILE") or _DEVICES_FILE_DEFAULT
 
 
-def _pid_alive(pid: Any) -> bool:
-    """True if `pid` is a live process we could signal. A dead owner means the
-    iMirror app crashed without deleting its device file, so the ports it lists
-    are stale and must not be driven."""
-    if not isinstance(pid, int) or isinstance(pid, bool) or pid <= 0:
+# proc_pidinfo flavours from <sys/proc_info.h>. The uniqueid one is in the
+# private header, but its layout is checked on macOS 26 by the tests.
+_PROC_PIDT_SHORTBSDINFO = 13
+_PROC_PIDUNIQIDENTIFIERINFO = 17
+_SZOMB = 5                                # p_stat of a zombie
+
+
+class _ProcBSDShortInfo(ctypes.Structure):
+    _fields_ = [("pbsi_pid", ctypes.c_uint32), ("pbsi_ppid", ctypes.c_uint32),
+                ("pbsi_pgid", ctypes.c_uint32), ("pbsi_status", ctypes.c_uint32),
+                ("pbsi_comm", ctypes.c_char * 16), ("pbsi_flags", ctypes.c_uint32),
+                ("pbsi_uid", ctypes.c_uint32), ("pbsi_gid", ctypes.c_uint32),
+                ("pbsi_ruid", ctypes.c_uint32), ("pbsi_rgid", ctypes.c_uint32),
+                ("pbsi_svuid", ctypes.c_uint32), ("pbsi_svgid", ctypes.c_uint32),
+                ("pbsi_rfu", ctypes.c_uint32)]
+
+
+class _ProcUniqIdentifierInfo(ctypes.Structure):
+    _fields_ = [("p_uuid", ctypes.c_uint8 * 16), ("p_uniqueid", ctypes.c_uint64),
+                ("p_puniqueid", ctypes.c_uint64), ("p_idversion", ctypes.c_int32),
+                ("p_orig_ppidversion", ctypes.c_int32), ("p_reserve2", ctypes.c_uint64),
+                ("p_reserve3", ctypes.c_uint64)]
+
+
+_proc_pidinfo_fn: list[Any] = []          # loaded once; [None] off macOS
+
+
+def _proc_info(pid: int, flavor: int, struct: Any) -> Any | None:
+    """One proc_pidinfo read of `pid`, or None when it fails: the process is
+    gone, or a zombie (macOS answers ESRCH for one), or this is not macOS."""
+    if not _proc_pidinfo_fn:
+        fn = None
+        if sys.platform == "darwin":
+            try:
+                fn = ctypes.CDLL("/usr/lib/libSystem.B.dylib", use_errno=True).proc_pidinfo
+                fn.argtypes = [ctypes.c_int, ctypes.c_int, ctypes.c_uint64,
+                               ctypes.c_void_p, ctypes.c_int]
+                fn.restype = ctypes.c_int
+            except (OSError, AttributeError):
+                fn = None
+        _proc_pidinfo_fn.append(fn)
+    fn = _proc_pidinfo_fn[0]
+    if fn is None:
+        return None
+    buf = struct()
+    n = fn(pid, flavor, 0, ctypes.byref(buf), ctypes.sizeof(buf))
+    return buf if n == ctypes.sizeof(buf) else None
+
+
+def _pid_alive(pid: Any, uniqueid: int | None = None) -> bool:
+    """True if `pid` is a live process we could signal and, when `uniqueid`
+    is given, the very process that wrote the device file.
+
+    A dead owner means the iMirror app crashed without deleting its device
+    file, so the ports it lists are stale and must not be driven. kill(pid, 0)
+    alone says yes to a zombie, and to a pid the system has given to a new
+    process. The app records its kernel uniqueid, never reused within a boot,
+    as owner_uniqueid; a file without one gets the pid checks only."""
+    # pid_t is 32-bit; os.kill raises OverflowError past that.
+    if not isinstance(pid, int) or isinstance(pid, bool) or not 0 < pid < 2 ** 31:
         return False
     try:
         os.kill(pid, 0)
     except OSError:
         return False
-    return True
+    info = _proc_info(pid, _PROC_PIDT_SHORTBSDINFO, _ProcBSDShortInfo)
+    if info is None:
+        return _proc_pidinfo_fn[0] is None    # off macOS, kill() is all we have
+    if info.pbsi_status == _SZOMB:
+        return False
+    if uniqueid is None:
+        return True
+    ids = _proc_info(pid, _PROC_PIDUNIQIDENTIFIERINFO, _ProcUniqIdentifierInfo)
+    return ids is not None and ids.p_uniqueid == uniqueid
 
 
 class _Registry:
@@ -244,6 +343,7 @@ class _Registry:
         self._by_udid: dict[str, _Target] = {}
         self._order: list[str] = []
         self._owner: int | None = None
+        self._owner_uniqueid: int | None = None
         self.goios: str | None = None
         self.problem = "no device file yet"
 
@@ -258,6 +358,7 @@ class _Registry:
 
     def _invalidate(self, problem: str) -> None:
         self._owner = None
+        self._owner_uniqueid = None
         self._order = []
         self.goios = None
         self.problem = problem
@@ -273,7 +374,8 @@ class _Registry:
         sig = (path, st.st_mtime_ns, st.st_size, st.st_ino)
         if sig == self._sig:
             # Unchanged file — but the app may have died since we parsed it.
-            if self._owner is not None and not _pid_alive(self._owner):
+            if self._owner is not None and not _pid_alive(self._owner,
+                                                          self._owner_uniqueid):
                 self._invalidate("the iMirror app that wrote the device file is gone")
             return
         self._sig = sig
@@ -290,7 +392,12 @@ class _Registry:
             self._invalidate("device file has an unknown schema")
             return
         owner = doc.get("owner_pid")
-        if not _pid_alive(owner):
+        uniq = doc.get("owner_uniqueid")      # absent in older app builds
+        if uniq is not None and (not isinstance(uniq, int) or isinstance(uniq, bool)
+                                 or uniq <= 0):
+            self._invalidate("device file has a malformed owner_uniqueid")
+            return
+        if not _pid_alive(owner, uniq):
             self._invalidate("the iMirror app that wrote the device file is gone")
             return
         order: list[str] = []
@@ -299,6 +406,7 @@ class _Registry:
             if t is not None and t.key not in order:
                 order.append(t.key)
         self._owner = owner
+        self._owner_uniqueid = uniq
         self._order = order
         goios = doc.get("goios")
         self.goios = goios if isinstance(goios, str) and goios else None
@@ -324,6 +432,8 @@ class _Registry:
             # nothing on the new endpoint.
             t.wda = wda
             t.session["id"] = None
+            t.session_losses.clear()
+            t.json_source = None             # may be another WDA build now
             t.window.update(size=None, t=0.0)
         t.alias, t.kind = alias, kind
 
@@ -332,6 +442,13 @@ class _Registry:
             return v if isinstance(v, str) and v else None
         t.product_type, t.ios_version = s("product_type"), s("ios_version")
         t.state, t.detail = s("state"), s("detail")
+        t.reason, t.state_since = s("reason"), s("state_since")
+        t.next_retry_at = s("next_retry_at")
+        err = s("last_error")
+        t.last_error = err[:200] if err else None
+        epoch = e.get("chain_epoch")
+        t.chain_epoch = (epoch if isinstance(epoch, int) and not isinstance(epoch, bool)
+                         else None)
         return t
 
 
@@ -417,11 +534,22 @@ def _resolve(query: str = "", prefer: str | None = None) -> _Target:
     prefer the simulator); else IMIRROR_DEFAULT_DEVICE; else the only physical
     phone (a Simulator switched on beside it doesn't count, so enabling one
     doesn't break calls that name no device); else fail listing the choices —
-    silently driving the wrong phone is worse than asking."""
+    silently driving the wrong phone is worse than asking. For the same
+    reason, fallback mode refuses when IMIRROR_DEFAULT_DEVICE names a phone
+    other than its single :8100 target."""
     mode, targets = _targets()
     q = (query or "").strip()
     if mode != "list":
         t = targets[0]
+        env = os.environ.get("IMIRROR_DEFAULT_DEVICE", "").strip()
+        if not q and mode == "fallback" and env and not _match_one(env, t):
+            # A pinned agent must not drive whatever answers :8100.
+            raise MCPToolError(
+                f"IMIRROR_DEFAULT_DEVICE={env!r} pins this server to one phone, but "
+                f"it is not reading iMirror's device file ({_REGISTRY.problem}). "
+                f"Refusing to drive {t.wda}, which may be another phone. Is the "
+                "iMirror app running? ios_devices shows the mode.",
+                kind=ErrorKind.UNREACHABLE, code="DEVICE_FILE_INVALID")
         if not q or _match_one(q, t):
             return t
         why = ("pinned to one target by IMIRROR_WDA" if mode == "pinned"
@@ -525,6 +653,273 @@ def _wedged_hint() -> str:
             else "check the iMirror health dot")
 
 
+# ---- Riding out a chain restart ------------------------------------------------
+#
+# When WDA stops answering, the iMirror app is often already restarting that
+# phone's chain, and says so in devices.json. A call waits for it (reading the
+# file, never /status: dozens of servers must not hammer a booting WDA), then
+# retries once if it only reads. The file layout is in the README's "Files
+# other tools read".
+
+_RIDE_OUT_S = 30.0               # longest wait for a restarting chain
+_RIDE_OUT_POLL_S = 1.0           # devices.json is a stat when unchanged
+_NOTICE_S = 5.0                  # the app probes WDA every 3 s
+_RECOVERING_MARKS = frozenset({"starting", "installing", "recovering", "booting",
+                               "usb_reset", "wda_wedged", "tunnel_down"})
+_PASSCODE_REASONS = frozenset({"needs_passcode", "locked"})
+
+
+def _chain_phase(state: str | None, reason: str | None) -> str:
+    """What a devices.json entry says about the phone's chain: "ready",
+    "recovering" (worth waiting for), "needs_passcode", "gave_up", or "down"
+    (nothing to wait for). Pure, so every branch is unit-tested. An app
+    without `reason` says "down" while its ladder retries, and "failed" once
+    it stops for good."""
+    if reason in _PASSCODE_REASONS:
+        return "needs_passcode"
+    if reason == "gave_up" or state == "failed":
+        return "gave_up"
+    if state == "ready" and reason is None:
+        return "ready"
+    if state in _RECOVERING_MARKS or reason in _RECOVERING_MARKS:
+        return "recovering"
+    if state == "down" and reason is None:
+        return "recovering"
+    return "down"
+
+
+def _app_entry(t: _Target) -> _Target | None:
+    """`t` as the app's device file shows it now, or None when the file is not
+    live or no longer lists the phone. A pinned target is looked up by UDID."""
+    valid, targets = _REGISTRY.snapshot()
+    if not valid:
+        return None
+    if t is not _LEGACY:
+        return t if any(x is t for x in targets) else None
+    return next((x for x in targets if t.udid and x.udid == t.udid), None)
+
+
+def _wait_for_chain(t: _Target, budget: float,
+                    waiting: Any = None) -> tuple[_Target | None, str]:
+    """Poll the device file while `waiting(entry, phase)` is true (default:
+    the chain is recovering), for at most `budget` seconds. Returns the
+    entry and its phase ("gone" when the file stops listing the phone)."""
+    deadline = time.monotonic() + budget
+    while True:
+        app = _app_entry(t)
+        if app is None:
+            return None, "gone"
+        phase = _chain_phase(app.state, app.reason)
+        left = deadline - time.monotonic()
+        still = waiting(app, phase) if waiting else phase == "recovering"
+        if not still or left <= 0:
+            return app, phase
+        time.sleep(min(_RIDE_OUT_POLL_S, left))
+
+
+def _parse_iso(s: str | None) -> datetime | None:
+    if not s:
+        return None
+    try:
+        d = datetime.fromisoformat(s)
+    except ValueError:
+        return None
+    return d if d.tzinfo else d.replace(tzinfo=timezone.utc)
+
+
+def _chain_error(app: _Target, phase: str, *, idempotent: bool) -> MCPToolError:
+    """The error a call gets when the phone is not back: RECOVERING,
+    NEEDS_PASSCODE or DEVICE_GAVE_UP, each with what to do next."""
+    a = app.alias
+    if phase == "needs_passcode":
+        where = ("its Lock Screen" if app.reason == "locked"
+                 else "the 'Enable UI Automation' passcode sheet")
+        return MCPToolError(
+            f"{a} is waiting for its passcode on {where}. If auto-passcode is set up "
+            "for this phone, iMirror types it; otherwise a person must enter it on "
+            "the phone. Calls fail until then; ios_devices shows when it clears.",
+            kind=ErrorKind.UNREACHABLE, code="NEEDS_PASSCODE",
+            fields={"reason": app.reason, "retry_after_s": 30})
+    if phase == "gave_up":
+        why = f" ({app.last_error})" if app.last_error else ""
+        nxt = _parse_iso(app.next_retry_at)
+        when = (f"It tries again by itself at {app.next_retry_at}" if nxt
+                else "It will not try again by itself")
+        wait = (max(0, math.ceil((nxt - datetime.now(timezone.utc)).total_seconds()))
+                if nxt else None)
+        return MCPToolError(
+            f"iMirror has stopped retrying {a}'s WebDriverAgent{why}. {when}; "
+            f"ios_recover(device={a!r}) asks for a retry now.",
+            kind=ErrorKind.UNREACHABLE, code="DEVICE_GAVE_UP",
+            fields={"reason": app.reason or app.state, "next_retry_at": app.next_retry_at,
+                    "retry_after_s": wait})
+    note = ("" if idempotent else " This call was not retried: it may already have "
+            "reached the phone, so look at the screen before repeating it.")
+    if phase == "ready":
+        return MCPToolError(
+            f"{a}'s WebDriverAgent restarted during this call and is ready again."
+            f"{note}", kind=ErrorKind.UNREACHABLE, code="RECOVERING",
+            fields={"reason": "restarted", "retry_after_s": 0})
+    what = app.reason or app.state or "unknown"
+    since = f" since {app.state_since}" if app.state_since else ""
+    return MCPToolError(
+        f"{a}'s WebDriverAgent is still restarting ({what}{since}).{note} Retry "
+        "shortly; ios_devices shows progress.",
+        kind=ErrorKind.UNREACHABLE, code="RECOVERING",
+        fields={"reason": what, "retry_after_s": 15})
+
+
+def _rides_out(e: BaseException) -> bool:
+    """Whether an error may be a chain restart worth waiting for."""
+    return isinstance(e, MCPToolError) and e.error_kind in (
+        ErrorKind.UNREACHABLE, ErrorKind.WEDGED, ErrorKind.OUTCOME_UNKNOWN)
+
+
+def _ride_out(t: _Target, err: MCPToolError, start_epoch: int | None,
+              retry: Any) -> Any:
+    """Handle a call to `t` that failed with `err` (UNREACHABLE, WEDGED or
+    OUTCOME_UNKNOWN).
+
+    If the app says the chain is restarting, wait up to _RIDE_OUT_S for it.
+    Then `retry` (given only for calls that change nothing) runs once.
+    Otherwise this raises a precise error. A phone the app calls ready,
+    whose chain did not restart during the call, gets `err` back unchanged
+    once _NOTICE_S has passed without the app noticing anything."""
+    def unnoticed(app: _Target, phase: str) -> bool:
+        restarted = (start_epoch is not None and app.chain_epoch is not None
+                     and app.chain_epoch != start_epoch)
+        return phase == "ready" and not restarted
+    if _app_entry(t) is None:
+        raise err                   # no live device file: nothing to wait for
+    app, phase = _wait_for_chain(t, _NOTICE_S, unnoticed)
+    if app is None or unnoticed(app, phase):
+        raise err
+    if phase == "recovering":
+        app, phase = _wait_for_chain(t, _RIDE_OUT_S)
+        if app is None:
+            raise err
+    if phase == "ready" and retry is not None:
+        return retry()
+    if phase == "down":
+        raise err
+    final = _chain_error(app, phase, idempotent=retry is not None)
+    if err.error_kind == ErrorKind.OUTCOME_UNKNOWN:
+        # The kind still says the change may have landed.
+        final.error_kind = ErrorKind.OUTCOME_UNKNOWN
+    raise final from err
+
+
+# ---- Events and restart requests (files the app shares) -------------------------
+
+_EVENTS_TAIL_BYTES = 256 * 1024     # bounded read, however big the log grows
+_EVENT_KEYS = ("ts", "event", "from", "to", "reason", "detail", "expected")
+
+
+def _support_dir() -> str:
+    """The app's folder: wherever devices.json is, so IMIRROR_DEVICES_FILE
+    moves the events log and the request folder with it (tests rely on it)."""
+    return os.path.dirname(_devices_file())
+
+
+def _tail_lines(path: str, max_bytes: int) -> list[bytes]:
+    """The whole lines in the last `max_bytes` of `path` ([] if unreadable)."""
+    try:
+        with open(path, "rb") as f:
+            size = f.seek(0, os.SEEK_END)
+            start = max(0, size - max_bytes)
+            f.seek(start)
+            data = f.read(max_bytes)
+    except OSError:
+        return []
+    lines = data.split(b"\n")
+    return lines[1:] if start > 0 else lines   # the first may be cut
+
+
+def _clean_event(e: dict[str, Any]) -> dict[str, Any]:
+    """Only the known keys, cut short: the agent sees the app's
+    words, so a bad line must not flood its reply."""
+    out: dict[str, Any] = {}
+    for k in _EVENT_KEYS:
+        v = e.get(k)
+        if isinstance(v, bool) and k == "expected":
+            out[k] = v
+        elif isinstance(v, str) and v:
+            out[k] = v[:160]
+    return out
+
+
+def _recent_events(udids: set[str], n: int = 5) -> dict[str, list[dict[str, Any]]]:
+    """The last `n` events.jsonl lines for each phone, oldest first. Reads the
+    file from its end, then the rotated .1 file if that is not enough."""
+    want: dict[str, list[dict[str, Any]]] = {u: [] for u in udids if u}
+    path = os.path.join(_support_dir(), "events.jsonl")
+    for p in (path, path + ".1"):
+        if all(len(v) >= n for v in want.values()):
+            break
+        for raw in reversed(_tail_lines(p, _EVENTS_TAIL_BYTES)):
+            try:
+                e = json.loads(raw)
+            except ValueError:
+                continue
+            u = e.get("udid") if isinstance(e, dict) else None
+            got = want.get(u) if isinstance(u, str) else None
+            if got is not None and len(got) < n:
+                got.append(_clean_event(e))
+    return {u: v[::-1] for u, v in want.items()}
+
+
+def _chain_fields(t: _Target) -> dict[str, Any]:
+    """What the app says about a phone's chain, for ios_status/ios_devices."""
+    return {"app_state": t.state, "reason": t.reason, "state_since": t.state_since,
+            "chain_epoch": t.chain_epoch, "next_retry_at": t.next_retry_at,
+            "last_error": t.last_error}
+
+
+def _iso(d: datetime) -> str:
+    """ISO-8601 UTC with milliseconds, as events.jsonl writes it."""
+    return d.astimezone(timezone.utc).isoformat(timespec="milliseconds").replace(
+        "+00:00", "Z")
+
+
+def _write_restart_request(udid: str, requested_at: str) -> str:
+    """Drop a restart request for the app to pick up; returns its path. Written
+    to a temp name and renamed, so the app never reads half a file."""
+    if not re.fullmatch(r"[A-Za-z0-9-]{1,64}", udid):
+        raise MCPToolError(f"Not a usable UDID: {udid!r}.", kind=ErrorKind.VALIDATION)
+    folder = os.path.join(_support_dir(), "requests")
+    os.makedirs(folder, mode=0o700, exist_ok=True)
+    path = os.path.join(folder, f"restart-{udid}.json")
+    body = {"udid": udid, "requested_at": requested_at,
+            "requested_by": f"imirror-mcp pid {os.getpid()}"}
+    tmp = f"{path}.{os.getpid()}.tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(body, f)
+    os.replace(tmp, path)
+    return path
+
+
+def _request_outcome(udid: str, since: datetime) -> str | None:
+    """The app's answer to a request made at `since` ("accepted",
+    "cooldown", "stale", "not_attached"), else None. The first answer after
+    `since` is ours: a later "cooldown" answers someone else's request."""
+    for e in _recent_events({udid}, n=50)[udid]:
+        ts = _parse_iso(e.get("ts"))
+        if e.get("event") == "request" and ts is not None and ts >= since:
+            detail = e.get("detail")
+            if detail:
+                return detail
+    return None
+
+
+# What ios_recover says when the app did not restart anything.
+_RECOVER_HINTS = {
+    "cooldown": "A restart ran in the last minute. Wait for it; don't ask again.",
+    "not_attached": "iMirror runs no WDA chain for this device (a Simulator, "
+                    "or a phone it has not started).",
+    "stale": "iMirror thought the request was old. Check the Mac's clock.",
+}
+
+
 # Named timeout tiers, in place of scattered per-call literals.
 #   PROBE    — cheap existence/point checks (/status, element lookups in poll
 #              loops, best-effort settings POSTs). Deliberately short: a poll
@@ -547,7 +942,10 @@ mcp = FastMCP("imirror", instructions=(
     "Several phones may be attached: ios_devices lists them. Every device tool "
     "takes an optional `device` (alias or UDID); omit it when only one phone is "
     "attached. Calls to different phones run in parallel. Simulators: sim_list "
-    "shows them, sim_enable turns one on (it is then a device by its alias)."))
+    "shows them, sim_enable turns one on (it is then a device by its alias). "
+    "A failure with kind=outcome_unknown means the action may already have "
+    "happened: look at the screen before repeating it. If ios_source and the "
+    "screenshot disagree, ios_alert reads a system alert covering the app."))
 
 # Optional per-run recording. Off until ios_start_run; every action/screenshot is
 # appended to _run["steps"], and ios_finish_run renders them into a report.
@@ -660,17 +1058,31 @@ def _recorded(fn):
         try:
             return fn(*args, **kwargs)
         except Exception as e:
-            if _run["active"]:
-                verdict: dict[str, Any] = {
-                    "kind": "fail",
-                    "reason": e.human_message if isinstance(e, MCPToolError) else str(e),
-                }
-                if isinstance(e, MCPToolError):
-                    verdict["error_kind"] = e.error_kind
-                    verdict["error_code"] = e.error_code
-                _record(fn.__name__, detail=verdict["reason"], verdict=verdict)
+            # _tool records this one after riding out the restart.
+            if not (_riding.get() is wrapper and _rides_out(e)):
+                _record_fail(fn.__name__, e)
             raise
+    wrapper._records_failures = True  # type: ignore[attr-defined]
     return wrapper
+
+
+def _record_fail(name: str, e: Exception) -> None:
+    """Record one `fail` step for a tool that raised, if a run is active."""
+    if not _run["active"]:
+        return
+    verdict: dict[str, Any] = {
+        "kind": "fail",
+        "reason": e.human_message if isinstance(e, MCPToolError) else str(e),
+    }
+    if isinstance(e, MCPToolError):
+        verdict["error_kind"] = e.error_kind
+        verdict["error_code"] = e.error_code
+    _record(name, detail=verdict["reason"], verdict=verdict)
+
+
+# The outer tool call that _tool may still ride out.
+_riding: contextvars.ContextVar[Any] = contextvars.ContextVar("imirror_riding",
+                                                              default=None)
 
 
 _DEVICE_DOC = ("Which device to drive: an alias or UDID from ios_devices (a unique "
@@ -699,7 +1111,9 @@ def _tool(*, per_device: bool = True, lock: bool = True, optional: bool = False,
     `lock=False`: don't queue behind this phone's other calls.
     `read_only`: the tool never changes the device. Advertised to the client
     as readOnlyHint, which is what lets Claude Code send two of these at once;
-    it runs other tool calls from one message one after another.
+    it runs other tool calls from one message one after another. Such a call
+    is also retried once after a chain restart (see _ride_out); any other
+    call waits for the restart but is never repeated.
     """
     def deco(fn):
         sig = inspect.signature(fn, eval_str=True)
@@ -725,13 +1139,31 @@ def _tool(*, per_device: bool = True, lock: bool = True, optional: bool = False,
                     if optional and not device:
                         return fn(*args, **kwargs)
                     raise
-                token = _current.set(t)
-                try:
+                def once() -> Any:
                     if lock:
                         with t.call_lock:
                             return fn(*args, **kwargs)
                     return fn(*args, **kwargs)
+                token = _current.set(t)
+                riding = _riding.set(fn)
+                start_epoch = t.chain_epoch
+                try:
+                    try:
+                        return once()
+                    except MCPToolError as e:
+                        if not _rides_out(e):
+                            raise
+                        # The wait runs outside call_lock.
+                        try:
+                            return _ride_out(t, e, start_epoch,
+                                             once if read_only else None)
+                        except Exception as final:
+                            if (getattr(fn, "_records_failures", False)
+                                    and _rides_out(final)):
+                                _record_fail(fn.__name__, final)
+                            raise
                 finally:
+                    _riding.reset(riding)
                     _current.reset(token)
             entry.__signature__ = sig  # type: ignore[attr-defined]
         else:
@@ -797,18 +1229,104 @@ def _http(method: str, path: str, data: bytes | None,
     host, port = parts.hostname, parts.port or 80
     conns = _conns()
     c = conns.get(base)
+    if c is not None and _peer_closed(getattr(c, "sock", None)):
+        _drop_conn(base)      # replace it before any byte goes out
+        c = None
     if c is None:
         c = http.client.HTTPConnection(host, port, timeout=timeout)
         conns[base] = c
+    counter: _CountingSocket | None = None
+    connecting = False
     try:
+        # connect() reads c.timeout only when it opens a socket. A reused
+        # keep-alive socket keeps its first timeout unless it is set here,
+        # so the PROBE/INTERACT/TREE tiers would silently not apply.
         c.timeout = timeout
+        if getattr(c, "sock", False) is None:      # a real, unopened connection
+            connecting = True
+            c.connect()
+            connecting = False
+            c.sock = _CountingSocket(c.sock)
+        sock = getattr(c, "sock", None)
+        if sock is not None:
+            sock.settimeout(timeout)
+        if isinstance(sock, _CountingSocket):
+            counter = sock
+            counter.sent = 0
         c.request(method, path, body=data,
                   headers={"Content-Type": "application/json"})
         r = c.getresponse()
         return r.status, r.read()
-    except Exception:
+    except Exception as e:
         _drop_conn(base)      # poison so the next call reconnects clean
+        if connecting or (counter is not None and counter.sent == 0):
+            e.imirror_unsent = True  # type: ignore[attr-defined]
         raise
+
+
+class _CountingSocket:
+    """A socket that counts the bytes it hands to the kernel.
+
+    socket.sendall() cannot say how much went out before it failed; a loop
+    of send() calls can. _req uses the count: a change whose request never
+    left may be sent again, one that partly left may not."""
+
+    def __init__(self, sock: socket.socket):
+        self._sock = sock
+        self.sent = 0
+
+    def sendall(self, data: Any) -> None:
+        view = memoryview(data).cast("B")
+        while view:
+            n = self._sock.send(view)
+            self.sent += n
+            view = view[n:]
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._sock, name)
+
+
+def _peer_closed(sock: Any) -> bool:
+    """Whether a kept-alive socket can no longer carry a request.
+
+    An idle keep-alive socket has nothing to read. If it is readable, WDA
+    closed it or sent bytes nobody asked for. Checking first means a change
+    is not written into a dead socket, where its outcome would be unknown."""
+    if sock is None:
+        return False
+    try:
+        readable, _, _ = select.select([sock], [], [], 0)
+    except (OSError, ValueError, TypeError):
+        return True
+    return bool(readable)
+
+
+def _nothing_sent(e: BaseException) -> bool:
+    """Whether a failed request surely never reached WDA: the connection
+    was refused, or it failed before its first byte left (see _http)."""
+    return isinstance(e, ConnectionRefusedError) or getattr(e, "imirror_unsent", False)
+
+
+# POSTs safe to send twice. Exact: neighbours must not match.
+_REPLAY_SAFE_POST = re.compile(
+    r"/session|/session/[^/]+/(?:elements?|wda/apps/state|wda/getPasteboard"
+    r"|appium/settings)")
+
+
+def _replay_safe(method: str, path: str) -> bool:
+    """Whether a request may be sent again after its reply was lost. POST
+    /session counts: a second one only replaces the session the first made."""
+    m = method.upper()
+    return m in ("GET", "HEAD", "OPTIONS") or (
+        m == "POST" and _REPLAY_SAFE_POST.fullmatch(path) is not None)
+
+
+def _outcome_unknown(method: str, path: str, e: BaseException) -> MCPToolError:
+    return MCPToolError(
+        f"Outcome unknown for {method} {path}: WDA at {_label(_cur_or_none())} "
+        f"may have received it, but no reply came back ({e}). The action may "
+        "already have happened, so it was not sent again. Take ios_screenshot "
+        "before repeating it.", kind=ErrorKind.OUTCOME_UNKNOWN)
 
 
 def _req(method: str, path: str, body: dict | None = None,
@@ -817,6 +1335,8 @@ def _req(method: str, path: str, body: dict | None = None,
     # WDA's CocoaHTTPServer occasionally drops a connection mid-exchange
     # (RemoteDisconnected / reset), and keep-alive means we may hand back a
     # server-closed socket — retry such transient failures a couple times.
+    # Resend a change only if none of it left.
+    safe = _replay_safe(method, path)
     last_exc: Exception | None = None
     for attempt in range(3):
         try:
@@ -824,6 +1344,8 @@ def _req(method: str, path: str, body: dict | None = None,
         except (http.client.RemoteDisconnected, ConnectionResetError,
                 http.client.BadStatusLine, http.client.IncompleteRead,
                 BrokenPipeError) as e:
+            if not (safe or _nothing_sent(e)):
+                raise _outcome_unknown(method, path, e) from e
             last_exc = e
             # A reused keep-alive socket the server already closed fails on the
             # first send — that's expected staleness, so reconnect and retry
@@ -833,10 +1355,14 @@ def _req(method: str, path: str, body: dict | None = None,
                 time.sleep(0.3 * attempt)
             continue
         except (socket.timeout, TimeoutError) as e:
+            if not (safe or _nothing_sent(e)):
+                raise _outcome_unknown(method, path, e) from e
             raise MCPToolError(
                 f"WDA timed out after {timeout}s on {path}. It may be busy or "
                 f"wedged — {_wedged_hint()}.", kind=ErrorKind.WEDGED) from e
         except OSError as e:
+            if not (safe or _nothing_sent(e)):
+                raise _outcome_unknown(method, path, e) from e
             raise MCPToolError(
                 f"Cannot reach WDA at {_label(_cur_or_none())} ({e}). "
                 f"{_unreachable_hint()}", kind=ErrorKind.UNREACHABLE) from e
@@ -902,9 +1428,68 @@ def _screenshot_quality() -> int:
 
 
 def _ensure_session() -> str:
-    session = _cur().session
-    if session["id"]:
-        return session["id"]  # type: ignore[return-value]
+    """This phone's WDA session: the cached one, else the one already active
+    on the phone (adopted), else a new one.
+
+    WDA keeps one session per phone, and POST /session kills whichever one
+    exists. A server that created a session whenever it had none broke every
+    other client on the phone, the iMirror app's own mirror included.
+    Adopting costs one GET /status, and clients sharing a session all keep
+    working."""
+    t = _cur()
+    sid = t.session["id"]
+    if sid:
+        return sid
+    active = _active_session_id()
+    if active:
+        return _adopt_session(t, active, "status")
+    return _create_session(t)
+
+
+def _active_session_id() -> str | None:
+    """The session WDA reports as active in GET /status, or None."""
+    code, j = _req("GET", "/status", timeout=_TIMEOUT_PROBE)
+    return _body_session_id(j) if code < 400 else None
+
+
+def _body_session_id(j: Any) -> str | None:
+    """The active session WDA names in a reply. Every reply carries it at
+    the top level, null when there is none (FBResponsePayload.m); a create
+    also returns it as value.sessionId."""
+    if not isinstance(j, dict):
+        return None
+    sid = j.get("sessionId")
+    if not sid and isinstance(j.get("value"), dict):
+        sid = j["value"].get("sessionId")
+    return sid if isinstance(sid, str) and sid else None
+
+
+def _may_adopt_foreign(t: _Target, why: str) -> bool:
+    """May this call join a WDA session that another client made on `t`?
+
+    `why` is "status" when this server had no session and found one active
+    (the normal case: the iMirror app's mirror keeps one), or "lost" when
+    another client replaced this server's session mid-use. The device lease
+    is meant to allow "lost" only while this caller holds the phone, so an
+    agent that does not hold it never drives inside someone else's session
+    unnoticed. Until then: always yes, because creating one kills theirs."""
+    return True
+
+
+def _adopt_session(t: _Target, sid: str, why: str) -> str:
+    """Use session `sid`, which another client created, from now on."""
+    if not _may_adopt_foreign(t, why):
+        raise MCPToolError(
+            f"Another client on this phone owns {_label(t)}'s WebDriverAgent "
+            "session, and this call may not take it over. Nothing was sent.",
+            kind=ErrorKind.WDA_HTTP, code="SESSION_STOLEN")
+    t.session["id"] = sid
+    t.session_stats["adopted"] += 1
+    _apply_session_settings(sid)          # settings are global; re-apply anyway
+    return sid
+
+
+def _create_session(t: _Target) -> str:
     # shouldWaitForQuiescence:false slashes gesture latency — measured on-device, a
     # swipe's /actions drops from ~1300ms to ~10-200ms (XCUITest otherwise blocks each
     # gesture until the UI settles). Use settle_ms on scroll/swipe when a following
@@ -915,11 +1500,64 @@ def _ensure_session() -> str:
     sid = (j.get("value") or {}).get("sessionId") or j.get("sessionId")
     if not sid:
         raise RuntimeError(f"WDA session create failed (HTTP {code}): {j}")
-    session["id"] = sid
+    t.session["id"] = sid
+    t.session_stats["created"] += 1
+    _apply_session_settings(sid)
+    return sid
+
+
+# Two losses this close together: something keeps replacing ours.
+_SESSION_CONTEST_WINDOW_S = 60.0
+
+
+def _lost_session(t: _Target, j: dict[str, Any], sid: str) -> str:
+    """WDA said session `sid` is gone. Return the session to retry with.
+
+    The reply's top-level sessionId says what replaced it: null means WDA
+    restarted, so check /status and create if still none; another id means
+    another client made a session, so adopt it. A second such takeover
+    within a minute means something keeps doing that, and recreating would
+    only start a fight over the phone, so raise SESSION_CONTESTED instead.
+    A restart is not a takeover, and iMirror's recovery can restart WDA
+    twice in a minute."""
+    active = _body_session_id(j)
+    rival = active is not None and active != sid
+    if _count_lost_session(t, sid, rival) >= 2:
+        raise _session_contested(t, active)
+    if active and active != sid:
+        return _adopt_session(t, active, "lost")
+    return _ensure_session()
+
+
+def _count_lost_session(t: _Target, sid: str, rival: bool = True) -> int:
+    """Forget session `sid` and return how many were taken in the window.
+    Only a loss to a `rival` session counts toward that."""
+    if t.session["id"] == sid:
+        t.session["id"] = None
+    t.session_stats["lost"] += 1
+    now = time.monotonic()
+    t.session_losses[:] = [x for x in t.session_losses
+                           if now - x < _SESSION_CONTEST_WINDOW_S] + ([now] if rival else [])
+    return len(t.session_losses)
+
+
+def _session_contested(t: _Target, active: str | None) -> MCPToolError:
+    now_on = f" (WDA's session is now {active})" if active else ""
+    return MCPToolError(
+        f"WebDriverAgent on {_label(t)} dropped this server's session twice "
+        f"within {_SESSION_CONTEST_WINDOW_S:.0f}s{now_on}: another client on "
+        "this phone keeps creating sessions. That is usually another agent's "
+        "MCP server or an old iMirror server, or iMirror itself while a system "
+        "alert is up. The action was not run. Take ios_screenshot: if an alert "
+        "is showing, tap it by coordinates; otherwise check ios_devices, and "
+        "do not retry in a loop.", kind=ErrorKind.WDA_HTTP, code="SESSION_CONTESTED")
+
+
+def _apply_session_settings(sid: str) -> None:
     # Disable XCUITest's idle/animation wait — the big latency win (a swipe over
     # animating content drops ~13s -> ~1s, static lists ~1.3s -> near-instant).
-    # Best-effort; the capability above is ignored by this WDA build, but this
-    # per-session settings route is honored.
+    # Best-effort; this WDA build ignores the shouldWaitForQuiescence capability,
+    # but honours this per-session settings route.
     try:
         _req("POST", f"/session/{sid}/appium/settings",
              {"settings": {"waitForIdleTimeout": 0, "animationCoolOffTimeout": 0}}, timeout=_TIMEOUT_PROBE)
@@ -933,32 +1571,103 @@ def _ensure_session() -> str:
              {"settings": {"screenshotQuality": _screenshot_quality()}}, timeout=_TIMEOUT_PROBE)
     except Exception:
         pass
-    return sid
+    # A shallower snapshot makes /source cheaper. Off unless configured.
+    depth = _snapshot_max_depth()
+    if depth:
+        try:
+            _req("POST", f"/session/{sid}/appium/settings",
+                 {"settings": {"snapshotMaxDepth": depth}}, timeout=_TIMEOUT_PROBE)
+        except Exception:
+            pass
 
 
-def _session_post(subpath: str, body: dict, _retry: bool = True) -> dict[str, Any]:
-    """POST to /session/<id><subpath>; recreate the session once on 404."""
+def _snapshot_max_depth() -> int | None:
+    """IMIRROR_SNAPSHOT_MAX_DEPTH (1-200), or None to keep WDA's own 50.
+
+    A heavy /source (a long Safari page) can kill the runner, which resets
+    the phone's USB link, and a lower depth makes it cheaper. It is off by
+    default: WDA applies it to every element lookup too, so an element
+    nested deeper is not found at all. Measure on a phone before setting
+    it. Never raises."""
+    try:
+        n = int(os.environ.get("IMIRROR_SNAPSHOT_MAX_DEPTH", ""))
+    except ValueError:
+        return None
+    return n if 1 <= n <= 200 else None
+
+
+def _wda_error(j: Any) -> str | None:
+    """The W3C error name in a WDA error reply, e.g. "no such element".
+
+    WDA answers every failure as {"value": {"error", "message", "traceback"},
+    "sessionId": <the active session, or null>} (FBResponsePayload.m), and
+    uses 404 for four different things: no such element, stale element
+    reference, unknown command and invalid session id. None means the body
+    has another shape: an older WDA build, or a body that was not JSON."""
+    v = j.get("value") if isinstance(j, dict) else None
+    err = v.get("error") if isinstance(v, dict) else None
+    return err if isinstance(err, str) and err else None
+
+
+def _wda_http_error(code: int, j: Any, where: str) -> MCPToolError:
+    """The error for a WDA reply this server cannot use. Quotes WDA's error
+    and message but not its traceback, which is a whole stack dump."""
+    err = _wda_error(j)
+    if err is not None:
+        msg = j["value"].get("message")
+        detail = f"{err}: {msg}" if isinstance(msg, str) and msg else err
+    else:
+        detail = str(j)[:300]
+    # WDA's 408 "timeout" is slowness; poll loops ride it out.
+    kind = ErrorKind.TIMEOUT if err == "timeout" else ErrorKind.WDA_HTTP
+    e = MCPToolError(f"WDA error (HTTP {code}) on {where}: {detail}",
+                     kind=kind, code=f"WDA_HTTP_{code}")
+    e.wda_error = err
+    return e
+
+
+def _session_call(method: str, subpath: str, body: dict | None,
+                  timeout: float) -> tuple[int, dict[str, Any]]:
+    """Send one request to /session/<id><subpath>, replacing a dead session
+    once, and return WDA's (status, body) for the caller to read.
+
+    Only "invalid session id" means the session is gone. Resetting on any
+    404, as this used to, turned every element miss into a new session,
+    which kills whichever session another client on the phone was using."""
+    t = _cur()
     sid = _ensure_session()
-    code, j = _req("POST", f"/session/{sid}{subpath}", body)
-    if code == 404 and _retry:               # stale session (WDA restarted)
-        _cur().session["id"] = None
-        return _session_post(subpath, body, _retry=False)
+    code, j = _req(method, f"/session/{sid}{subpath}", body, timeout=timeout)
+    if code != 404:
+        return code, j
+    err = _wda_error(j)
+    if err == "invalid session id":
+        sid = _lost_session(t, j, sid)
+    elif err is None:
+        # Older WDA builds send a bare 404: recreate once.
+        t.session["id"] = None
+        sid = _ensure_session()
+    else:
+        return code, j                      # a miss, a stale element, an unknown route
+    code, j = _req(method, f"/session/{sid}{subpath}", body, timeout=timeout)
+    if code == 404 and _wda_error(j) == "invalid session id":
+        _count_lost_session(t, sid)         # lost again within this one call
+        raise _session_contested(t, _body_session_id(j))
+    return code, j
+
+
+def _session_post(subpath: str, body: dict) -> dict[str, Any]:
+    """POST to /session/<id><subpath>; raise on any WDA error."""
+    code, j = _session_call("POST", subpath, body, _TIMEOUT_INTERACT)
     if code >= 400:
-        raise MCPToolError(f"WDA error (HTTP {code}) on {subpath}: {j}",
-                            kind=ErrorKind.WDA_HTTP, code=f"WDA_HTTP_{code}")
+        raise _wda_http_error(code, j, subpath)
     return j
 
 
-def _session_get(subpath: str, _retry: bool = True) -> dict[str, Any]:
-    """GET /session/<id><subpath>; recreate the session once on 404."""
-    sid = _ensure_session()
-    code, j = _req("GET", f"/session/{sid}{subpath}")
-    if code == 404 and _retry:               # stale session (WDA restarted)
-        _cur().session["id"] = None
-        return _session_get(subpath, _retry=False)
+def _session_get(subpath: str) -> dict[str, Any]:
+    """GET /session/<id><subpath>; raise on any WDA error."""
+    code, j = _session_call("GET", subpath, None, _TIMEOUT_INTERACT)
     if code >= 400:
-        raise MCPToolError(f"WDA error (HTTP {code}) on {subpath}: {j}",
-                            kind=ErrorKind.WDA_HTTP, code=f"WDA_HTTP_{code}")
+        raise _wda_http_error(code, j, subpath)
     return j
 
 
@@ -966,10 +1675,6 @@ def _pointer(steps: list[dict]) -> dict:
     return {"actions": [{"type": "pointer", "id": "finger1",
                          "parameters": {"pointerType": "touch"}, "actions": steps}]}
 
-
-# Gesture (/actions) posts are serialised per phone by _Target.gesture_lock:
-# WDA has a single XCUITest queue per phone, and two overlapping gestures stall
-# it and can wedge the wire. Different phones' gestures don't wait on each other.
 
 # Serialise the simulator recorder handoff (start/stop) across threads. Two
 # racing ios_start_run calls could otherwise interleave their _run["recorder"]
@@ -980,13 +1685,9 @@ _recorder_lock = threading.RLock()
 
 
 def _gesture(steps: list[dict]) -> None:
-    lock = _cur().gesture_lock
-    if not lock.acquire(timeout=5):
-        raise RuntimeError("WDA gesture lock timeout — another gesture is stuck")
-    try:
-        _session_post("/actions", _pointer(steps))
-    finally:
-        lock.release()
+    """Send one pointer gesture. The caller's call_lock keeps it from
+    overlapping another gesture on this phone from this process."""
+    _session_post("/actions", _pointer(steps))
 
 
 def _win_size() -> tuple[float, float]:
@@ -996,11 +1697,19 @@ def _win_size() -> tuple[float, float]:
     cached = window["size"]
     if cached and now - window["t"] < 30:
         return cached
-    j = _session_get("/window/size")
-    v = j.get("value", j)
+    v = _window_size()
     size = (float(v["width"]), float(v["height"]))
     window.update(size=size, t=now)
     return size
+
+
+def _window_size() -> dict[str, Any]:
+    """GET /window/size on WDA's sessionless route (FBElementCommands.m), so
+    reading the size never creates a session or takes someone else's."""
+    code, j = _req("GET", "/window/size")
+    if code >= 400:
+        raise _wda_http_error(code, j, "/window/size")
+    return j.get("value", j)
 
 
 def _scroll_geom(direction: str, distance_pct: float,
@@ -1038,10 +1747,10 @@ def _scroll_once(direction: str, distance_pct: float, x_pct: float,
     return fx, fy, tx, ty, dist
 
 
-def _find_element(text: str, visible_only: bool = False, _retry: bool = True) -> str | None:
+def _find_element(text: str, visible_only: bool = False) -> str | None:
     """Return the element id of the first element whose label/name/value matches
-    `text`, or None if no such element is on screen. Recreates the session once
-    on a stale 404.
+    `text`, or None if no such element is on screen. WDA's 404 "no such
+    element" is that miss; any other 4xx raises.
 
     `visible_only` ANDs `visible == 1` into the predicate so only an on-screen
     match counts — WDA returns the first predicate match, which is reading
@@ -1052,7 +1761,6 @@ def _find_element(text: str, visible_only: bool = False, _retry: bool = True) ->
     per poll, a real-device perf regression. Default False keeps today's
     behavior for ios_find_and_tap / ios_scroll_to / the asserts.
     """
-    sid = _ensure_session()
     # Escape backslashes BEFORE quotes: input ending in \' would otherwise become
     # \\' (escaped backslash + live quote) and break out of the predicate literal.
     safe = text.replace("\\", "\\\\").replace("'", "\\'")
@@ -1062,14 +1770,18 @@ def _find_element(text: str, visible_only: bool = False, _retry: bool = True) ->
     # PROBE tier: poll loops (ios_wait_for, ios_find_and_tap, ios_scroll_to, the
     # asserts) call this many times per second, so a wedged WDA should surface
     # fast rather than each lookup eating the INTERACT tier.
-    code, j = _req("POST", f"/session/{sid}/element",
-                   {"using": "predicate string", "value": predicate},
-                   timeout=_TIMEOUT_PROBE)
-    if code == 404 and _retry:
-        _cur().session["id"] = None
-        return _find_element(text, visible_only=visible_only, _retry=False)
-    return (j.get("value") or {}).get("ELEMENT") or \
-           (j.get("value") or {}).get("element-6066-11e4-a52e-4f735466cecf")
+    code, j = _session_call("POST", "/element",
+                            {"using": "predicate string", "value": predicate},
+                            _TIMEOUT_PROBE)
+    if code == 404 and _wda_error(j) in ("no such element", None):
+        return None          # None: an older build's bare 404, after one recreate
+    if 400 <= code < 500:
+        raise _wda_http_error(code, j, "/element")
+    # A 5xx stays a miss, so poll loops keep polling.
+    v = j.get("value")
+    if not isinstance(v, dict):
+        return None
+    return v.get("ELEMENT") or v.get("element-6066-11e4-a52e-4f735466cecf")
 
 
 def _find_element_or_timeout(text: str, visible_only: bool = False) -> tuple[str | None, MCPToolError | None]:
@@ -1111,6 +1823,11 @@ def _find_element_or_timeout(text: str, visible_only: bool = False) -> tuple[str
 # but info-dense tree, and a byte cap would truncate mid-element. The full
 # payload is always parsed first; only the rendered output is capped.
 _SOURCE_MAX_ELEMENTS = 400
+# A huge label (web page text) can still flood replies.
+_SOURCE_MAX_FIELD_CHARS = 240
+_SOURCE_MAX_TEXT_CHARS = 20000
+_SOURCE_TEXT_FIELDS = (("label", "label"), ("name", "name"),
+                       ("value", "value"), ("identifier", "id"))
 
 # "Content" roles are always rendered, even with an empty label, because they're
 # the elements an agent actually taps/reads. Pure containers (Other, Window,
@@ -1198,18 +1915,27 @@ def _norm_source_json(d: dict) -> dict[str, Any] | None:
 
 
 def _fetch_source_json_tree() -> dict[str, Any] | None:
-    """Probe WDA's JSON source once. Returns a normalized root node, or None if
-    this WDA build doesn't support it (non-2xx, missing/non-dict `value`, or the
-    request itself blows up) so the caller falls back to XML. Never raises."""
+    """Read WDA's JSON source. Returns a normalized root node, or None when
+    this WDA build doesn't serve it, so the caller falls back to XML.
+
+    A stalled or unreachable WDA raises: falling back to XML then only waits
+    out the same stall a second time. A 4xx or a non-JSON or non-tree reply
+    marks the build unsupported, so later reads skip straight to XML."""
+    t = _cur()
+    if t.json_source is False:
+        return None
     try:
         code, j = _req_tree("/source?format=json")
-    except Exception:
-        return None
-    if code >= 400:
+    except ValueError:                       # a 2xx body that is not JSON
+        t.json_source = False
         return None
     value = j.get("value")
-    if not isinstance(value, dict):
+    if code >= 500:
+        return None                          # maybe passing; try JSON again later
+    if code >= 400 or not isinstance(value, dict):
+        t.json_source = False
         return None
+    t.json_source = True
     return _norm_source_json(value)
 
 
@@ -1250,11 +1976,18 @@ def _render_source_line(depth: int, node: dict[str, Any],
                         win_w: float, win_h: float) -> str:
     short = _source_short_type(node.get("type"))
     parts = [("  " * depth) + short]
-    for field, tag in (("label", "label"), ("name", "name"),
-                       ("value", "value"), ("identifier", "id")):
+    seen: set[str] = set()
+    for field, tag in _SOURCE_TEXT_FIELDS:
         v = node.get(field)
         if v:
-            parts.append(f'{tag}="{v}"')
+            value = str(v)
+            if value in seen:             # name often repeats the label
+                continue
+            seen.add(value)
+            if len(value) > _SOURCE_MAX_FIELD_CHARS:
+                value = value[:_SOURCE_MAX_FIELD_CHARS - 1] + "…"
+            # JSON quoting keeps a multi-line label on one line.
+            parts.append(f"{tag}={json.dumps(value, ensure_ascii=False)}")
     flags = [name for name, v in (("enabled", node.get("enabled")),
                                   ("visible", node.get("visible")),
                                   ("hittable", node.get("hittable"))) if v is True]
@@ -1280,11 +2013,28 @@ def _render_source_text(root: dict[str, Any]) -> str:
     lines = ["# tap point = (x + w/2, y + h/2) in normalized [0,1] coords, "
              "multiply by window size"]
     total = len(elements)
+    # Leave room for the notice, keeping output under the cap.
+    notice = (f"… ({total} elements dropped; field values truncated; "
+              "use ios_source(format='xml') for more detail.)")
+    used = len(lines[0])
+    emitted = 0
+    fields_truncated = False
     for depth, node in elements[:_SOURCE_MAX_ELEMENTS]:
-        lines.append(_render_source_line(depth, node, win_w, win_h))
-    dropped = total - _SOURCE_MAX_ELEMENTS
-    if dropped > 0:
-        lines.append(f"… ({dropped} elements dropped; refine with a more specific screen)")
+        line = _render_source_line(depth, node, win_w, win_h)
+        if used + 1 + len(line) + 1 + len(notice) > _SOURCE_MAX_TEXT_CHARS:
+            break                         # whole lines only
+        lines.append(line)
+        used += 1 + len(line)
+        emitted += 1
+        fields_truncated |= any(len(str(node.get(field) or "")) > _SOURCE_MAX_FIELD_CHARS
+                                for field, _ in _SOURCE_TEXT_FIELDS)
+    dropped = total - emitted
+    if dropped or fields_truncated:
+        details = [f"{dropped} elements dropped"] if dropped else []
+        if fields_truncated:
+            details.append("field values truncated")
+        lines.append("… (" + "; ".join(details) +
+                     "; use ios_source(format='xml') for more detail.)")
     return "\n".join(lines)
 
 
@@ -1294,10 +2044,15 @@ def _render_source_text(root: dict[str, Any]) -> str:
 def ios_status() -> str:
     """Check whether WebDriverAgent is up and ready to accept commands.
 
-    Returns a short JSON summary (ready flag, iOS version, device name, and this
-    MCP server's version). Call this first if other tools fail — a not-ready/
-    unreachable result means the iMirror app isn't running or its health dot isn't
-    green yet.
+    Returns a short JSON summary (ready flag, iOS version, device name, this
+    MCP server's version and file, and which target answered: `target`
+    "device" or "simulator", `wda_endpoint`, `selected_udid`). Call this
+    first if other tools fail — a not-ready/unreachable result means the
+    iMirror app isn't running or its health dot isn't green yet. With
+    iMirror's device file it also gives the app's view: app_state, reason
+    (why it is not ready), state_since, chain_epoch, next_retry_at,
+    last_error and the phone's last 5 events. While WDA is down this call
+    fails too; ios_devices still shows that view.
     """
     _, j = _req("GET", "/status")
     v = j.get("value", {})
@@ -1306,12 +2061,21 @@ def ios_status() -> str:
         "message": v.get("message"),
         "ios": v.get("os", {}).get("version"),
         "device": v.get("device"),
-        "server_version": __version__,
+        **_server_identity(),
     }
     t = _cur()
+    # Which endpoint answered, so a wrong pin shows here.
+    out.update(target=t.kind, wda_endpoint=t.wda, selected_udid=t.udid)
     if t is not _LEGACY:                 # list mode: say which phone answered
-        out.update(alias=t.alias, udid=t.udid, kind=t.kind)
+        out.update(alias=t.alias, udid=t.udid, kind=t.kind, **_chain_fields(t),
+                   events=_recent_events({t.udid} if t.udid else set()).get(t.udid, []))
     return json.dumps(out)
+
+
+def _server_identity() -> dict[str, str]:
+    """Which server answered: a session can then spot one running from a
+    stale checkout or a dev tree instead of the installed copy."""
+    return {"server_version": __version__, "script_path": os.path.realpath(__file__)}
 
 
 _PROBE_S = 2.0
@@ -1339,9 +2103,15 @@ def _probe_status(t: _Target) -> dict[str, Any]:
 def ios_devices() -> str:
     """List the devices this server can drive, and whether each one answers.
 
-    Returns JSON {"mode", "default", "devices": [{"alias", "udid", "kind",
-    "product_type", "ios", "wda", "app_state", "wda_ready", "is_default"}]}.
-    Pass a device's `alias` (or its UDID) as `device` to any other tool.
+    Returns JSON {"mode", "default", "server_version", "script_path",
+    "devices": [{"alias", "udid", "kind", "product_type", "ios", "wda",
+    "app_state", "reason", "state_since", "chain_epoch", "next_retry_at",
+    "last_error", "events", "wda_ready", "is_default", "session"}]}. `reason`
+    says why the app's chain is not ready; `events` are its last 5 for that
+    device. `session` counts
+    how this server got its WDA sessions (created, adopted from another
+    client, lost): losses mean another client on this phone. Pass a device's
+    `alias` (or its UDID) as `device` to any other tool.
     `mode` is "list" when the iMirror app is publishing its phones, "pinned"
     when IMIRROR_WDA fixes one target, and "fallback" when neither (then only
     127.0.0.1:8100 is known). `default` is the device a call without `device`
@@ -1354,18 +2124,88 @@ def ios_devices() -> str:
         default = None
     with concurrent.futures.ThreadPoolExecutor(max_workers=max(1, len(targets))) as ex:
         probes = list(ex.map(_probe_status, targets))
+    events = _recent_events({t.udid for t in targets if t.udid and t is not _LEGACY})
     devices = []
     for t, p in zip(targets, probes):
         devices.append({
             "alias": t.alias, "udid": t.udid, "kind": t.kind,
             "product_type": t.product_type, "ios": t.ios_version or p.get("ios"),
-            "wda": t.wda, "app_state": t.state, "wda_ready": p["wda_ready"],
+            "wda": t.wda, **_chain_fields(t), "events": events.get(t.udid or "", []),
+            "wda_ready": p["wda_ready"],
             "is_default": t.alias == default,
+            # Many adoptions or losses mean another client shares the phone.
+            "session": {"cached": bool(t.session["id"]), **t.session_stats},
             **({"error": p["error"]} if "error" in p else {}),
         })
-    out: dict[str, Any] = {"mode": mode, "default": default, "devices": devices}
+    out: dict[str, Any] = {"mode": mode, "default": default, **_server_identity(),
+                           "devices": devices}
     if mode == "fallback":
         out["note"] = f"not using an iMirror device file: {_REGISTRY.problem}"
+    return json.dumps(out)
+
+
+_RECOVER_WAIT_S = 30.0
+
+
+@_tool(lock=False)
+def ios_recover() -> str:
+    """Ask iMirror to restart this device's WebDriverAgent chain, then wait up
+    to 30 s for it.
+
+    Use it when calls keep failing with RECOVERING or DEVICE_GAVE_UP, or WDA
+    looks stuck. iMirror honours one request per phone per minute, so several
+    agents asking at once restart it only once. It never types a passcode.
+    Returns JSON {"result", "alias", "udid", "app_state", "reason", ...}:
+    `result` is "accepted" (the restart began; app_state says whether it is
+    ready yet), "cooldown" (one ran in the last minute: wait, don't repeat)
+    "not_attached" (no chain for this device here, e.g. a Simulator),
+    "stale" (the app judged the request old) or "timeout" (iMirror did not
+    answer; an older build ignores requests).
+    """
+    t = _cur()
+    app = _app_entry(t) if t.udid else None
+    if app is None or not app.udid:
+        raise MCPToolError(
+            "ios_recover needs a device that iMirror's device file lists "
+            f"({_REGISTRY.problem or 'this device is not in it'}). Is the iMirror "
+            "app running? ios_devices shows the mode.",
+            kind=ErrorKind.UNREACHABLE, code="DEVICE_FILE_INVALID")
+    start_epoch = app.chain_epoch
+    clock = datetime.now(timezone.utc)
+    # Event times have whole milliseconds; match them.
+    since = clock.replace(microsecond=clock.microsecond // 1000 * 1000)
+    path = _write_restart_request(app.udid, _iso(since))
+    deadline = time.monotonic() + _RECOVER_WAIT_S
+    result = "timeout"
+    while True:
+        answer = _request_outcome(app.udid, since)
+        if answer is not None and answer != "accepted":
+            result = answer             # nothing was restarted
+            break
+        now = _app_entry(t) or app
+        moved = (now.chain_epoch is not None and start_epoch is not None
+                 and now.chain_epoch != start_epoch)
+        if answer == "accepted" or moved:
+            result = "accepted"
+        app = now
+        # Only a restarted chain's ready counts; old state lingers.
+        if moved and _chain_phase(app.state, app.reason) != "recovering":
+            break
+        left = deadline - time.monotonic()
+        if left <= 0:
+            break
+        time.sleep(min(_RIDE_OUT_POLL_S, left))
+    out: dict[str, Any] = {"result": result, "alias": app.alias, "udid": app.udid,
+                           **_chain_fields(app)}
+    if result == "timeout":
+        try:
+            os.unlink(path)         # an old app must not act on it later
+        except OSError:
+            pass
+        out["hint"] = ("iMirror did not pick up the request; an older build "
+                       "ignores them. Tap the phone's WDA status in iMirror instead.")
+    elif result in _RECOVER_HINTS:
+        out["hint"] = _RECOVER_HINTS[result]
     return json.dumps(out)
 
 
@@ -1377,8 +2217,7 @@ def ios_window_size() -> str:
     The width/height swap when the device is in landscape, so call this before
     computing coordinates if the orientation may have changed.
     """
-    j = _session_get("/window/size")
-    return json.dumps(j.get("value", j))
+    return json.dumps(_window_size())
 
 
 def _img_kind(data: bytes) -> tuple[str, str]:
@@ -1415,12 +2254,14 @@ def _img_kind(data: bytes) -> tuple[str, str]:
 def _screenshot_bytes_wda() -> bytes:
     """Capture a screenshot over WDA. Used directly on a device, and as the
     simulator's fallback when the simctl fast path fails."""
-    # Ensure a session exists first so the screenshotQuality settings POST (in
-    # _ensure_session) has run even when a screenshot is the very first tool call
-    # of a session — otherwise the sessionless /screenshot route below returns a
-    # full PNG because quality settings were never applied. Cheap/cached after
-    # the first call.
-    _ensure_session()
+    # screenshotQuality is a session setting. Apply it through the phone's
+    # active session when this server has none yet, but never create one for
+    # a screenshot: that would kill whichever session another client uses.
+    t = _cur()
+    if not t.session["id"]:
+        active = _active_session_id()
+        if active and _may_adopt_foreign(t, "status"):
+            _adopt_session(t, active, "status")
     _, j = _req("GET", "/screenshot")
     b64 = j.get("value")
     if not b64:
@@ -1511,9 +2352,11 @@ def ios_source(format: str = "text") -> str:
     be briefly stale. Pure containers (Other/Window/Group/...) are collapsed
     unless they carry their own label/value/identifier or are interactive;
     content elements (buttons, text, fields, images, cells, ...) always
-    appear, even with an empty label. Output is capped at 400 elements (by
-    count, not bytes — the full tree is always parsed first); a trailing line
-    reports how many were dropped, if any. This is far cheaper for an agent to
+    appear, even with an empty label. Identical field values appear once.
+    Output is capped at 400 elements and 20,000 characters, with each field
+    value cut to 240 characters; the full tree is parsed first. A trailing
+    line says how many elements were dropped or that fields were cut, and
+    points to format="xml" for more. This is far cheaper for an agent to
     read than the raw XML — prefer it unless you need the exact raw markup.
 
     `format="xml"` returns the raw WDA source string unchanged (today's
@@ -1605,8 +2448,7 @@ def ios_await_idle(timeout_s: float = 5.0, min_stable_ms: int = 600) -> str:
     A genuine transport failure (WDA unreachable/wedged) still raises out of
     this call — only "didn't settle in time" is swallowed into a verdict.
 
-    Read-only: does not take the gesture lock, so it's safe to call alongside
-    other read tools. Each poll is a full compact-tree read (the same heavy
+    Read-only, so it's safe to call alongside other read tools. Each poll is a full compact-tree read (the same heavy
     /source call ios_source makes), so a long timeout_s here means real
     device round-trips — call it deliberately, not in a tight loop.
     """
@@ -1823,6 +2665,86 @@ def ios_press_button(name: str = "home") -> str:
     return f"pressed {name}"
 
 
+def _alert_call(method: str, route: str, body: dict | None = None) -> tuple[bool, Any]:
+    """One WDA alert request: (False, None) when no alert is up, else
+    (True, value). Errors name WDA's error but never quote its message,
+    which can carry the alert's own text, such as a one-time code."""
+    code, j = _session_call(method, route, body, _TIMEOUT_INTERACT)
+    if code == 404 and _wda_error(j) == "no such alert":
+        return False, None
+    if code >= 400:
+        err = _wda_error(j)
+        raise MCPToolError(
+            f"WDA alert request failed (HTTP {code}{', ' + err if err else ''}) on {route}.",
+            kind=ErrorKind.WDA_HTTP, code=f"WDA_HTTP_{code}")
+    return True, (j.get("value") if isinstance(j, dict) else None)
+
+
+@_tool()
+def ios_alert(action: str = "get", button_label: str = "") -> str:
+    """Read a system alert, or accept or dismiss it.
+
+    `get` returns {"present", "text", "buttons"}, or {"present": false} when
+    no alert is up. `accept` and `dismiss` press WDA's default button, or the
+    button whose label is exactly `button_label`. Read first, then choose.
+    Use it when ios_source and the screenshot disagree: an alert can cover
+    the app. Alert text never goes into run recordings, and a lost reply to
+    accept/dismiss is never sent again (kind=outcome_unknown).
+    """
+    if action not in ("get", "accept", "dismiss"):
+        raise MCPToolError("action must be 'get', 'accept', or 'dismiss'.",
+                           kind=ErrorKind.VALIDATION)
+    if not isinstance(button_label, str) or (action == "get" and button_label):
+        raise MCPToolError("button_label must be text and is only valid for accept/dismiss.",
+                           kind=ErrorKind.VALIDATION)
+    if action == "get":
+        present, text = _alert_call("GET", "/alert/text")
+        if not present:
+            return json.dumps({"present": False})
+        present, buttons = _alert_call("GET", "/wda/alert/buttons")
+        if not present:                   # closed between the two reads
+            return json.dumps({"present": False})
+        if not isinstance(text, str) or not isinstance(buttons, list) or not all(
+                isinstance(b, str) for b in buttons):
+            raise MCPToolError("WDA returned an unexpected alert response.",
+                               kind=ErrorKind.WDA_HTTP, code="WDA_BAD_RESPONSE")
+        return json.dumps({"present": True, "text": text, "buttons": buttons})
+    present, _ = _alert_call("POST", f"/alert/{action}",
+                             {"name": button_label} if button_label else {})
+    if not present:
+        return json.dumps({"present": False})
+    # The button, never the alert's text.
+    _record("alert", f"{action} {button_label!r}" if button_label else action)
+    return json.dumps({"present": True, "action": action, "button_label": button_label})
+
+
+def _click_element(eid: str, text: str) -> None:
+    """Click element `eid`, found by `text`, re-finding it once if it went stale.
+
+    The screen can change between the find and the click (an animation, a
+    list reload, or a session swap, since element ids belong to one session),
+    and WDA then answers 404 "stale element reference". Any other failure
+    raises: returning "tapped" after a failed click would mislead."""
+    try:
+        _session_post(f"/element/{eid}/click", {})
+        return
+    except MCPToolError as e:
+        if e.wda_error != "stale element reference":
+            raise
+    again = _find_element(text)
+    if again:
+        try:
+            _session_post(f"/element/{again}/click", {})
+            return
+        except MCPToolError as e:
+            if e.wda_error != "stale element reference":
+                raise
+    raise MCPToolError(f"Element '{text}' went stale before it could be tapped "
+                       "(the screen kept changing). Wait for it to settle "
+                       "(ios_await_idle), then try again.",
+                       kind=ErrorKind.NOT_FOUND, code="STALE_ELEMENT")
+
+
 @_tool()
 @_recorded
 def ios_find_and_tap(text: str, retries: int = 0, retry_delay_s: float = 0.5) -> str:
@@ -1844,9 +2766,7 @@ def ios_find_and_tap(text: str, retries: int = 0, retry_delay_s: float = 0.5) ->
         else:
             any_clean = True
             if eid:
-                # The click leg goes through _session_post so a stale-session 404 retries
-                # and a WDA error raises — returning "tapped" on a failed click would mislead.
-                _session_post(f"/element/{eid}/click", {})
+                _click_element(eid, text)
                 _record("find_and_tap", text)
                 return f"tapped element '{text}'"
         if attempt >= retries:
@@ -2091,20 +3011,100 @@ def ios_install_app(path: str) -> str:
     return f"installed {os.path.basename(path)}"
 
 
+# ---- One phone install at a time, Mac-wide ------------------------------------
+
+_EXPECTED_RESET_S = 90              # same window antsignalctl gives
+_INSTALL_LOCK_PATIENCE_S = 15 * 60  # longer than any install
+_INSTALL_LOCK_POLL_S = 1.0
+_INSTALL_BY = "go-ios install"
+
+
+def _expected_reset_note(now: datetime) -> dict[str, str]:
+    """The note's body: a USB reset on this phone before `until` is ours.
+    The app reads only `until`; `by` is for a human reading the file."""
+    return {"until": _iso(now + timedelta(seconds=_EXPECTED_RESET_S)), "by": _INSTALL_BY}
+
+
+def _write_expected_reset(udid: str | None) -> None:
+    """Tell iMirror a USB reset is coming, as
+    expected-resets/<udid>.json, so it logs that reset as expected. Written
+    to a temp name and renamed, so the app never reads half a file. Best
+    effort: an app that does not read the note just ignores it."""
+    if not udid or not re.fullmatch(r"[A-Za-z0-9-]{1,64}", udid):
+        return                         # unknown phone, or a name that escapes
+    folder = os.path.join(_support_dir(), "expected-resets")
+    path = os.path.join(folder, f"{udid}.json")
+    tmp = f"{path}.{os.getpid()}.{threading.get_ident()}.tmp"
+    try:
+        os.makedirs(folder, mode=0o700, exist_ok=True)
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(_expected_reset_note(datetime.now(timezone.utc)), f)
+        os.replace(tmp, path)
+    except OSError:
+        with contextlib.suppress(OSError):
+            os.unlink(tmp)
+
+
+@contextlib.contextmanager
+def _mac_wide_install_lock():
+    """Hold devicectl.lock, the flock every session on this Mac shares
+    (antsignalctl takes the same file around devicectl install/launch).
+    An install resets the phone's USB link; two at once reset each other.
+    The kernel drops the lock when the process dies, so a crash never leaves
+    the Mac locked. After _INSTALL_LOCK_PATIENCE_S we go ahead anyway: no
+    lock beats no install."""
+    fd = -1
+    path = os.path.join(_support_dir(), "devicectl.lock")
+    try:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        fd = os.open(path, os.O_CREAT | os.O_RDWR | os.O_CLOEXEC, 0o644)
+    except OSError:
+        pass                           # no lock beats no install
+    if fd >= 0:
+        deadline = time.monotonic() + _INSTALL_LOCK_PATIENCE_S
+        told = False
+        while True:
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except BlockingIOError:
+                if time.monotonic() >= deadline:
+                    print(f"imirror_mcp: {path} is still held; going ahead",
+                          file=sys.stderr, flush=True)
+                    break
+                if not told:
+                    print("imirror_mcp: waiting for another session's install",
+                          file=sys.stderr, flush=True)
+                    told = True
+                time.sleep(_INSTALL_LOCK_POLL_S)
+    try:
+        yield
+    finally:
+        if fd >= 0:
+            os.close(fd)               # closing drops the flock
+
+
 def _install_on_device(path: str) -> None:
     """Install `path` on the current device via go-ios (resolved by _ios_bin).
     Passes --udid whenever the phone is known: without it go-ios installs on
-    whichever phone it lists first, which with two attached is a coin toss."""
+    whichever phone it lists first, which with two attached is a coin toss.
+    Runs under the Mac-wide install lock, with an expected-reset note
+    written before and after (the reset can come late)."""
     args = [_ios_bin(), "install", f"--path={path}"]
     t = _cur_or_none()
-    if t is not None and t.udid:
-        args.append(f"--udid={t.udid}")
-    try:
-        subprocess.run(args, check=True, capture_output=True, text=True)
-    except FileNotFoundError as e:
-        raise RuntimeError("go-ios 'ios' binary not found (set IMIRROR_IOS_BIN).") from e
-    except subprocess.CalledProcessError as e:
-        raise RuntimeError(f"install failed: {(e.stderr or '').strip() or e}") from e
+    udid = t.udid if t is not None else None
+    if udid:
+        args.append(f"--udid={udid}")
+    with _mac_wide_install_lock():
+        _write_expected_reset(udid)
+        try:
+            subprocess.run(args, check=True, capture_output=True, text=True)
+        except FileNotFoundError as e:
+            raise RuntimeError("go-ios 'ios' binary not found (set IMIRROR_IOS_BIN).") from e
+        except subprocess.CalledProcessError as e:
+            raise RuntimeError(f"install failed: {(e.stderr or '').strip() or e}") from e
+        finally:
+            _write_expected_reset(udid)  # the reset can come after
 
 
 def _install_on_simulator(path: str) -> None:
@@ -3148,6 +4148,83 @@ _REPORT_CSS = """
 """
 
 
+def _exit_reason(start_ppid: int, now_ppid: int, stdin_closed: bool) -> str | None:
+    """Why this server should stop now, or None to keep serving.
+
+    A server whose client is gone can never be called again, yet such
+    servers stayed alive: another process can hold the client's stdin
+    pipe open after the client dies, and a tool stuck on WDA keeps the
+    process up after EOF. A new parent pid means we were orphaned, and
+    so does pid 1 (launchd), which adopts orphans: a parent can die
+    before this server is up far enough to note its pid.
+    """
+    if stdin_closed:
+        return "stdin closed"
+    if now_ppid != start_ppid or now_ppid == 1:
+        return f"parent {start_ppid} is gone"
+    return None
+
+
+def _stdin_eof_queue(fd: int):
+    """A kqueue that fires when fd's writer hangs up, or None.
+
+    kqueue reports EV_EOF without reading, so FastMCP still gets every
+    byte of stdin. EV_CLEAR makes it fire once per change, not spin
+    while a message waits to be read. None off macOS, or when fd is
+    not something kqueue can watch.
+    """
+    import select
+    if not hasattr(select, "kqueue"):
+        return None
+    kq = select.kqueue()
+    try:
+        flags = select.KQ_EV_ADD | select.KQ_EV_CLEAR
+        kq.control([select.kevent(fd, select.KQ_FILTER_READ, flags)], 0, 0)
+    except OSError:
+        kq.close()
+        return None
+    return kq
+
+
+def _watch_client(fd: int, start_ppid: int, on_exit, interval: float = 2.0) -> None:
+    """Call on_exit(reason) once stdin closes or the parent changes.
+
+    Runs on its own thread. It checks the parent every interval
+    seconds and wakes at once when the stdin pipe closes.
+    """
+    import select
+    kq = _stdin_eof_queue(fd)
+    while True:
+        closed = False
+        if kq is None:
+            time.sleep(interval)
+        else:
+            events = kq.control(None, 1, interval)
+            closed = any(e.flags & select.KQ_EV_EOF for e in events)
+        reason = _exit_reason(start_ppid, os.getppid(), closed)
+        if reason:
+            on_exit(reason)
+            return
+
+
+def _exit_now(reason: str) -> None:
+    """Stop the whole process, even with a tool thread stuck on WDA.
+
+    os._exit skips atexit, so run those hooks first: one stops a
+    Simulator recording that would otherwise run forever.
+    """
+    print(f"imirror_mcp: exiting, {reason}", file=sys.stderr, flush=True)
+    try:
+        atexit._run_exitfuncs()
+    finally:
+        os._exit(0)
+
+
+def _start_client_watch() -> None:
+    threading.Thread(target=_watch_client, name="client-watch", daemon=True,
+                     args=(sys.stdin.fileno(), os.getppid(), _exit_now)).start()
+
+
 def _autowda_bring_up() -> None:
     """Bring WDA up ourselves before serving, when IMIRROR_AUTOWDA is set.
 
@@ -3185,5 +4262,8 @@ def _autowda_bring_up() -> None:
 
 
 if __name__ == "__main__":
+    _start_client_watch()
     _autowda_bring_up()
     mcp.run()
+    # Don't wait on a tool thread still blocked on WDA.
+    _exit_now("stdin closed")

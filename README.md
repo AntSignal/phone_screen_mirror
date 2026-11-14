@@ -183,7 +183,18 @@ Then install WebDriverAgent on the device once (Xcode):
 ```bash
 ./scripts/run.sh            # debug build → bundle (with go-ios + icon) → launch
 ./scripts/run.sh release    # optimized build
+./scripts/run.sh --restart  # build/iMirror.app is running: quit it, rebuild, relaunch
 ```
+
+`run.sh` (and `package.sh`) refuse to replace a `build/iMirror.app` that is
+running, because deleting it under the live app leaves the old binary running
+and `devices.json` pointing at a deleted bundle. `--restart` quits exactly that
+process (by pid, not bundle id — an older iMirror may share it), waits for it to
+exit, rebuilds, relaunches, and waits until the new pid owns `devices.json`.
+Every phone drops for about 30 s while it does.
+
+Before committing, run `swift build && swift test` and the MCP suite
+(`mcp-server/.venv/bin/python -m pytest mcp-server`); see `CLAUDE.md`.
 
 On launch the app connects to the iPhone and brings up WebDriverAgent
 automatically (health dot green within ~30 s) — the phone stays unlocked and
@@ -287,9 +298,11 @@ transport and loopback-only security. If the bundled go-ios is ever missing,
 
 ## Files other tools read
 
-All live in `~/Library/Application Support/iMirror/` (with
-`IMIRROR_DEVICES_FILE` set, next to that file instead). None of them ever holds
-a secret.
+The app shares state with the MCP server and with test harnesses (such as
+`antsignalctl` and `run.sh`) through these files. All live in
+`~/Library/Application Support/iMirror/` (with `IMIRROR_DEVICES_FILE` set, next
+to that file instead). Times are ISO-8601 in UTC. None of them ever holds a
+passcode or other secret.
 
 **`devices.json`** — every phone and Simulator the app drives, rewritten
 atomically on each change (format: `Sources/iMirrorCore/DeviceRegistry.swift`).
@@ -405,6 +418,17 @@ safe merge into `claude_desktop_config.json` that leaves your other servers
 untouched). It shows installed status + version and flags when a re-register is
 needed. Prefer the manual route? See [mcp-server/README.md](mcp-server/README.md).
 
+What it registers is a **frozen copy**, not your checkout. Install copies the
+server files the app was built with into
+`~/Library/Application Support/iMirror/mcp/<version>-<hash8>/`, imports that copy
+with the venv's Python (and checks `devicelease.py --version` when it ships), and
+only then swaps `mcp/current` to it; a copy that fails is never used. Clients run
+`~/Library/Application Support/iMirror/mcp/current/imirror_mcp.py`, so editing or
+checking out the repo does not change what new sessions load. After rebuilding the
+app with new server code, press **Update**. pip re-runs only when
+`requirements.txt` changes. When the server ships `devicelease.py`, Install also
+writes the device-lease CLI launcher `~/Library/Application Support/iMirror/bin/imirror-lease`.
+
 It talks to the same loopback WDA the app brings up — open iMirror and wait for
 the green dot before driving the phone. See
 [mcp-server/README.md](mcp-server/README.md) for the tool table and report
@@ -472,6 +496,8 @@ swift scripts/make_icon.swift   # regenerate Resources/AppIcon.icns (one-off)
 ```
 
 `package.sh` builds the release `.app` (bundling go-ios + icon) and makes a DMG.
+Like `run.sh`, it refuses to replace a running `build/iMirror.app`; pass
+`--restart` to quit it first and relaunch the new build.
 With a **Developer ID Application** certificate it signs with hardened runtime +
 the camera entitlement (and signs the nested go-ios), ready for notarization:
 

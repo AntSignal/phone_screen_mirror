@@ -6,9 +6,11 @@
 // MCPClientAdapter in ClaudeCodeAdapter.swift / ClaudeDesktopAdapter.swift.
 // The JSON merge itself lives in iMirrorCore.MCPConfig (unit-tested).
 //
-// The server script is taken from this repo checkout when running from source, else
-// from the copy bundled into iMirror.app (see scripts/package.sh). The venv lives in
-// ~/Library/Application Support/iMirror/mcp so it's writable in both cases.
+// The server is not registered where it was built. Install copies it into a
+// frozen, smoke-tested copy under ~/Library/Application Support/iMirror/mcp/
+// (MCPFrozenInstaller) and registers mcp/current/imirror_mcp.py, so editing or
+// checking out a git tree never changes what new sessions run. The copy comes
+// from iMirror.app's bundle, else this checkout (MCPPaths.sourceScriptURL).
 
 import Foundation
 import iMirrorCore
@@ -47,7 +49,7 @@ enum MCPInstaller {
 
     /// The meaningful line(s) of a pip/venv failure — the real ERROR is usually at
     /// the top, above pip's "consider upgrading pip" notice (which .suffix() would show).
-    private static func firstError(_ out: String) -> String {
+    static func firstError(_ out: String) -> String {
         let errs = out.split(whereSeparator: \.isNewline)
             .filter { $0.contains("ERROR") || $0.lowercased().contains("error:") }
         return String((errs.isEmpty ? Substring(out) : Substring(errs.joined(separator: " "))).prefix(220))
@@ -57,8 +59,8 @@ enum MCPInstaller {
 
     struct Status {
         let clients: [String]      // which MCP clients have it registered
-        let version: String?       // current server __version__
-        let upToDate: Bool         // registration points at the current script + a working venv
+        let version: String?       // installed server __version__ (else the source's)
+        let upToDate: Bool         // registered at mcp/current, venv works, copy matches this app's
         var installed: Bool { !clients.isEmpty }
     }
 
@@ -84,39 +86,49 @@ enum MCPInstaller {
             }
         }
         let venvOK = FileManager.default.isExecutableFile(atPath: MCPPaths.venvPython.path)
-        return Status(clients: clients, version: currentVersion(),
-                      upToDate: !clients.isEmpty && venvOK && !stale)
+        let frozen = MCPFrozenInstaller(layout: MCPPaths.layout)
+        let source = MCPPaths.sourceScriptURL()?.deletingLastPathComponent()
+        let copyOK = copyIsCurrent(installed: frozen.currentDirName(),
+                                   wanted: source.flatMap { frozen.plannedDirName(sourceDir: $0) })
+        return Status(clients: clients, version: version(of: MCPPaths.registeredScriptURL())
+                                                 ?? MCPPaths.sourceScriptURL().flatMap(version(of:)),
+                      upToDate: !clients.isEmpty && venvOK && !stale && copyOK)
     }
 
-    /// The `__version__` of the current (repo or bundled) server script.
-    static func currentVersion() -> String? {
-        guard let s = MCPPaths.scriptURL(), let txt = try? String(contentsOf: s, encoding: .utf8) else { return nil }
-        let re = try? NSRegularExpression(pattern: #"__version__\s*=\s*["']([^"']+)["']"#)
-        let range = NSRange(txt.startIndex..., in: txt)
-        guard let m = re?.firstMatch(in: txt, range: range), let r = Range(m.range(at: 1), in: txt)
-        else { return nil }
-        return String(txt[r])
+    /// Whether the frozen copy is this app's. With no source to compare
+    /// (nothing bundled, no checkout) there is nothing newer to offer.
+    static func copyIsCurrent(installed: String?, wanted: String?) -> Bool {
+        guard let installed else { return false }
+        return wanted == nil || wanted == installed
+    }
+
+    /// The `__version__` of a server script, if it exists and has one.
+    static func version(of script: URL) -> String? {
+        (try? String(contentsOf: script, encoding: .utf8)).flatMap(MCPFrozenInstall.serverVersion(in:))
     }
 
     // MARK: Install / uninstall
 
-    static func install(profile: MCPProfile = .device, update: Bool = false,
+    /// Makes the venv if needed, installs a frozen copy (MCPFrozenInstaller),
+    /// then registers mcp/current with every client. Install and Update do the
+    /// same thing; pip runs only when requirements.txt changed.
+    static func install(profile: MCPProfile = .device,
                         progress: @escaping (String) -> Void,
                         completion: @escaping (Result) -> Void) {
         DispatchQueue.global(qos: .userInitiated).async {
-            let result = doInstall(profile: profile, update: update, progress: progress)
+            let result = doInstall(profile: profile, progress: progress)
             DispatchQueue.main.async { completion(result) }
         }
     }
 
-    private static func doInstall(profile: MCPProfile, update: Bool, progress: @escaping (String) -> Void) -> Result {
-        guard let script = MCPPaths.scriptURL() else {
-            return Result(ok: false, message: "Couldn't find imirror_mcp.py (repo or bundle).")
+    private static func doInstall(profile: MCPProfile, progress: @escaping (String) -> Void) -> Result {
+        guard let source = MCPPaths.sourceScriptURL() else {
+            return Result(ok: false, message: "Couldn't find imirror_mcp.py (bundle or repo).")
         }
-        // 1. venv + deps. mcp needs Python 3.10+, so (re)create the venv when it's
+        // 1. venv. mcp needs Python 3.10+, so (re)create the venv when it's
         //    missing OR was built with an older Python (e.g. the system 3.9).
-        let venvUsable = isPython310Plus(MCPPaths.venvPython.path)
-        if !venvUsable {
+        //    A new venv has no requirements hash, so step 2 runs pip.
+        if !isPython310Plus(MCPPaths.venvPython.path) {
             guard let interp = pythonInterpreter() else {
                 return Result(ok: false,
                     message: "Need Python 3.10+ for mcp — install it (e.g. `brew install python`) and retry.")
@@ -130,20 +142,14 @@ enum MCPInstaller {
                 return Result(ok: false, message: "venv creation failed: \(firstError(mk.out))")
             }
         }
-        if !venvUsable || update {
-            progress(update ? "Updating dependencies…" : "Installing dependencies (mcp)…")
-            _ = ProcessRunner.spawn(MCPPaths.venvPython.path, ["-m", "pip", "install", "--upgrade", "pip"])  // old pip can't resolve mcp
-            let reqs = script.deletingLastPathComponent().appendingPathComponent("requirements.txt")
-            var pipArgs = ["-m", "pip", "install", "--upgrade"]
-            if FileManager.default.fileExists(atPath: reqs.path) { pipArgs += ["-r", reqs.path] }
-            else { pipArgs.append("mcp[cli]") }
-            let pip = ProcessRunner.spawn(MCPPaths.venvPython.path, pipArgs)
-            guard pip.code == 0 else {
-                return Result(ok: false, message: "pip install failed: \(firstError(pip.out))")
-            }
-        }
 
-        // 2. Register with every detected client, in order.
+        // 2. Frozen copy, deps, smoke test, then the swap of mcp/current.
+        //    A failure here registers nothing, so clients keep what they had.
+        let frozen = MCPFrozenInstaller(layout: MCPPaths.layout)
+            .install(from: source.deletingLastPathComponent(), progress: progress)
+        guard frozen.ok else { return Result(ok: false, message: frozen.message) }
+
+        // 3. Register mcp/current with every detected client, in order.
         var registered: [String] = []
         for adapter in allAdapters {
             guard adapter.detect() else { continue }
@@ -160,7 +166,7 @@ enum MCPInstaller {
         guard !registered.isEmpty else {
             return Result(ok: false, message: "No MCP client found (Claude Code CLI or Claude Desktop).")
         }
-        return Result(ok: true, message: "Installed ✓ — " + registered.joined(separator: ", "))
+        return Result(ok: true, message: "Installed ✓ \(frozen.message) — " + registered.joined(separator: ", "))
     }
 
     static func uninstall(profile: MCPProfile = .device, completion: @escaping (Result) -> Void) {

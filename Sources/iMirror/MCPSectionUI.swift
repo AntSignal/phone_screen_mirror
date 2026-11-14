@@ -80,10 +80,9 @@ final class MCPSectionUI: NSObject {
     @objc private func primary() {
         button.isEnabled = false; uninstallButton.isEnabled = false
         spinner.startAnimation(nil)
-        let updating = installed             // reinstall/update re-points paths + refreshes deps
-        statusLabel.stringValue = updating
+        statusLabel.stringValue = installed   // reinstall/update re-copies and re-points paths
             ? "Updating…" : "Installing… (first run sets up Python — up to ~30s)"
-        MCPInstaller.install(profile: profile, update: updating, progress: { [weak self] msg in
+        MCPInstaller.install(profile: profile, progress: { [weak self] msg in
             self?.statusLabel.stringValue = msg
         }, completion: { [weak self] r in
             guard let self else { return }

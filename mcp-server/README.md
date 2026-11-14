@@ -14,8 +14,9 @@ its self-managed transport (userspace tunnel + runwda + forward + relay).
 
 | Tool | What it does |
 |------|--------------|
-| `ios_status` | WDA ready? + iOS version / device name |
-| `ios_devices` | every device this server can drive (alias, UDID, port, ready?) and which one is the default |
+| `ios_status` | WDA ready? + iOS version / device name, which server answered (`server_version`, `script_path`) and which endpoint (`target`, `wda_endpoint`, `selected_udid`); with iMirror's device file, also the app's view (`app_state`, `reason`, `state_since`, `chain_epoch`, `next_retry_at`, `last_error`) and the phone's last 5 events |
+| `ios_devices` | every device this server can drive (alias, UDID, port, ready?, the app's view as above, how its WDA sessions were got) and which one is the default |
+| `ios_recover` | ask iMirror to restart a phone's WDA chain, then wait ≤30 s: `accepted`, `cooldown` (one ran in the last minute) or `timeout` |
 | `ios_window_size` | logical screen size (points) for the current orientation |
 | `ios_screenshot` | full-res device screenshot (PNG, or JPEG on a device via `IMIRROR_SCREENSHOT_QUALITY`) — no macOS Screen Recording perm needed |
 | `ios_tap(x, y)` | tap at a point (points, top-left origin) |
@@ -24,10 +25,11 @@ its self-managed transport (userspace tunnel + runwda + forward + relay).
 | `ios_scroll_to(text, direction, max_swipes, distance_pct, settle_ms)` | scroll (capped at 20 swipes) until an element with that label/name/value is on screen |
 | `ios_type(text)` | type into the focused field (`\n`=return, `\b`=backspace) |
 | `ios_press_button(name)` | `home` / `volumeUp` / `volumeDown` |
+| `ios_alert(action, button_label)` | `get` a system alert's text and buttons (`present: false` when none), or `accept` / `dismiss` it, optionally by exact button label. Alert text is never recorded in run reports |
 | `ios_find_and_tap(text)` | find an element by visible label/name and tap it |
 | `ios_wait_for(text, timeout_s)` | poll until an element with that label/name appears |
 | `ios_orientation(set_to)` | get orientation, or set `PORTRAIT` / `LANDSCAPE` |
-| `ios_source` | accessibility hierarchy (XML) of the current screen |
+| `ios_source` | accessibility hierarchy of the current screen: a compact text tree (at most 400 elements, 20,000 characters, 240 per field) or raw XML |
 | `ios_start_run(label)` | begin recording a test run (opt-in) |
 | `ios_run_section(title)` | start a named section — groups following steps under it in the report + TOC |
 | `ios_run_note(text, status)` | add a checkpoint — `info` / `pass` / `fail` |
@@ -84,10 +86,100 @@ ios_run_sequence steps=[…] device="phone1"   # one device for the whole sequen
   server uses the device file, and falls back to `127.0.0.1:8100` when there is
   no live file (an older iMirror app, or the app isn't running). `ios_devices`
   reports which mode it is in. `IMIRROR_DEVICES_FILE` overrides the file's path.
+- **A pinned default never falls back.** With `IMIRROR_DEFAULT_DEVICE` set
+  (run.sh sets it per agent) and no live file, a call that names no device
+  fails with `DEVICE_FILE_INVALID` instead of driving `:8100`, which may be
+  another phone. A pin of `default`, or of `IMIRROR_UDID`, still uses it.
 - The file is only trusted while the app that wrote it is running, and only
-  loopback entries are used — WDA has no auth on the wire.
+  loopback entries are used — WDA has no auth on the wire. "Running" means
+  the `owner_pid` is a live process that is not a zombie and, when the file
+  has `owner_uniqueid`, is the very process that wrote it (macOS's kernel
+  uniqueid is never reused within a boot, unlike a pid).
+
+## Sharing a phone: WDA sessions
+
+WebDriverAgent keeps **one session per phone**, and creating a session ends
+the one that was there. Several clients share each phone (the iMirror app's
+mirror, every agent's MCP server), so this server avoids creating one:
+
+- **It joins the session already on the phone.** With no session of its own
+  it reads `GET /status` and adopts the active one, re-applying its two
+  settings (no idle wait; `screenshotQuality`); it creates one only when the
+  phone has none. Screenshots, `ios_window_size` and `ios_source` use WDA's
+  sessionless routes and never create one.
+- **A miss is not a dead session.** WDA answers 404 for four things. Only
+  `invalid session id` replaces the session: the reply names the session now
+  active, which is adopted (another client made it), or none (WDA restarted:
+  a new one is created). `no such element` is a clean miss; a click that hits
+  `stale element reference` re-finds the element once; any other 4xx raises
+  `WDA_HTTP_<code>`.
+- **`SESSION_CONTESTED`** means another session replaced this server's twice
+  within 60 s (a WDA restart does not count), so something keeps creating
+  sessions on that phone: another agent's server, an
+  old iMirror server, or iMirror itself while a system alert is up. The action
+  was not run. Take a screenshot; tap a system alert by coordinates if one is
+  showing; otherwise check `ios_devices` rather than retrying in a loop. Its
+  per-device `session` counts (`created`, `adopted`, `lost`) show the history.
+
+Nothing here orders two servers' calls to one phone: calls are serialised per
+phone only within one server process.
+
+A server exits as soon as its client is gone: when its stdin closes, or when
+its parent process changes (it was orphaned). It does not wait for a tool
+call still blocked on WDA.
+
+## When a phone's WDA restarts
+
+The iMirror app restarts a phone's chain by itself after a USB reset or a
+wedged WDA, and says so in `devices.json` (see "Files other tools read" in the
+top-level README). A call that cannot reach WDA reads that file, never
+`/status`, so dozens of servers don't hammer a booting WDA:
+
+- **Restarting** (`starting`, `installing`, or a `reason` such as `usb_reset`,
+  `wda_wedged`, `tunnel_down`): the call waits up to 30 s for `ready`. Then a
+  read (screenshot, source, status, waits, asserts) is retried once. A tap,
+  type, swipe or launch is **never** repeated, because it may already have
+  reached the phone: it fails with `RECOVERING` and `retry_after_s=0`. Still
+  restarting after 30 s: `RECOVERING` with `retry_after_s` and `reason`.
+- **`NEEDS_PASSCODE`** (`reason` `needs_passcode` or `locked`): fails at once.
+  iMirror types the passcode if auto-passcode is set up for that phone;
+  otherwise a person must.
+- **`DEVICE_GAVE_UP`**: the app has stopped retrying; `next_retry_at` says
+  when it tries again by itself. `ios_recover` asks for a retry now.
+- The app checks WDA every 3 s, so a call can fail before the file says
+  anything. The call gives it 5 s to notice. A phone the app still calls
+  `ready` after that gets the plain `unreachable`/`wedged` error, as before.
+
+**A lost reply to a change.** A tap, type, swipe, alert accept or launch whose
+reply never came back fails with `kind=outcome_unknown`: WDA may already have
+done it, so it is never sent again. Look at the screen before repeating it. It
+is re-sent only when it failed before its first byte left (a refused connection,
+or a send that failed at once), and a kept-alive socket WDA closed while idle is
+replaced before a request goes out on it. Reads (and the POSTs that only find
+elements or read state) are still retried. During a restart, such a call waits
+like any other change and keeps `kind=outcome_unknown` with `code=RECOVERING`.
+
+The extra values ride in the error's tail, e.g.
+`[kind=unreachable code=RECOVERING reason=usb_reset retry_after_s=15]`.
+
+`ios_recover(device)` writes a restart request for the app. The app takes one
+per phone per minute (`cooldown` otherwise), so several agents asking at once
+restart it once. It never types a passcode.
+
+**Installs reset the phone's USB link.** `ios_install_app` on a phone takes
+`devicectl.lock` next to `devices.json`, the same flock `antsignalctl device
+install|launch` takes, so two sessions never install at once and reset each
+other. It waits up to 15 minutes, then goes ahead. While it holds the lock it
+writes `expected-resets/<udid>.json` (`{"until": now+90 s, "by": "go-ios
+install"}`) before and after go-ios runs, so iMirror logs the reset that follows
+as expected. A Simulator install takes neither.
 
 ## Setup
+
+The app's one-click install (Settings → MCP server) does all of this for you, and
+registers a frozen copy at `~/Library/Application Support/iMirror/mcp/current/`
+rather than this tree (see the main README). The steps below are the manual,
+run-from-the-checkout route, which is what you want while developing the server.
 
 ```bash
 python3 -m venv mcp-server/.venv
@@ -126,6 +218,12 @@ Screenshots are PNG by default. On a physical device, set `IMIRROR_SCREENSHOT_QU
 to `1` (medium JPEG) or `2` (low JPEG) for smaller, faster-to-encode frames; `0` keeps
 lossless PNG. The default is target-aware — `1` on a device, `0` on the simulator,
 where WDA ignores the JPEG path and returns PNG regardless.
+
+`IMIRROR_SNAPSHOT_MAX_DEPTH` (1–200) sets WDA's `snapshotMaxDepth` on each session
+this server makes or joins. A lower depth makes a heavy `/source` cheaper, and a
+heavy one can kill the runner and reset the phone's USB link. It is unset by
+default (WDA's own 50), because WDA applies it to every element lookup too: an
+element nested deeper is not found at all. Measure on the phone before setting it.
 
 ## Running against an iOS Simulator
 
@@ -191,11 +289,15 @@ and give me a report".
 
 ## Tests
 
-The unit tests stub the HTTP layer, so no device or WebDriverAgent is needed:
+No device or WebDriverAgent is needed. Most tests stub the HTTP layer;
+`test_wda_wire.py` runs the real wire layer against
+`testsupport/fake_wda_server.py`, a keep-alive loopback server that answers
+with the vendored WDA's real reply bodies and can stall, drop a connection,
+or hand the phone's session to another client:
 
 ```bash
 mcp-server/.venv/bin/pip install pytest
-mcp-server/.venv/bin/python -m pytest mcp-server/test_imirror_mcp.py
+mcp-server/.venv/bin/python -m pytest mcp-server
 ```
 
 ## Security

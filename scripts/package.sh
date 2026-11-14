@@ -13,21 +13,39 @@
 #   ./scripts/package.sh                 # auto-detect signing identity
 #   NOTARY_PROFILE=imirror ./scripts/package.sh   # also notarize + staple
 #   WITH_WDA=build/WebDriverAgent.ipa ./scripts/package.sh
+#   ./scripts/package.sh --restart       # build/iMirror.app is running: quit it,
+#                                        # rebuild, relaunch it (see run.sh)
 #
 # One-time notary profile setup (per machine):
 #   xcrun notarytool store-credentials imirror \
 #       --apple-id you@example.com --team-id HOMEKARETEAMID --password <app-specific-pw>
 set -euo pipefail
-ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+# -P: running apps report physical paths; compare those.
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd -P)"
 cd "$ROOT"
+source "$ROOT/scripts/lib/imirror-procs.sh"
+
+RESTART=0
+for arg in "$@"; do
+    case "$arg" in
+        --restart) RESTART=1 ;;
+        -h|--help) echo "usage: $0 [--restart]"; exit 0 ;;
+        *) echo "usage: $0 [--restart]" >&2; exit 2 ;;
+    esac
+done
 
 APP="$ROOT/build/iMirror.app"
 DMG="$ROOT/build/iMirror.dmg"
 ENT="$ROOT/Resources/iMirror.entitlements"
 
+# Like run.sh: never delete the bundle under a running app.
+imirror_guard_bundle "$APP" "$RESTART" || exit 1
+
 echo "==> swift build (release, universal2: arm64 + x86_64)"
 swift build -c release --arch arm64 --arch x86_64
 BIN="$(swift build -c release --arch arm64 --arch x86_64 --show-bin-path)/iMirror"
+
+imirror_stop_bundle "$APP" "$RESTART" || exit 1
 
 echo "==> assembling app"
 rm -rf "$APP"; mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
@@ -62,7 +80,7 @@ mkdir -p "$APP/Contents/Resources/mcp-server"
 # Every server module, not just imirror_mcp.py: it imports wda_bringup, and a
 # bundle missing that file fails at import. Tests stay out of the app.
 for py in "$ROOT"/mcp-server/*.py; do
-    case "$(basename "$py")" in test_*) continue ;; esac
+    case "$(basename "$py")" in test_*|conftest.py) continue ;; esac
     cp "$py" "$APP/Contents/Resources/mcp-server/" 2>/dev/null || true
 done
 [[ -f "$ROOT/mcp-server/requirements.txt" ]] && \
@@ -119,6 +137,12 @@ else
     [[ -f "$APP/Contents/Resources/ios" ]] && codesign --force --sign - "$APP/Contents/Resources/ios"
     codesign --force --sign - --entitlements "$ENT" "$APP"
     SIGNED=0
+fi
+
+# Relaunch what --restart quit, before the slow DMG steps.
+if [[ -n "$IMIRROR_STOPPED_PIDS" ]]; then
+    echo "==> relaunching"
+    imirror_launch_bundle "$APP" || exit 1
 fi
 
 echo "==> building DMG"

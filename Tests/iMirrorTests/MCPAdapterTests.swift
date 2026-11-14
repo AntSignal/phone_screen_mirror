@@ -55,7 +55,7 @@ final class ClaudeDesktopAdapterTests: XCTestCase {
         let data = try Data(contentsOf: configURL)
         let entry = MCPConfig.entry(data, name: deviceProfile.serverName)
         XCTAssertEqual(entry?.command, MCPPaths.venvPython.path)
-        XCTAssertEqual(entry?.args.first, MCPPaths.scriptURL()?.path)
+        XCTAssertEqual(entry?.args.first, MCPPaths.registeredScriptURL().path)
     }
 
     /// The directory-exists gate only affects install, never status — a
@@ -75,9 +75,38 @@ final class ClaudeDesktopAdapterTests: XCTestCase {
         XCTAssertEqual(adapter.status(deviceProfile), .installed)
     }
 
+    /// The frozen copy is what counts as installed, so a config another app
+    /// wrote with the same path reads as current, not as an update.
+    func testRegisteredPathCountsAsInstalled() throws {
+        let data = try MCPConfig.merged(into: nil, name: deviceProfile.serverName,
+                                        command: MCPPaths.venvPython.path,
+                                        args: [MCPPaths.registeredScriptURL().path],
+                                        env: deviceProfile.env)
+        try data.write(to: configURL)
+        XCTAssertEqual(ClaudeDesktopAdapter(configURL: configURL).status(deviceProfile), .installed)
+    }
+
+    /// Regression (fork-scripts-3): a registration pointing at a git checkout
+    /// used to read as installed, so sessions ran whatever that tree held.
+    func testDevCheckoutPathIsStale() throws {
+        let dev = try XCTUnwrap(MCPPaths.sourceScriptURL()).path
+        let data = try MCPConfig.merged(into: nil, name: deviceProfile.serverName,
+                                        command: MCPPaths.venvPython.path, args: [dev],
+                                        env: deviceProfile.env)
+        try data.write(to: configURL)
+        XCTAssertEqual(ClaudeDesktopAdapter(configURL: configURL).status(deviceProfile), .stale)
+    }
+
+    func testInstallRegistersTheFrozenCopy() throws {
+        _ = try ClaudeDesktopAdapter(configURL: configURL).install(deviceProfile)
+        let entry = MCPConfig.entry(try Data(contentsOf: configURL), name: deviceProfile.serverName)
+        XCTAssertEqual(entry?.args, [MCPPaths.registeredScriptURL().path])
+        XCTAssertTrue(entry?.args.first?.hasSuffix("/iMirror/mcp/current/imirror_mcp.py") ?? false)
+    }
+
     func testStatusStaleWhenCommandDiffers() throws {
         let data = try MCPConfig.merged(into: nil, name: deviceProfile.serverName,
-                                        command: "/old/python", args: [MCPPaths.scriptURL()!.path],
+                                        command: "/old/python", args: [MCPPaths.registeredScriptURL().path],
                                         env: deviceProfile.env)
         try data.write(to: configURL)
         let adapter = ClaudeDesktopAdapter(configURL: configURL)
@@ -87,7 +116,7 @@ final class ClaudeDesktopAdapterTests: XCTestCase {
     func testStatusStaleWhenEnvDiffers() throws {
         let data = try MCPConfig.merged(into: nil, name: simProfile.serverName,
                                         command: MCPPaths.venvPython.path,
-                                        args: [MCPPaths.scriptURL()!.path],
+                                        args: [MCPPaths.registeredScriptURL().path],
                                         env: ["WRONG": "1"])
         try data.write(to: configURL)
         let adapter = ClaudeDesktopAdapter(configURL: configURL)
@@ -136,12 +165,28 @@ final class ClaudeCodeAdapterTests: XCTestCase {
     }
 
     func testStatusInstalledWhenOutputMatchesCurrentScriptAndEnv() {
-        let script = MCPPaths.scriptURL()!.path
+        let script = MCPPaths.registeredScriptURL().path
         let a = adapter { launch, args in
             XCTAssertEqual(launch, "/usr/bin/claude")
             XCTAssertEqual(args, ["mcp", "get", deviceProfile.serverName])
             return (0, "\(deviceProfile.serverName)\ncommand: \(script)")
         }
+        XCTAssertEqual(a.status(deviceProfile), .installed)
+    }
+
+    /// Regression (fork-scripts-3): `claude mcp get` naming the checkout the
+    /// app was built from used to read as installed; only mcp/current counts.
+    func testDevCheckoutPathIsStale() throws {
+        let dev = try XCTUnwrap(MCPPaths.sourceScriptURL()).path
+        XCTAssertNotEqual(dev, MCPPaths.registeredScriptURL().path)
+        let a = adapter { _, _ in (0, "\(deviceProfile.serverName)\n  Args: \(dev)") }
+        XCTAssertEqual(a.status(deviceProfile), .stale)
+    }
+
+    func testRegisteredPathCountsAsInstalled() {
+        let registered = MCPPaths.registeredScriptURL().path
+        XCTAssertTrue(registered.hasSuffix("/Application Support/iMirror/mcp/current/imirror_mcp.py"))
+        let a = adapter { _, _ in (0, "\(deviceProfile.serverName)\n  Args: \(registered)") }
         XCTAssertEqual(a.status(deviceProfile), .installed)
     }
 
@@ -151,14 +196,14 @@ final class ClaudeCodeAdapterTests: XCTestCase {
     }
 
     func testStatusStaleWhenEnvMissingFromOutput() {
-        let script = MCPPaths.scriptURL()!.path
+        let script = MCPPaths.registeredScriptURL().path
         let a = adapter { _, _ in (0, "\(simProfile.serverName)\ncommand: \(script)") }
         XCTAssertEqual(a.status(simProfile), .stale)
     }
 
     func testInstallSendsRemoveThenAddWithScriptAndEnvArgs() throws {
         var calls: [[String]] = []
-        let script = MCPPaths.scriptURL()!.path
+        let script = MCPPaths.registeredScriptURL().path
         let a = adapter { _, args in
             calls.append(args)
             return (0, "")
