@@ -219,12 +219,16 @@ OUT="$(imirror_audit_mcp_servers "$SUP" <<EOF
   102 /Library/Frameworks/Python.framework/Versions/3.13/Resources/Python.app/Contents/MacOS/Python /Users/u/Documents/Github/imirror/mcp-server/imirror_mcp.py
   103 /usr/bin/python3 -m pytest mcp-server/test_imirror_mcp.py
   104 vim imirror_mcp.py
+  105 $SUP/mcp/.venv/bin/python /Users/u/Documents/Github/imirror/mcp-server/imirror_mcp.py
+  106 $SUP/mcp/.venv/bin/python $SUP/mcp/1.3.0-0123abcd/imirror_mcp.py
 EOF
 )"
 check "a dev-tree server is flagged with its pid" has "$OUT" "WARNING: MCP server pid 102"
 check "the frozen server is not flagged" hasnt "$OUT" "pid 101"
-check "pytest and editors are not servers" has "$OUT" "2 MCP server(s) running; 1 not under $SUP/mcp/"
-check "flagged servers are counted per script" has "$OUT" "  1 running /Users/u/Documents/Github/imirror/mcp-server/imirror_mcp.py"
+check "the venv's python does not hide a dev-tree script" has "$OUT" "WARNING: MCP server pid 105"
+check "a frozen copy run by the venv is fine" hasnt "$OUT" "pid 106"
+check "pytest and editors are not servers" has "$OUT" "4 MCP server(s) running; 2 not under $SUP/mcp/"
+check "flagged servers are counted per script" has "$OUT" "  2 running /Users/u/Documents/Github/imirror/mcp-server/imirror_mcp.py"
 
 OUT="$(imirror_audit_app_instances 500 <<'EOF'
   500 /Users/u/Documents/Github/imirror-antsignal/build/iMirror.app/Contents/MacOS/iMirror

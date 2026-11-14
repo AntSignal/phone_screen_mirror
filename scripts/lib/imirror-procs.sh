@@ -117,16 +117,24 @@ imirror_launch_bundle() {
 
 # stdin: `ps -axo pid=,args=`. $1: the iMirror Application Support dir.
 # Flags MCP servers not run from the frozen install in $1/mcp/: a dev
-# checkout or the old upstream app, which ignore device leases.
+# checkout or the old upstream app, which ignore device leases. Only the
+# script path is judged, since the venv's python is also under $1/mcp/.
 imirror_audit_mcp_servers() {
     awk -v want="$1/mcp/" '
         { pid = $1; line = $0; sub(/^[[:space:]]*[0-9]+[[:space:]]+/, "", line) }
         tolower(line) ~ /python/ && line ~ /(^|[ \/])imirror_mcp\.py( |$)/ {
             total++
-            if (index(line, want) == 0) {
+            # Paths may hold spaces; the script starts after the last " /".
+            match(line, /imirror_mcp\.py( |$)/)
+            end = RSTART + 13; start = 0
+            for (i = RSTART - 2; i >= 1 && !start; i--) if (substr(line, i, 2) == " /") start = i + 1
+            for (i = RSTART - 1; i >= 1 && !start; i--) if (substr(line, i, 1) == " ") start = i + 1
+            script = substr(line, start ? start : 1, end - (start ? start : 1) + 1)
+            rest = substr(script, length(want) + 1)
+            if (index(script, want) != 1 || rest !~ /^[^\/]+\/imirror_mcp\.py$/) {
                 other++
                 printf "WARNING: MCP server pid %s is not the frozen install: %s\n", pid, line
-                script = line; sub(/^[^ ]+ +/, "", script); by[script]++
+                by[script]++
             }
         }
         END {
