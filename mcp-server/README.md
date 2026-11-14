@@ -14,8 +14,9 @@ its self-managed transport (userspace tunnel + runwda + forward + relay).
 
 | Tool | What it does |
 |------|--------------|
-| `ios_status` | WDA ready? + iOS version / device name, which server answered (`server_version`, `script_path`) and which endpoint (`target`, `wda_endpoint`, `selected_udid`) |
-| `ios_devices` | every device this server can drive (alias, UDID, port, ready?, how its WDA sessions were got) and which one is the default |
+| `ios_status` | WDA ready? + iOS version / device name, which server answered (`server_version`, `script_path`) and which endpoint (`target`, `wda_endpoint`, `selected_udid`); with iMirror's device file, also the app's view (`app_state`, `reason`, `state_since`, `chain_epoch`, `next_retry_at`, `last_error`) and the phone's last 5 events |
+| `ios_devices` | every device this server can drive (alias, UDID, port, ready?, the app's view as above, how its WDA sessions were got) and which one is the default |
+| `ios_recover` | ask iMirror to restart a phone's WDA chain, then wait ≤30 s: `accepted`, `cooldown` (one ran in the last minute) or `timeout` |
 | `ios_window_size` | logical screen size (points) for the current orientation |
 | `ios_screenshot` | full-res device screenshot (PNG, or JPEG on a device via `IMIRROR_SCREENSHOT_QUALITY`) — no macOS Screen Recording perm needed |
 | `ios_tap(x, y)` | tap at a point (points, top-left origin) |
@@ -144,7 +145,7 @@ top-level README). A call that cannot reach WDA reads that file, never
   iMirror types the passcode if auto-passcode is set up for that phone;
   otherwise a person must.
 - **`DEVICE_GAVE_UP`**: the app has stopped retrying; `next_retry_at` says
-  when it tries again by itself.
+  when it tries again by itself. `ios_recover` asks for a retry now.
 - The app checks WDA every 3 s, so a call can fail before the file says
   anything. The call gives it 5 s to notice. A phone the app still calls
   `ready` after that gets the plain `unreachable`/`wedged` error, as before.
@@ -160,6 +161,10 @@ like any other change and keeps `kind=outcome_unknown` with `code=RECOVERING`.
 
 The extra values ride in the error's tail, e.g.
 `[kind=unreachable code=RECOVERING reason=usb_reset retry_after_s=15]`.
+
+`ios_recover(device)` writes a restart request for the app. The app takes one
+per phone per minute (`cooldown` otherwise), so several agents asking at once
+restart it once. It never types a passcode.
 
 ## Setup
 

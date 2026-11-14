@@ -747,7 +747,7 @@ def _chain_error(app: _Target, phase: str, *, idempotent: bool) -> MCPToolError:
                 if nxt else None)
         return MCPToolError(
             f"iMirror has stopped retrying {a}'s WebDriverAgent{why}. {when}; "
-            "a tap on the phone's WDA status in iMirror retries now.",
+            f"ios_recover(device={a!r}) asks for a retry now.",
             kind=ErrorKind.UNREACHABLE, code="DEVICE_GAVE_UP",
             fields={"reason": app.reason or app.state, "next_retry_at": app.next_retry_at,
                     "retry_after_s": wait})
@@ -805,6 +805,117 @@ def _ride_out(t: _Target, err: MCPToolError, start_epoch: int | None,
         # The kind still says the change may have landed.
         final.error_kind = ErrorKind.OUTCOME_UNKNOWN
     raise final from err
+
+
+# ---- Events and restart requests (files the app shares) -------------------------
+
+_EVENTS_TAIL_BYTES = 256 * 1024     # bounded read, however big the log grows
+_EVENT_KEYS = ("ts", "event", "from", "to", "reason", "detail", "expected")
+
+
+def _support_dir() -> str:
+    """The app's folder: wherever devices.json is, so IMIRROR_DEVICES_FILE
+    moves the events log and the request folder with it (tests rely on it)."""
+    return os.path.dirname(_devices_file())
+
+
+def _tail_lines(path: str, max_bytes: int) -> list[bytes]:
+    """The whole lines in the last `max_bytes` of `path` ([] if unreadable)."""
+    try:
+        with open(path, "rb") as f:
+            size = f.seek(0, os.SEEK_END)
+            start = max(0, size - max_bytes)
+            f.seek(start)
+            data = f.read(max_bytes)
+    except OSError:
+        return []
+    lines = data.split(b"\n")
+    return lines[1:] if start > 0 else lines   # the first may be cut
+
+
+def _clean_event(e: dict[str, Any]) -> dict[str, Any]:
+    """Only the known keys, cut short: the agent sees the app's
+    words, so a bad line must not flood its reply."""
+    out: dict[str, Any] = {}
+    for k in _EVENT_KEYS:
+        v = e.get(k)
+        if isinstance(v, bool) and k == "expected":
+            out[k] = v
+        elif isinstance(v, str) and v:
+            out[k] = v[:160]
+    return out
+
+
+def _recent_events(udids: set[str], n: int = 5) -> dict[str, list[dict[str, Any]]]:
+    """The last `n` events.jsonl lines for each phone, oldest first. Reads the
+    file from its end, then the rotated .1 file if that is not enough."""
+    want: dict[str, list[dict[str, Any]]] = {u: [] for u in udids if u}
+    path = os.path.join(_support_dir(), "events.jsonl")
+    for p in (path, path + ".1"):
+        if all(len(v) >= n for v in want.values()):
+            break
+        for raw in reversed(_tail_lines(p, _EVENTS_TAIL_BYTES)):
+            try:
+                e = json.loads(raw)
+            except ValueError:
+                continue
+            u = e.get("udid") if isinstance(e, dict) else None
+            got = want.get(u) if isinstance(u, str) else None
+            if got is not None and len(got) < n:
+                got.append(_clean_event(e))
+    return {u: v[::-1] for u, v in want.items()}
+
+
+def _chain_fields(t: _Target) -> dict[str, Any]:
+    """What the app says about a phone's chain, for ios_status/ios_devices."""
+    return {"app_state": t.state, "reason": t.reason, "state_since": t.state_since,
+            "chain_epoch": t.chain_epoch, "next_retry_at": t.next_retry_at,
+            "last_error": t.last_error}
+
+
+def _iso(d: datetime) -> str:
+    """ISO-8601 UTC with milliseconds, as events.jsonl writes it."""
+    return d.astimezone(timezone.utc).isoformat(timespec="milliseconds").replace(
+        "+00:00", "Z")
+
+
+def _write_restart_request(udid: str, requested_at: str) -> str:
+    """Drop a restart request for the app to pick up; returns its path. Written
+    to a temp name and renamed, so the app never reads half a file."""
+    if not re.fullmatch(r"[A-Za-z0-9-]{1,64}", udid):
+        raise MCPToolError(f"Not a usable UDID: {udid!r}.", kind=ErrorKind.VALIDATION)
+    folder = os.path.join(_support_dir(), "requests")
+    os.makedirs(folder, mode=0o700, exist_ok=True)
+    path = os.path.join(folder, f"restart-{udid}.json")
+    body = {"udid": udid, "requested_at": requested_at,
+            "requested_by": f"imirror-mcp pid {os.getpid()}"}
+    tmp = f"{path}.{os.getpid()}.tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(body, f)
+    os.replace(tmp, path)
+    return path
+
+
+def _request_outcome(udid: str, since: datetime) -> str | None:
+    """The app's answer to a request made at `since` ("accepted",
+    "cooldown", "stale", "not_attached"), else None. The first answer after
+    `since` is ours: a later "cooldown" answers someone else's request."""
+    for e in _recent_events({udid}, n=50)[udid]:
+        ts = _parse_iso(e.get("ts"))
+        if e.get("event") == "request" and ts is not None and ts >= since:
+            detail = e.get("detail")
+            if detail:
+                return detail
+    return None
+
+
+# What ios_recover says when the app did not restart anything.
+_RECOVER_HINTS = {
+    "cooldown": "A restart ran in the last minute. Wait for it; don't ask again.",
+    "not_attached": "iMirror runs no WDA chain for this device (a Simulator, "
+                    "or a phone it has not started).",
+    "stale": "iMirror thought the request was old. Check the Mac's clock.",
+}
 
 
 # Named timeout tiers, in place of scattered per-call literals.
@@ -1935,7 +2046,11 @@ def ios_status() -> str:
     MCP server's version and file, and which target answered: `target`
     "device" or "simulator", `wda_endpoint`, `selected_udid`). Call this
     first if other tools fail — a not-ready/unreachable result means the
-    iMirror app isn't running or its health dot isn't green yet.
+    iMirror app isn't running or its health dot isn't green yet. With
+    iMirror's device file it also gives the app's view: app_state, reason
+    (why it is not ready), state_since, chain_epoch, next_retry_at,
+    last_error and the phone's last 5 events. While WDA is down this call
+    fails too; ios_devices still shows that view.
     """
     _, j = _req("GET", "/status")
     v = j.get("value", {})
@@ -1950,7 +2065,8 @@ def ios_status() -> str:
     # Which endpoint answered, so a wrong pin shows here.
     out.update(target=t.kind, wda_endpoint=t.wda, selected_udid=t.udid)
     if t is not _LEGACY:                 # list mode: say which phone answered
-        out.update(alias=t.alias, udid=t.udid, kind=t.kind)
+        out.update(alias=t.alias, udid=t.udid, kind=t.kind, **_chain_fields(t),
+                   events=_recent_events({t.udid} if t.udid else set()).get(t.udid, []))
     return json.dumps(out)
 
 
@@ -1987,7 +2103,10 @@ def ios_devices() -> str:
 
     Returns JSON {"mode", "default", "server_version", "script_path",
     "devices": [{"alias", "udid", "kind", "product_type", "ios", "wda",
-    "app_state", "wda_ready", "is_default", "session"}]}. `session` counts
+    "app_state", "reason", "state_since", "chain_epoch", "next_retry_at",
+    "last_error", "events", "wda_ready", "is_default", "session"}]}. `reason`
+    says why the app's chain is not ready; `events` are its last 5 for that
+    device. `session` counts
     how this server got its WDA sessions (created, adopted from another
     client, lost): losses mean another client on this phone. Pass a device's
     `alias` (or its UDID) as `device` to any other tool.
@@ -2003,12 +2122,14 @@ def ios_devices() -> str:
         default = None
     with concurrent.futures.ThreadPoolExecutor(max_workers=max(1, len(targets))) as ex:
         probes = list(ex.map(_probe_status, targets))
+    events = _recent_events({t.udid for t in targets if t.udid and t is not _LEGACY})
     devices = []
     for t, p in zip(targets, probes):
         devices.append({
             "alias": t.alias, "udid": t.udid, "kind": t.kind,
             "product_type": t.product_type, "ios": t.ios_version or p.get("ios"),
-            "wda": t.wda, "app_state": t.state, "wda_ready": p["wda_ready"],
+            "wda": t.wda, **_chain_fields(t), "events": events.get(t.udid or "", []),
+            "wda_ready": p["wda_ready"],
             "is_default": t.alias == default,
             # Many adoptions or losses mean another client shares the phone.
             "session": {"cached": bool(t.session["id"]), **t.session_stats},
@@ -2018,6 +2139,71 @@ def ios_devices() -> str:
                            "devices": devices}
     if mode == "fallback":
         out["note"] = f"not using an iMirror device file: {_REGISTRY.problem}"
+    return json.dumps(out)
+
+
+_RECOVER_WAIT_S = 30.0
+
+
+@_tool(lock=False)
+def ios_recover() -> str:
+    """Ask iMirror to restart this device's WebDriverAgent chain, then wait up
+    to 30 s for it.
+
+    Use it when calls keep failing with RECOVERING or DEVICE_GAVE_UP, or WDA
+    looks stuck. iMirror honours one request per phone per minute, so several
+    agents asking at once restart it only once. It never types a passcode.
+    Returns JSON {"result", "alias", "udid", "app_state", "reason", ...}:
+    `result` is "accepted" (the restart began; app_state says whether it is
+    ready yet), "cooldown" (one ran in the last minute: wait, don't repeat)
+    "not_attached" (no chain for this device here, e.g. a Simulator),
+    "stale" (the app judged the request old) or "timeout" (iMirror did not
+    answer; an older build ignores requests).
+    """
+    t = _cur()
+    app = _app_entry(t) if t.udid else None
+    if app is None or not app.udid:
+        raise MCPToolError(
+            "ios_recover needs a device that iMirror's device file lists "
+            f"({_REGISTRY.problem or 'this device is not in it'}). Is the iMirror "
+            "app running? ios_devices shows the mode.",
+            kind=ErrorKind.UNREACHABLE, code="DEVICE_FILE_INVALID")
+    start_epoch = app.chain_epoch
+    clock = datetime.now(timezone.utc)
+    # Event times have whole milliseconds; match them.
+    since = clock.replace(microsecond=clock.microsecond // 1000 * 1000)
+    path = _write_restart_request(app.udid, _iso(since))
+    deadline = time.monotonic() + _RECOVER_WAIT_S
+    result = "timeout"
+    while True:
+        answer = _request_outcome(app.udid, since)
+        if answer is not None and answer != "accepted":
+            result = answer             # nothing was restarted
+            break
+        now = _app_entry(t) or app
+        moved = (now.chain_epoch is not None and start_epoch is not None
+                 and now.chain_epoch != start_epoch)
+        if answer == "accepted" or moved:
+            result = "accepted"
+        app = now
+        # Only a restarted chain's ready counts; old state lingers.
+        if moved and _chain_phase(app.state, app.reason) != "recovering":
+            break
+        left = deadline - time.monotonic()
+        if left <= 0:
+            break
+        time.sleep(min(_RIDE_OUT_POLL_S, left))
+    out: dict[str, Any] = {"result": result, "alias": app.alias, "udid": app.udid,
+                           **_chain_fields(app)}
+    if result == "timeout":
+        try:
+            os.unlink(path)         # an old app must not act on it later
+        except OSError:
+            pass
+        out["hint"] = ("iMirror did not pick up the request; an older build "
+                       "ignores them. Tap the phone's WDA status in iMirror instead.")
+    elif result in _RECOVER_HINTS:
+        out["hint"] = _RECOVER_HINTS[result]
     return json.dumps(out)
 
 
