@@ -49,10 +49,11 @@ Features:
   WebDriverAgent app is on the connected iPhone and installs the bundled build if
   it's missing, with progress and actionable errors (e.g. "not signed for this
   iPhone — re-sign for this device"). A pre-provisioned device just works.
-- **iOS Simulator support** — no physical phone required: **Settings (⚙) → iOS
-  Simulator** picks a booted simulator, brings up WebDriverAgent on it, and
-  registers a dedicated `imirror-sim` MCP server, so an agent can drive and test
-  simulator builds too. You view the sim in Apple's Simulator app; requires Xcode.
+- **iOS Simulator support** — no physical phone required: enable any number of
+  simulators (from **Settings (⚙) → iOS Simulator**, a shell, or the MCP server's
+  `sim_enable`) and iMirror brings WebDriverAgent up on each, so an agent can drive
+  and test simulator builds too, several at once. You view the sims in Apple's
+  Simulator app; requires Xcode.
 
 The app code is dependency-free Swift (AppKit, Network, CoreGraphics/ImageIO).
 Control rides on two vetted, source-built tools —
@@ -310,14 +311,52 @@ own, without the Mac app: set `IMIRROR_AUTOWDA=1` and it runs the same go-ios
 tunnel / runwda / forward chain and talks to WDA directly. Useful for driving
 the phone from an agent without launching the GUI.
 
-**iOS Simulator (optional).** No phone handy, or testing a simulator build?
-**Settings (⚙) → iOS Simulator** lists your simulators; pick one and **Enable** to
-boot it and bring WebDriverAgent up on it (loopback `:8201`, so it coexists with a
-physical device on `:8100`), then **Install** the `imirror-sim` MCP server. You
-view and drive the sim through Apple's Simulator app and Claude — same `ios_*`
-tools, plus simulator-only `sim_push` / `sim_privacy` / `sim_status_bar`.
-**Requires Xcode**; the packaged app bundles the WebDriverAgent source and builds
-it once with your Xcode on first Enable (cached afterward).
+**iOS Simulators (optional).** No phone handy, or testing a simulator build?
+Enable one or more simulators and iMirror boots each and brings WebDriverAgent up
+on it, on its own loopback ports (the first `:8201`, then `:8202`, … — clear of
+the phones' `:8100`, `:8110`, …), and lists it to the `imirror` MCP server under
+an alias made from its name (`iPhone 17 Pro` → `iphone-17-pro`; `simN` when the
+name gives nothing usable). Port and alias stick to the sim's UDID across
+relaunches. Agents drive it with the same `ios_*` tools (`device="iphone-17-pro"`),
+plus simulator-only `sim_push` / `sim_privacy` / `sim_status_bar`;
+`device="sim"` still works while only one simulator is on. You view the sims in
+Apple's Simulator app. **Requires Xcode**; each sim builds WebDriverAgent once
+(2–3 min, cached afterward in `~/Library/Application Support/iMirror/sim/<UDID>/`).
+
+The enabled set is one list in the app's defaults, and it is the only switch —
+the app re-reads it on launch (so enabled sims come back after a relaunch) and
+every 2 s while running. Three ways to edit it, none needing the GUI except the
+first:
+
+- **Settings (⚙) → iOS Simulator**: pick a sim, **Enable**; each enabled sim gets
+  a row with its alias, port, state and a **Disable** button.
+- **A shell** — `scripts/imirror-sim.sh` (takes a UDID, the sim's exact name, or
+  its alias):
+
+  ```bash
+  scripts/imirror-sim.sh list                          # every sim: on/off, alias, port, state
+  scripts/imirror-sim.sh enable "iPhone 17 Pro" --wait # returns once WDA is ready
+  scripts/imirror-sim.sh enable <UDID> <UDID>          # several at once
+  scripts/imirror-sim.sh wait iphone-17-pro 300
+  scripts/imirror-sim.sh disable iphone-17-pro         # or: disable all
+  ```
+
+  or plain `defaults` (UDIDs only; this replaces the whole list):
+
+  ```bash
+  defaults write com.local.imirror imirror.enabledSimulators -array <UDID> <UDID>
+  defaults read  com.local.imirror imirror.enabledSimulators
+  defaults delete com.local.imirror imirror.enabledSimulators   # all off
+  ```
+
+- **The MCP server**: `sim_list`, `sim_enable(simulator, wait_seconds)` and
+  `sim_disable(simulator)` edit the same list.
+
+Disabling stops that sim's WebDriverAgent; the sim itself stays booted. Each
+sim's runner is supervised: one that exits is relaunched (with backoff), and one
+that stops answering `/status` for 90 s is killed and relaunched. The
+`imirror-sim` MCP registration (Settings → **Install**) is the older pinned
+setup: it only ever drives `:8201`, the first sim enabled.
 
 ## Packaging / distribution
 
@@ -361,8 +400,9 @@ distribute the notarized DMG directly.
 - **Not reachable** (XCUITest limitation): App Switcher, Control Center, Siri.
 - **Several phones, one window.** Every iPhone attached by USB is driven at once
   (up to 8, one port slot each); the window mirrors one at a time. A phone paired
-  only over Wi-Fi is not picked up. A booted **iOS Simulator** runs on its own
-  WDA (`:8201`) alongside them, and is listed to the MCP server as `sim`. All
+  only over Wi-Fi is not picked up. Enabled **iOS Simulators** (up to 8) run
+  their own WDA (`:8201`, `:8202`, …) alongside them, each listed to the MCP
+  server by its own alias. All
   phones share one go-ios tunnel, so a tunnel restart drops every phone for
   about 20 s.
 - **Maintenance reality:** control depends on go-ios + WebDriverAgent tracking

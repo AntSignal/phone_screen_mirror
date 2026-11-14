@@ -257,14 +257,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSToolbarDelegate {
     private var settingsBuilt = false
     private let deviceMCP = MCPSectionUI(profile: .device, noun: "")
     private let simMCP = MCPSectionUI(profile: .simulator, noun: " (sim)")
-    private let simController = SimulatorController()
+    /// Every enabled Simulator's WDA. Its switch is a UserDefaults list, so it
+    /// is also driven headlessly (`defaults write`, scripts/imirror-sim.sh).
+    private let simManager = SimulatorManager()
     private var simDevices: [SimDevice] = []
     private let simPicker = NSPopUpButton()
     private let simEnableButton = NSButton()
     private let simStatusLabel = NSTextField(labelWithString: "")
-    private var simEnabled = false
-    /// The Simulator Settings enabled, for its entry in the device file.
-    private var simEnabledDevice: SimDevice?
+    /// Settings → iOS Simulator: one row per enabled sim.
+    private let simRowsStack = NSStackView()
     private let healthButton = NSButton()
     /// Which phone the window shows (and the toolbar's buttons act on).
     private let devicePopUp = NSPopUpButton()
@@ -341,12 +342,22 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSToolbarDelegate {
         // capture), so it always starts on launch instead of waiting for an opt-in.
         automationSwitch.state = .on
         setAutomation(true)
+
+        // Simulators: independent of the Automation switch (they need no
+        // phone chain), but not while another iMirror owns the device file —
+        // it would be running these sims on these ports already.
+        simManager.phoneAliases = { [weak self] in self?.manager.allAliases ?? [] }
+        manager.reservedAliases = { [weak self] in self?.simManager.allAliases ?? [] }
+        simManager.onEntries = { [weak self] entries in self?.manager.simulatorEntries = entries }
+        simManager.onChange = { [weak self] in self?.renderSims() }
+        if manager.running { simManager.start() }
     }
 
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool { true }
 
     func applicationWillTerminate(_ notification: Notification) {
         manager.stop()           // every phone's chain + the tunnel; deletes the device file
+        simManager.stopAll()     // every sim's runner; the enabled list is kept for next launch
         mjpeg?.stop()
     }
 
@@ -1250,7 +1261,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSToolbarDelegate {
         for v in deviceMCP.views() { stack.addArrangedSubview(v) }
         deviceMCP.refresh(updateLabel: true)
 
-        // iOS Simulator section — pick a sim, bring up WDA on :8201, install imirror-sim.
+        // iOS Simulator section — enable any number of sims (WDA on :8201, :8202, …),
+        // install imirror-sim (pinned to the first, :8201).
         let simSep = NSBox(); simSep.boxType = .separator
         simSep.translatesAutoresizingMaskIntoConstraints = false
         simSep.widthAnchor.constraint(equalToConstant: 268).isActive = true
@@ -1261,8 +1273,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSToolbarDelegate {
         stack.addArrangedSubview(simTitle)
 
         let simCap = NSTextField(wrappingLabelWithString:
-            "Boot a Simulator and drive it from Claude. Enable brings up WebDriverAgent "
-          + "on it (port 8201); view the sim in Apple's Simulator app. Requires Xcode.")
+            "Boot Simulators and drive them from Claude. Enable brings up WebDriverAgent "
+          + "on each (ports 8201, 8202, …) and lists it to the MCP server by the alias "
+          + "below; several can run at once. View them in Apple's Simulator app. "
+          + "Requires Xcode. Headless: scripts/imirror-sim.sh enable <udid|name>.")
         simCap.font = .systemFont(ofSize: 11)
         simCap.textColor = .secondaryLabelColor
         simCap.preferredMaxLayoutWidth = 268
@@ -1284,10 +1298,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSToolbarDelegate {
         simStatusLabel.maximumNumberOfLines = 0
         stack.addArrangedSubview(simStatusLabel)
 
+        simRowsStack.orientation = .vertical
+        simRowsStack.alignment = .leading
+        simRowsStack.spacing = 6
+        stack.addArrangedSubview(simRowsStack)
+
         for v in simMCP.views() { stack.addArrangedSubview(v) }
 
-        simController.onState = { [weak self] state in self?.renderSimState(state) }
-        refreshSimulators()
+        simManager.refreshList()
+        renderSims()
         simMCP.refresh(updateLabel: true)
 
         // Version footer.
@@ -1395,7 +1414,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSToolbarDelegate {
             switch problem {
             case .badFormat: setStatus("“\(wanted)”: use lower-case letters, digits, - or _, starting with a letter.")
             case .looksLikeUDID: setStatus("“\(wanted)” looks like part of a UDID — pick a name.")
-            case .taken: setStatus("“\(wanted)” already names another iPhone.")
+            case .taken: setStatus("“\(wanted)” already names another iPhone or simulator.")
             }
         } else {
             setStatus("Renamed to \(wanted) — agents now pass device=\"\(wanted)\".")
@@ -1415,72 +1434,109 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSToolbarDelegate {
     /// Check installed state / version / staleness off the main thread (it shells
     /// out) and reflect it in the buttons — and the status line when `updateLabel`.
 
-    private func refreshSimulators() {
-        DispatchQueue.global(qos: .userInitiated).async {
-            let hasXcode = self.simController.xcodeAvailable()
-            let sims = hasXcode ? self.simController.listSimulators() : []
-            DispatchQueue.main.async {
-                self.simPicker.isEnabled = hasXcode
-                self.simEnableButton.isEnabled = hasXcode
-                guard hasXcode else { self.simStatusLabel.stringValue = "Requires Xcode."; return }
-                self.simDevices = sims
-                self.simPicker.removeAllItems()
-                for s in sims {
-                    self.simPicker.addItem(withTitle: "\(s.name) — \(s.runtime)"
-                                           + (s.isBooted ? " (booted)" : ""))
-                }
-                if sims.isEmpty { self.simStatusLabel.stringValue = "No simulators found." }
+    /// The UDID the picker has selected, if any.
+    private var pickedSimUDID: String? {
+        let idx = simPicker.indexOfSelectedItem
+        return idx >= 0 && idx < simDevices.count ? simDevices[idx].udid : nil
+    }
+
+    /// Redraw Settings → iOS Simulator from SimulatorManager: the picker (its
+    /// selection kept by UDID), the Enable/Disable button for the picked sim,
+    /// and one row per enabled sim.
+    private func renderSims() {
+        guard settingsBuilt || simRowsStack.superview != nil else { return }
+        let hasXcode = simManager.xcodeAvailable
+        simPicker.isEnabled = hasXcode != false
+        simEnableButton.isEnabled = hasXcode != false
+
+        let sims = simManager.knownList
+        if sims != simDevices {
+            let keep = pickedSimUDID
+            simDevices = sims
+            simPicker.removeAllItems()
+            for s in sims {
+                simPicker.addItem(withTitle: "\(s.name) — \(s.runtime)" + (s.isBooted ? " (booted)" : ""))
             }
+            if let keep, let i = sims.firstIndex(where: { $0.udid == keep }) { simPicker.selectItem(at: i) }
+        }
+
+        if hasXcode == false {
+            simStatusLabel.stringValue = "Requires Xcode."
+        } else if hasXcode == true && sims.isEmpty {
+            simStatusLabel.stringValue = "No simulators found."
+        } else if let udid = pickedSimUDID {
+            simEnableButton.title = simManager.isEnabled(udid) ? "Disable" : "Enable"
+            simStatusLabel.stringValue = simManager.isEnabled(udid)
+                ? simPhaseText(simManager.phase(udid), problem: simManager.problems[udid.uppercased()])
+                : "Off."
+        } else {
+            simStatusLabel.stringValue = ""
+        }
+
+        for v in simRowsStack.arrangedSubviews { simRowsStack.removeArrangedSubview(v); v.removeFromSuperview() }
+        let rows = simManager.rows
+        let rowUDIDs = Set(rows.map(\.udid))
+        for r in rows {
+            let off = NSButton(title: "Disable", target: self, action: #selector(disableSimRow(_:)))
+            off.bezelStyle = .rounded
+            off.controlSize = .small
+            off.identifier = NSUserInterfaceItemIdentifier(r.udid)
+            let name = NSTextField(labelWithString: r.alias)
+            name.font = .systemFont(ofSize: 12, weight: .semibold)
+            name.isSelectable = true
+            name.toolTip = "The name agents pass as device="
+            let top = NSStackView(views: [name, off])
+            top.orientation = .horizontal
+            top.spacing = 6
+            let what = [r.device?.name, r.device?.runtime].compactMap { $0 }.joined(separator: " · ")
+            let info = smallLabel("\(what.isEmpty ? "Simulator" : what) · WDA :\(r.slot.wdaPort)\n"
+                                  + simPhaseText(r.phase, problem: nil))
+            let row = NSStackView(views: [top, info])
+            row.orientation = .vertical
+            row.alignment = .leading
+            row.spacing = 2
+            simRowsStack.addArrangedSubview(row)
+        }
+        // Enabled but not started (unknown UDID, no Xcode, no free port).
+        for udid in simManager.enabled where !rowUDIDs.contains(udid) {
+            let off = NSButton(title: "Disable", target: self, action: #selector(disableSimRow(_:)))
+            off.bezelStyle = .rounded
+            off.controlSize = .small
+            off.identifier = NSUserInterfaceItemIdentifier(udid)
+            let why = simManager.problems[udid] ?? "starting"
+            let row = NSStackView(views: [smallLabel("\(shortUDID(udid)): not started — \(why)."), off])
+            row.orientation = .vertical
+            row.alignment = .leading
+            simRowsStack.addArrangedSubview(row)
         }
     }
 
-    @objc private func simPicked() { /* selection stored implicitly via indexOfSelectedItem */ }
+    private func simPhaseText(_ phase: SimPhase?, problem: String?) -> String {
+        if let problem { return "Not started: \(problem)." }
+        switch phase {
+        case nil, .booting?: return "Booting simulator…"
+        case .building?: return "Building WebDriverAgent (first run ~2–3 min)…"
+        case .starting?: return "Starting WebDriverAgent…"
+        case .restarting?: return "WebDriverAgent stopped answering — relaunching…"
+        case .ready?: return "WebDriverAgent ready ✓"
+        case .failed(let m)?: return "Failed: \(m)"
+        }
+    }
+
+    @objc private func simPicked() { renderSims() }
 
     @objc private func toggleSimEnable() {
-        if simEnabled {
-            simController.disable()
-            return
-        }
-        let idx = simPicker.indexOfSelectedItem
-        guard idx >= 0, idx < simDevices.count else {
+        guard let udid = pickedSimUDID else {
             simStatusLabel.stringValue = "Pick a simulator first."; return
         }
-        simEnabledDevice = simDevices[idx]
-        simController.enable(udid: simDevices[idx].udid)
+        simManager.setEnabled(udid, !simManager.isEnabled(udid))
+        renderSims()
     }
 
-    private func renderSimState(_ state: SimState) {
-        publishSimulator(state)
-        switch state {
-        case .idle:
-            simEnabled = false; simEnableButton.title = "Enable"
-            simStatusLabel.stringValue = "Off."
-        case .booting:  simEnabled = true; simEnableButton.title = "Disable"; simStatusLabel.stringValue = "Booting simulator…"
-        case .building: simStatusLabel.stringValue = "Building WebDriverAgent (first run ~2–3 min)…"
-        case .starting: simStatusLabel.stringValue = "Starting WebDriverAgent…"
-        case .ready:    simStatusLabel.stringValue = "WebDriverAgent ready on :8201 ✓"
-        case .failed(let m):
-            simEnabled = false; simEnableButton.title = "Enable"
-            simStatusLabel.stringValue = "Failed: \(m)"
-        }
-    }
-
-    /// List the enabled Simulator in the device file, so the one MCP server
-    /// can drive it too (device="sim") alongside the phones.
-    private func publishSimulator(_ state: SimState) {
-        guard let sim = simEnabledDevice else { manager.simulatorEntry = nil; return }
-        let registryState: RegisteredDevice.State
-        switch state {
-        case .idle: manager.simulatorEntry = nil; simEnabledDevice = nil; return
-        case .failed: registryState = .failed
-        case .ready: registryState = .ready
-        case .booting, .building, .starting: registryState = .starting
-        }
-        let version = sim.runtime.split(separator: " ").last.map(String.init)
-        manager.simulatorEntry = RegisteredDevice(
-            udid: sim.udid, alias: "sim", kind: .simulator, productType: sim.name,
-            iosVersion: version, wdaURL: "http://127.0.0.1:\(SimulatorController.port)",
-            state: registryState)
+    @objc private func disableSimRow(_ sender: NSButton) {
+        guard let udid = sender.identifier?.rawValue else { return }
+        simManager.setEnabled(udid, false)
+        renderSims()
     }
 
     @objc private func pressHome() {

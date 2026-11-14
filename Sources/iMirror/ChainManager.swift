@@ -36,8 +36,10 @@ final class ChainManager {
     private var lastTunnelRestart: TimeInterval?
     private var writeScheduled = false
 
-    /// The Simulator, when Settings has one enabled; listed in the device file.
-    var simulatorEntry: RegisteredDevice? { didSet { if simulatorEntry != oldValue { scheduleWrite() } } }
+    /// The enabled Simulators (SimulatorManager); listed in the device file after the phones.
+    var simulatorEntries: [RegisteredDevice] = [] { didSet { if simulatorEntries != oldValue { scheduleWrite() } } }
+    /// Aliases phones can't be renamed to (the simulators').
+    var reservedAliases: () -> Set<String> = { [] }
 
     /// The set of phones (or their order/aliases/problems) changed.
     var onDevicesChanged: (() -> Void)?
@@ -263,6 +265,7 @@ final class ChainManager {
     /// be unique and look nothing like a UDID (see validateAlias).
     func rename(_ c: DeviceController, to alias: String) -> AliasProblem? {
         if let problem = validateAlias(alias, forUDID: c.udid, in: table) { return problem }
+        if reservedAliases().contains(alias.lowercased()) { return .taken(byUDID: "simulator") }
         table.entries[c.udid]?.alias = alias
         saveTable()
         c.alias = alias
@@ -270,6 +273,9 @@ final class ChainManager {
         scheduleWrite()
         return nil
     }
+
+    /// Every alias a phone has ever had (lower-cased) — simulators avoid them.
+    var allAliases: Set<String> { Set(table.entries.values.map { $0.alias.lowercased() }) }
 
     private func saveTable() {
         if let data = try? JSONEncoder().encode(table) {
@@ -299,7 +305,7 @@ final class ChainManager {
                              wdaURL: c.slot.relayURL, mjpegPort: Int(c.slot.mjpegPort),
                              state: c.registryState, detail: c.detail)
         }
-        if let sim = simulatorEntry { devices.append(sim) }
+        devices.append(contentsOf: simulatorEntries)
         let version = Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "dev"
         return DeviceRegistryFile(ownerPid: getpid(), appVersion: version,
                                   updatedAt: DeviceRegistryCodec.timestamp(Date()),

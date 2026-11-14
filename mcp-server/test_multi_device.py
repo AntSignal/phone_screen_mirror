@@ -28,7 +28,8 @@ PNG = b"\x89PNG\r\n\x1a\nfake"
 SAMPLE = os.path.join(os.path.dirname(__file__), "testdata", "devices.sample.json")
 
 # Tools that are about the run or the server, not a device, take no `device`.
-NO_DEVICE_TOOLS = {"ios_run_note", "ios_run_section", "ios_finish_run", "ios_devices"}
+NO_DEVICE_TOOLS = {"ios_run_note", "ios_run_section", "ios_finish_run", "ios_devices",
+                   "sim_list", "sim_enable", "sim_disable"}
 
 
 def entry(udid: str, alias: str, kind: str = "device", port: int = 8100, **extra) -> dict:
@@ -163,6 +164,7 @@ def test_tool_names_and_required_params_are_unchanged(reg):
         "ios_open_url": ["url"], "ios_clipboard_set": ["text"], "ios_clipboard_get": [],
         "ios_install_app": ["path"], "sim_push": ["bundle_id", "payload_json"],
         "sim_privacy": ["action", "service"], "sim_status_bar": [],
+        "sim_list": [], "sim_enable": ["simulator"], "sim_disable": ["simulator"],
         "ios_start_run": [], "ios_run_note": ["text"], "ios_run_section": ["title"],
         "ios_finish_run": [], "ios_assert_visible": ["text"],
         "ios_assert_not_visible": ["text"], "ios_run_sequence": ["steps"],
@@ -239,6 +241,75 @@ def test_sim_tools_default_to_the_simulator(reg, monkeypatch):
                         lambda args, **kw: seen.setdefault("args", args) and R())
     reg.m.sim_status_bar(clear=True)
     assert seen["args"] == ["xcrun", "simctl", "status_bar", SIM, "clear"]
+
+
+SIM2 = "0F1E2D3C-1111-4222-8333-444455556666"
+PHONE_AND_TWO_SIMS = [entry(PHONE_16E, "phone1", port=8100),
+                      entry(SIM, "iphone-17-pro", kind="simulator", port=8201),
+                      entry(SIM2, "iphone-16e", kind="simulator", port=8202)]
+
+
+def test_each_simulator_is_its_own_device_by_alias(reg, wda):
+    reg.write(PHONE_AND_TWO_SIMS)
+    reg.m.ios_tap(1, 2, device="iphone-16e")
+    reg.m.ios_tap(1, 2, device="iphone-17-pro")
+    assert wda.aliases_for("/actions") == ["iphone-16e", "iphone-17-pro"]
+
+
+def test_old_sim_alias_still_means_the_only_simulator(reg, wda):
+    reg.write([entry(PHONE_16E, "phone1", port=8100),
+               entry(SIM, "iphone-17-pro", kind="simulator", port=8201)])
+    assert reg.m._resolve("sim").alias == "iphone-17-pro"
+    assert reg.m._resolve("SIM").alias == "iphone-17-pro"
+
+
+def test_old_sim_alias_is_refused_with_two_simulators(reg):
+    reg.write(PHONE_AND_TWO_SIMS)
+    with pytest.raises(reg.m.MCPToolError) as e:
+        reg.m._resolve("sim")
+    assert e.value.error_code == "DEVICE_AMBIGUOUS"
+    assert "iphone-16e" in str(e.value) and "iphone-17-pro" in str(e.value)
+
+
+def test_a_simulator_really_called_sim_wins(reg):
+    reg.write(PHONE_AND_TWO_SIMS + [entry("ABCDEF01-2345-4678-9ABC-DEF012345678", "sim",
+                                          kind="simulator", port=8203)])
+    assert reg.m._resolve("sim").wda == "http://127.0.0.1:8203"
+
+
+def test_sim_tools_need_a_device_with_two_simulators(reg, monkeypatch):
+    reg.write([entry(SIM, "iphone-17-pro", kind="simulator", port=8201),
+               entry(SIM2, "iphone-16e", kind="simulator", port=8202)])
+    with pytest.raises(reg.m.MCPToolError) as e:
+        reg.m.sim_status_bar(clear=True)
+    assert e.value.error_code == "DEVICE_REQUIRED"
+
+
+def test_sim_enable_reports_the_published_entry(reg, monkeypatch):
+    sc = reg.m.sim_control
+    seen = {}
+    monkeypatch.setattr(sc, "enable", lambda qs: seen.setdefault("q", qs) and [SIM2])
+    reg.write(PHONE_AND_TWO_SIMS)
+    out = json.loads(reg.m.sim_enable("iPhone 16e"))
+    assert seen["q"] == ["iPhone 16e"]
+    assert out["alias"] == "iphone-16e" and out["wda"] == "http://127.0.0.1:8202"
+    assert out["state"] == "ready" and "note" not in out
+
+
+def test_sim_enable_without_the_app_says_it_starts_on_launch(reg, monkeypatch):
+    monkeypatch.setattr(reg.m.sim_control, "enable", lambda qs: [SIM2])
+    os.remove(reg.path)
+    out = json.loads(reg.m.sim_enable(SIM2, wait_seconds=30))   # must not wait
+    assert out["state"] is None and "isn't running" in out["note"]
+
+
+def test_sim_control_errors_become_validation_errors(reg, monkeypatch):
+    def boom(qs):
+        raise reg.m.sim_control.SimControlError("no simulator matches 'x'")
+    monkeypatch.setattr(reg.m.sim_control, "disable", boom)
+    with pytest.raises(reg.m.MCPToolError) as e:
+        reg.m.sim_disable("x")
+    assert e.value.error_kind == "validation" and "no simulator matches" in str(e.value)
 
 
 def test_sim_tools_refuse_a_physical_phone(reg):
@@ -570,5 +641,5 @@ def test_only_tools_that_never_change_the_device_are_marked_read_only(reg):
     assert read_only == {
         "ios_status", "ios_devices", "ios_window_size", "ios_screenshot", "ios_source",
         "ios_await_idle", "ios_wait_for", "ios_assert_visible", "ios_assert_not_visible",
-        "ios_app_state", "ios_clipboard_get",
+        "ios_app_state", "ios_clipboard_get", "sim_list",
     }

@@ -35,29 +35,40 @@ its self-managed transport (userspace tunnel + runwda + forward + relay).
 | `sim_push(bundle_id, payload_json)` | *(simulator only)* deliver a push notification from an APNs payload |
 | `sim_privacy(action, service, bundle_id)` | *(simulator only)* grant/revoke/reset a permission without the consent dialog |
 | `sim_status_bar(time, clear)` | *(simulator only)* freeze the status bar (full bars, 100%, fixed time) for clean screenshots |
+| `sim_list()` | every Simulator on the Mac: enabled in iMirror?, its alias, WDA port and state |
+| `sim_enable(simulator, wait_seconds)` | have the iMirror app run WDA on a Simulator (UDID, exact name or alias); it then becomes a device by its alias. `wait_seconds` ≤ 100; a first WDA build takes 2–3 min |
+| `sim_disable(simulator)` | stop WDA on a Simulator (or `"all"`); the sim stays booted |
 
 Every device tool also takes an optional **`device`** argument — see
-[Several devices](#several-devices). The run-report tools and `ios_devices` don't.
+[Several devices](#several-devices). The run-report tools, `ios_devices` and
+`sim_list` / `sim_enable` / `sim_disable` don't.
 
 ## Several devices
 
 The iMirror app runs WebDriverAgent on every iPhone attached by USB, each on its
-own loopback port, and lists them (plus an enabled Simulator, as `sim`) in
-`~/Library/Application Support/iMirror/devices.json`. This server reads that file
-(re-reading it when it changes), so one server drives them all:
+own loopback port, and lists them (plus every enabled Simulator, each by an
+alias made from its name) in `~/Library/Application Support/iMirror/devices.json`.
+This server reads that file (re-reading it when it changes), so one server
+drives them all:
 
 ```
-ios_devices                                  -> phone1 (:8100), phone2 (:8110), sim (:8201)
+ios_devices                                  -> phone1 (:8100), phone2 (:8110),
+                                                iphone-17-pro (:8201), iphone-16e (:8202)
 ios_find_and_tap text="Settings" device="phone2"
+ios_screenshot device="iphone-16e"           # a simulator, by its alias
+sim_enable simulator="iPad Air 13-inch (M3)" wait_seconds=100
 ios_screenshot device="00008140"             # a UDID, or a unique UDID prefix/suffix (4+ chars)
 ios_run_sequence steps=[…] device="phone1"   # one device for the whole sequence
 ```
 
-- **Omitting `device`** is fine with one phone attached (an enabled Simulator
-  doesn't count; the `sim_*` tools default to the Simulator). With several
-  phones it fails with the list of devices rather than guess — set
-  `IMIRROR_DEFAULT_DEVICE=<alias or UDID>` in the server's environment to give
-  omitted calls a default instead.
+- **Omitting `device`** is fine with one phone attached (enabled Simulators
+  don't count; the simctl `sim_*` tools default to the Simulator when only one
+  is on). With several phones it fails with the list of devices rather than
+  guess — set `IMIRROR_DEFAULT_DEVICE=<alias or UDID>` in the server's
+  environment to give omitted calls a default instead.
+- **`device="sim"`** is the single-simulator name from before simulators had
+  aliases of their own: it still means the Simulator while exactly one is on,
+  and is refused as ambiguous with several.
 - **Parallel across devices, in order per device.** Each call runs on its own
   worker thread and holds only its device's lock: a 10 s `ios_wait_for` on
   phone1 doesn't delay phone2, while two calls to phone1 still run one after

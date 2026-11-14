@@ -58,6 +58,7 @@ from mcp.server.fastmcp import FastMCP, Image
 from mcp.types import ToolAnnotations
 from pydantic import Field
 
+import sim_control
 import wda_bringup
 
 
@@ -384,6 +385,15 @@ def _match(query: str, targets: list[_Target], source: str = "device") -> _Targe
     for t in targets:
         if t.alias.lower() == ql:
             return t
+    if ql == "sim":
+        # The app used to list its one Simulator as "sim"; each sim now has an
+        # alias of its own. Keep "sim" working while it can only mean one.
+        sims = [t for t in targets if t.is_sim]
+        if len(sims) == 1:
+            return sims[0]
+        if len(sims) > 1:
+            raise _device_error(f"{source}='sim' is ambiguous: several simulators are on; "
+                                "use one's alias.", "DEVICE_AMBIGUOUS", targets)
     for t in targets:
         if t.udid and t.udid.lower() == ql:
             return t
@@ -533,10 +543,11 @@ _TIMEOUT_INTERACT = 15
 _TIMEOUT_TREE = 60
 
 mcp = FastMCP("imirror", instructions=(
-    "Drives real iPhones (and optionally a Simulator) through WebDriverAgent. "
+    "Drives real iPhones (and optionally Simulators) through WebDriverAgent. "
     "Several phones may be attached: ios_devices lists them. Every device tool "
     "takes an optional `device` (alias or UDID); omit it when only one phone is "
-    "attached. Calls to different phones run in parallel."))
+    "attached. Calls to different phones run in parallel. Simulators: sim_list "
+    "shows them, sim_enable turns one on (it is then a device by its alias)."))
 
 # Optional per-run recording. Off until ios_start_run; every action/screenshot is
 # appended to _run["steps"], and ios_finish_run renders them into a report.
@@ -2292,6 +2303,85 @@ def sim_status_bar(time: str = "9:41", clear: bool = False) -> str:
             "--cellularBars", "4", "--wifiBars", "3", "--dataNetwork", "wifi")
     _record("sim_status_bar", f"override time={time}")
     return f"status bar overridden (time {time})"
+
+
+# ---- Switching Simulators on and off (the iMirror app's enabled list) ----------
+# The app runs WDA on every sim in its `imirror.enabledSimulators` defaults list
+# and polls that list, so these tools only edit it (sim_control) and then read
+# the device file for the result. Not device tools: they pick a simulator by
+# its own argument, and the sim they name may not be a target yet.
+
+# Under Claude Code's ~120 s tool-call budget; a first WDA build takes longer,
+# so a caller waits again with ios_devices or another sim_enable.
+_SIM_ENABLE_MAX_WAIT = 100
+
+
+def _sim_control(fn, *args: Any) -> Any:
+    try:
+        return fn(*args)
+    except sim_control.SimControlError as e:
+        raise MCPToolError(str(e), kind=ErrorKind.VALIDATION, code="SIM_CONTROL") from e
+
+
+@_tool(per_device=False, read_only=True)
+def sim_list() -> str:
+    """List the Mac's iOS Simulators and which ones iMirror runs WDA on.
+
+    Returns JSON {"app_running", "simulators": [{"udid", "name", "runtime",
+    "booted", "enabled", "alias", "wda", "state", "detail"}]}. An enabled
+    sim's `alias` is what you pass as `device` to every other tool once its
+    `state` is "ready". Turn one on with sim_enable.
+    """
+    return json.dumps(_sim_control(sim_control.status))
+
+
+@_tool(per_device=False)
+def sim_enable(simulator: str, wait_seconds: int = 0) -> str:
+    """Have the iMirror app boot a Simulator and run WebDriverAgent on it, so
+    the ios_* tools can drive it as device=<its alias>. Several can be on at
+    once, each on its own port (8201, 8202, …). It stays on across app
+    relaunches until sim_disable.
+
+    `simulator`: a UDID, an exact simulator name ("iPhone 17 Pro"), or the
+    alias iMirror gave it; see sim_list. `wait_seconds` (max 100): wait for
+    WDA to be ready. A sim's first WDA build takes 2–3 minutes; if it isn't
+    ready in time, call ios_devices (or sim_enable again) to check.
+
+    Returns JSON {"udid", "alias", "wda", "state", "detail"}.
+    """
+    udid = _sim_control(sim_control.enable, [simulator])[0]
+    wait = max(0, min(int(wait_seconds), _SIM_ENABLE_MAX_WAIT))
+    out: dict[str, Any] = {"udid": udid}
+    entry: dict[str, Any] = {}
+    deadline = time.monotonic() + wait
+    while True:
+        running, pub = sim_control.published()
+        entry = pub.get(udid, {})
+        if not running or entry.get("state") == "ready" or time.monotonic() >= deadline:
+            break
+        time.sleep(1.0)
+    out.update(alias=entry.get("alias"), wda=entry.get("wda_url"),
+               state=entry.get("state"), detail=entry.get("detail"))
+    if not running:
+        out["note"] = ("The iMirror app isn't running; the sim starts when it launches. "
+                       "It is now in the app's enabled list.")
+    elif entry.get("state") != "ready":
+        out["note"] = ("Enabled; WebDriverAgent is still coming up (a first build takes "
+                       "2–3 min). Check with ios_devices.")
+    if _PINNED:
+        out["note"] = ((out.get("note", "") + " ").lstrip()
+                       + "This server is pinned by IMIRROR_WDA, so it can't drive it; "
+                         "use the imirror server (no IMIRROR_WDA).")
+    return json.dumps(out)
+
+
+@_tool(per_device=False)
+def sim_disable(simulator: str) -> str:
+    """Stop WebDriverAgent on a Simulator iMirror runs (the sim stays booted)
+    and drop it from the app's enabled list. `simulator`: a UDID, name or
+    alias, or "all". Returns JSON {"disabled": [udid, …]}.
+    """
+    return json.dumps({"disabled": _sim_control(sim_control.disable, [simulator])})
 
 
 # ---- Test-run recording & report -----------------------------------------------

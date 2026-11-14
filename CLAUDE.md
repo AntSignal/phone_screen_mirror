@@ -16,8 +16,8 @@ There is **no CI**. Before committing or opening a PR for anything under
 mcp-server/.venv/bin/python -m pytest mcp-server
 ```
 
-(`mcp-server` runs every suite: `test_imirror_mcp.py`, `test_multi_device.py` and
-`test_wda_bringup.py`; the live ones skip themselves.)
+(`mcp-server` runs every suite: `test_imirror_mcp.py`, `test_multi_device.py`,
+`test_sim_control.py` and `test_wda_bringup.py`; the live ones skip themselves.)
 
 First-time setup (creates the venv the command above expects):
 

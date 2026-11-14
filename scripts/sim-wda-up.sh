@@ -20,6 +20,13 @@
 #   ./scripts/sim-wda-up.sh <UDID>          # boot that device by udid
 #   PORT=8200 ./scripts/sim-wda-up.sh       # WDA on a non-default port
 #
+# Several sims at once (the iMirror app runs one of these per enabled sim) need,
+# per sim, their own PORT, their own MJPEG_PORT (WDA's MJPEG server binds 9100
+# on the Mac's loopback by default, so a second sim would lose it) and their own
+# WDA_SIM_BUILD_DIR (two builds into one derived-data dir lock each other out,
+# and the branding step below rewrites its scratch dirs in place):
+#   PORT=8202 MJPEG_PORT=9202 WDA_SIM_BUILD_DIR=/tmp/sim2 ./scripts/sim-wda-up.sh <UDID>
+#
 # Then, in another shell, point the MCP server at it:
 #   IMIRROR_TARGET=simulator IMIRROR_WDA=http://127.0.0.1:$PORT \
 #     mcp-server/.venv/bin/python mcp-server/imirror_mcp.py
@@ -69,7 +76,10 @@ if [[ ! -d "$PROJ" ]]; then
 fi
 
 PORT="${PORT:-8100}"
-DERIVED="$ROOT/build/wda-sim-derived"
+MJPEG_PORT="${MJPEG_PORT:-}"
+BUILD_DIR="${WDA_SIM_BUILD_DIR:-$ROOT/build}"
+mkdir -p "$BUILD_DIR"
+DERIVED="$BUILD_DIR/wda-sim-derived"
 BUNDLE_ID="com.local.imirror.WebDriverAgentRunner"   # matches WDAIdentity in Transport.swift
 DISPLAY_NAME="iMirror"
 
@@ -129,9 +139,9 @@ RUNNER="$DERIVED/Build/Products/Debug-iphonesimulator/WebDriverAgentRunner-Runne
 # team identity. Re-applied every launch because build-for-testing may rebuild the
 # runner and wipe the patch.
 echo "==> branding the runner (icon + name '$DISPLAY_NAME'), ad-hoc re-sign"
-ASSETS="$ROOT/build/wda-sim-assets"
-ICONSET="$ROOT/build/wda-sim-AppIcon.xcassets/AppIcon.appiconset"
-rm -rf "$ROOT/build/wda-sim-AppIcon.xcassets" "$ASSETS"; mkdir -p "$ICONSET" "$ASSETS"
+ASSETS="$BUILD_DIR/wda-sim-assets"
+ICONSET="$BUILD_DIR/wda-sim-AppIcon.xcassets/AppIcon.appiconset"
+rm -rf "$BUILD_DIR/wda-sim-AppIcon.xcassets" "$ASSETS"; mkdir -p "$ICONSET" "$ASSETS"
 
 # 1024 iMirror icon, flattened to opaque (iOS rejects alpha), compiled with actool.
 swift "$ROOT/scripts/make_ios_icon.swift" "$ASSETS/icon-1024.png"
@@ -141,7 +151,7 @@ cat > "$ICONSET/Contents.json" <<'JSON'
 { "images":[{"filename":"icon-1024.png","idiom":"universal","platform":"ios","size":"1024x1024"}],
   "info":{"author":"xcode","version":1} }
 JSON
-xcrun actool "$ROOT/build/wda-sim-AppIcon.xcassets" --compile "$ASSETS" \
+xcrun actool "$BUILD_DIR/wda-sim-AppIcon.xcassets" --compile "$ASSETS" \
   --platform iphonesimulator --minimum-deployment-target 12.0 --app-icon AppIcon \
   --output-partial-info-plist "$ASSETS/partial.plist" >/dev/null
 
@@ -173,6 +183,8 @@ echo "==> launching WebDriverAgent (port $PORT); leave running, Ctrl-C to stop."
 # reads USE_PORT=$PORT and binds it. As a build setting it is ignored and WDA falls
 # back to its compiled-in default (8100).
 export TEST_RUNNER_USE_PORT="$PORT"
+# Same mechanism for WDA's MJPEG server (it reads MJPEG_SERVER_PORT).
+if [[ -n "$MJPEG_PORT" ]]; then export TEST_RUNNER_MJPEG_SERVER_PORT="$MJPEG_PORT"; fi
 exec xcodebuild test-without-building \
     -project "$PROJ" \
     -scheme WebDriverAgentRunner \
