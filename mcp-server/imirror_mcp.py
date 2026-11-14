@@ -51,6 +51,7 @@ import time
 import urllib.error
 import urllib.request
 import xml.etree.ElementTree as ET
+from datetime import datetime, timezone
 from typing import Annotated, Any
 from urllib.parse import urlsplit
 
@@ -101,18 +102,25 @@ class MCPToolError(RuntimeError):
     # WDA's W3C error name, e.g. "stale element reference", if any.
     wda_error: str | None = None
 
-    def __init__(self, message: str, *, kind: str, code: str | None = None):
+    def __init__(self, message: str, *, kind: str, code: str | None = None,
+                 fields: dict[str, Any] | None = None):
         if kind not in _ERROR_KINDS:
             raise ValueError(f"unknown MCPToolError kind: {kind!r}")
         super().__init__(message)
         self.human_message = message
         self.error_kind = kind
         self.error_code = code
+        # Extra key=value pairs for the tail, such as retry_after_s.
+        self.fields = {k: v for k, v in (fields or {}).items() if v is not None}
 
     def __str__(self) -> str:
-        tail = (f"[kind={self.error_kind}]" if self.error_code is None
-                else f"[kind={self.error_kind} code={self.error_code}]")
-        return f"{self.human_message} {tail}"
+        bits = [f"kind={self.error_kind}"]
+        if self.error_code is not None:
+            bits.append(f"code={self.error_code}")
+        # One token per value keeps the tail parseable.
+        bits += [f"{k}={re.sub(r'[^A-Za-z0-9_.:+-]', '_', str(v))}"
+                 for k, v in self.fields.items()]
+        return f"{self.human_message} [{' '.join(bits)}]"
 
 
 def _is_loopback_url(url: str) -> bool:
@@ -198,6 +206,12 @@ class _Target:
     ios_version: str | None = None
     state: str | None = None
     detail: str | None = None
+    # Why the app's chain is not ready (devices.json).
+    reason: str | None = None
+    state_since: str | None = None
+    chain_epoch: int | None = None    # +1 each time the app starts the chain
+    last_error: str | None = None
+    next_retry_at: str | None = None  # set while the app has given up
 
     @property
     def is_sim(self) -> bool:
@@ -417,6 +431,13 @@ class _Registry:
             return v if isinstance(v, str) and v else None
         t.product_type, t.ios_version = s("product_type"), s("ios_version")
         t.state, t.detail = s("state"), s("detail")
+        t.reason, t.state_since = s("reason"), s("state_since")
+        t.next_retry_at = s("next_retry_at")
+        err = s("last_error")
+        t.last_error = err[:200] if err else None
+        epoch = e.get("chain_epoch")
+        t.chain_epoch = (epoch if isinstance(epoch, int) and not isinstance(epoch, bool)
+                         else None)
         return t
 
 
@@ -621,6 +642,152 @@ def _wedged_hint() -> str:
             else "check the iMirror health dot")
 
 
+# ---- Riding out a chain restart ------------------------------------------------
+#
+# When WDA stops answering, the iMirror app is often already restarting that
+# phone's chain, and says so in devices.json. A call waits for it (reading the
+# file, never /status: dozens of servers must not hammer a booting WDA), then
+# retries once if it only reads. The file layout is in the README's "Files
+# other tools read".
+
+_RIDE_OUT_S = 30.0               # longest wait for a restarting chain
+_RIDE_OUT_POLL_S = 1.0           # devices.json is a stat when unchanged
+_RECOVERING_MARKS = frozenset({"starting", "installing", "recovering", "booting",
+                               "usb_reset", "wda_wedged", "tunnel_down"})
+_PASSCODE_REASONS = frozenset({"needs_passcode", "locked"})
+
+
+def _chain_phase(state: str | None, reason: str | None) -> str:
+    """What a devices.json entry says about the phone's chain: "ready",
+    "recovering" (worth waiting for), "needs_passcode", "gave_up", or "down"
+    (nothing to wait for). Pure, so every branch is unit-tested. An app
+    without `reason` says "down" while its ladder retries, and "failed" once
+    it stops for good."""
+    if reason in _PASSCODE_REASONS:
+        return "needs_passcode"
+    if reason == "gave_up" or state == "failed":
+        return "gave_up"
+    if state == "ready" and reason is None:
+        return "ready"
+    if state in _RECOVERING_MARKS or reason in _RECOVERING_MARKS:
+        return "recovering"
+    if state == "down" and reason is None:
+        return "recovering"
+    return "down"
+
+
+def _app_entry(t: _Target) -> _Target | None:
+    """`t` as the app's device file shows it now, or None when the file is not
+    live or no longer lists the phone. A pinned target is looked up by UDID."""
+    valid, targets = _REGISTRY.snapshot()
+    if not valid:
+        return None
+    if t is not _LEGACY:
+        return t if any(x is t for x in targets) else None
+    return next((x for x in targets if t.udid and x.udid == t.udid), None)
+
+
+def _wait_for_chain(t: _Target, budget: float) -> tuple[_Target | None, str]:
+    """Poll the device file until the chain is no longer recovering, or
+    `budget` seconds pass. Returns the entry and its phase ("gone" when the
+    file stops listing the phone)."""
+    deadline = time.monotonic() + budget
+    while True:
+        app = _app_entry(t)
+        if app is None:
+            return None, "gone"
+        phase = _chain_phase(app.state, app.reason)
+        left = deadline - time.monotonic()
+        if phase != "recovering" or left <= 0:
+            return app, phase
+        time.sleep(min(_RIDE_OUT_POLL_S, left))
+
+
+def _parse_iso(s: str | None) -> datetime | None:
+    if not s:
+        return None
+    try:
+        d = datetime.fromisoformat(s)
+    except ValueError:
+        return None
+    return d if d.tzinfo else d.replace(tzinfo=timezone.utc)
+
+
+def _chain_error(app: _Target, phase: str, *, idempotent: bool) -> MCPToolError:
+    """The error a call gets when the phone is not back: RECOVERING,
+    NEEDS_PASSCODE or DEVICE_GAVE_UP, each with what to do next."""
+    a = app.alias
+    if phase == "needs_passcode":
+        where = ("its Lock Screen" if app.reason == "locked"
+                 else "the 'Enable UI Automation' passcode sheet")
+        return MCPToolError(
+            f"{a} is waiting for its passcode on {where}. If auto-passcode is set up "
+            "for this phone, iMirror types it; otherwise a person must enter it on "
+            "the phone. Calls fail until then; ios_devices shows when it clears.",
+            kind=ErrorKind.UNREACHABLE, code="NEEDS_PASSCODE",
+            fields={"reason": app.reason, "retry_after_s": 30})
+    if phase == "gave_up":
+        why = f" ({app.last_error})" if app.last_error else ""
+        nxt = _parse_iso(app.next_retry_at)
+        when = (f"It tries again by itself at {app.next_retry_at}" if nxt
+                else "It will not try again by itself")
+        wait = (max(0, math.ceil((nxt - datetime.now(timezone.utc)).total_seconds()))
+                if nxt else None)
+        return MCPToolError(
+            f"iMirror has stopped retrying {a}'s WebDriverAgent{why}. {when}; "
+            "a tap on the phone's WDA status in iMirror retries now.",
+            kind=ErrorKind.UNREACHABLE, code="DEVICE_GAVE_UP",
+            fields={"reason": app.reason or app.state, "next_retry_at": app.next_retry_at,
+                    "retry_after_s": wait})
+    note = ("" if idempotent else " This call was not retried: it may already have "
+            "reached the phone, so look at the screen before repeating it.")
+    if phase == "ready":
+        return MCPToolError(
+            f"{a}'s WebDriverAgent restarted during this call and is ready again."
+            f"{note}", kind=ErrorKind.UNREACHABLE, code="RECOVERING",
+            fields={"reason": "restarted", "retry_after_s": 0})
+    what = app.reason or app.state or "unknown"
+    since = f" since {app.state_since}" if app.state_since else ""
+    return MCPToolError(
+        f"{a}'s WebDriverAgent is still restarting ({what}{since}).{note} Retry "
+        "shortly; ios_devices shows progress.",
+        kind=ErrorKind.UNREACHABLE, code="RECOVERING",
+        fields={"reason": what, "retry_after_s": 15})
+
+
+def _rides_out(e: BaseException) -> bool:
+    """Whether an error may be a chain restart worth waiting for."""
+    return isinstance(e, MCPToolError) and e.error_kind in (ErrorKind.UNREACHABLE,
+                                                            ErrorKind.WEDGED)
+
+
+def _ride_out(t: _Target, err: MCPToolError, start_epoch: int | None,
+              retry: Any) -> Any:
+    """Handle a call to `t` that failed with `err` (UNREACHABLE or WEDGED).
+
+    If the app says the chain is restarting, wait up to _RIDE_OUT_S for it.
+    Then `retry` (given only for calls that change nothing) runs once.
+    Otherwise this raises a precise error. A phone the app calls ready,
+    whose chain did not restart during the call, gets `err` back unchanged."""
+    app = _app_entry(t)
+    if app is None:
+        raise err
+    phase = _chain_phase(app.state, app.reason)
+    restarted = (start_epoch is not None and app.chain_epoch is not None
+                 and app.chain_epoch != start_epoch)
+    if phase == "ready" and not restarted:
+        raise err
+    if phase == "recovering":
+        app, phase = _wait_for_chain(t, _RIDE_OUT_S)
+        if app is None:
+            raise err
+    if phase == "ready" and retry is not None:
+        return retry()
+    if phase == "down":
+        raise err
+    raise _chain_error(app, phase, idempotent=retry is not None) from err
+
+
 # Named timeout tiers, in place of scattered per-call literals.
 #   PROBE    — cheap existence/point checks (/status, element lookups in poll
 #              loops, best-effort settings POSTs). Deliberately short: a poll
@@ -756,17 +923,31 @@ def _recorded(fn):
         try:
             return fn(*args, **kwargs)
         except Exception as e:
-            if _run["active"]:
-                verdict: dict[str, Any] = {
-                    "kind": "fail",
-                    "reason": e.human_message if isinstance(e, MCPToolError) else str(e),
-                }
-                if isinstance(e, MCPToolError):
-                    verdict["error_kind"] = e.error_kind
-                    verdict["error_code"] = e.error_code
-                _record(fn.__name__, detail=verdict["reason"], verdict=verdict)
+            # _tool records this one after riding out the restart.
+            if not (_riding.get() is wrapper and _rides_out(e)):
+                _record_fail(fn.__name__, e)
             raise
+    wrapper._records_failures = True  # type: ignore[attr-defined]
     return wrapper
+
+
+def _record_fail(name: str, e: Exception) -> None:
+    """Record one `fail` step for a tool that raised, if a run is active."""
+    if not _run["active"]:
+        return
+    verdict: dict[str, Any] = {
+        "kind": "fail",
+        "reason": e.human_message if isinstance(e, MCPToolError) else str(e),
+    }
+    if isinstance(e, MCPToolError):
+        verdict["error_kind"] = e.error_kind
+        verdict["error_code"] = e.error_code
+    _record(name, detail=verdict["reason"], verdict=verdict)
+
+
+# The outer tool call that _tool may still ride out.
+_riding: contextvars.ContextVar[Any] = contextvars.ContextVar("imirror_riding",
+                                                              default=None)
 
 
 _DEVICE_DOC = ("Which device to drive: an alias or UDID from ios_devices (a unique "
@@ -795,7 +976,9 @@ def _tool(*, per_device: bool = True, lock: bool = True, optional: bool = False,
     `lock=False`: don't queue behind this phone's other calls.
     `read_only`: the tool never changes the device. Advertised to the client
     as readOnlyHint, which is what lets Claude Code send two of these at once;
-    it runs other tool calls from one message one after another.
+    it runs other tool calls from one message one after another. Such a call
+    is also retried once after a chain restart (see _ride_out); any other
+    call waits for the restart but is never repeated.
     """
     def deco(fn):
         sig = inspect.signature(fn, eval_str=True)
@@ -821,13 +1004,31 @@ def _tool(*, per_device: bool = True, lock: bool = True, optional: bool = False,
                     if optional and not device:
                         return fn(*args, **kwargs)
                     raise
-                token = _current.set(t)
-                try:
+                def once() -> Any:
                     if lock:
                         with t.call_lock:
                             return fn(*args, **kwargs)
                     return fn(*args, **kwargs)
+                token = _current.set(t)
+                riding = _riding.set(fn)
+                start_epoch = t.chain_epoch
+                try:
+                    try:
+                        return once()
+                    except MCPToolError as e:
+                        if not _rides_out(e):
+                            raise
+                        # The wait runs outside call_lock.
+                        try:
+                            return _ride_out(t, e, start_epoch,
+                                             once if read_only else None)
+                        except Exception as final:
+                            if (getattr(fn, "_records_failures", False)
+                                    and _rides_out(final)):
+                                _record_fail(fn.__name__, final)
+                            raise
                 finally:
+                    _riding.reset(riding)
                     _current.reset(token)
             entry.__signature__ = sig  # type: ignore[attr-defined]
         else:
