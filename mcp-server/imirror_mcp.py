@@ -883,16 +883,25 @@ def _write_restart_request(udid: str, requested_at: str) -> str:
 
 
 def _request_outcome(udid: str, since: datetime) -> str | None:
-    """"accepted" or "cooldown" once the app has logged its answer to a
-    request made at `since`, else None. The first answer after `since` is
-    ours: a later "cooldown" answers someone else's request."""
+    """The app's answer to a request made at `since` ("accepted",
+    "cooldown", "stale", "not_attached"), else None. The first answer after
+    `since` is ours: a later "cooldown" answers someone else's request."""
     for e in _recent_events({udid}, n=50)[udid]:
         ts = _parse_iso(e.get("ts"))
         if e.get("event") == "request" and ts is not None and ts >= since:
             detail = e.get("detail")
-            if detail in ("accepted", "cooldown"):
+            if detail:
                 return detail
     return None
+
+
+# What ios_recover says when the app did not restart anything.
+_RECOVER_HINTS = {
+    "cooldown": "A restart ran in the last minute. Wait for it; don't ask again.",
+    "not_attached": "iMirror runs no WDA chain for this device (a Simulator, "
+                    "or a phone it has not started).",
+    "stale": "iMirror thought the request was old. Check the Mac's clock.",
+}
 
 
 # Named timeout tiers, in place of scattered per-call literals.
@@ -1986,7 +1995,9 @@ def ios_recover() -> str:
     Returns JSON {"result", "alias", "udid", "app_state", "reason", ...}:
     `result` is "accepted" (the restart began; app_state says whether it is
     ready yet), "cooldown" (one ran in the last minute: wait, don't repeat)
-    or "timeout" (iMirror did not answer; an older build ignores requests).
+    "not_attached" (no chain for this device here, e.g. a Simulator),
+    "stale" (the app judged the request old) or "timeout" (iMirror did not
+    answer; an older build ignores requests).
     """
     t = _cur()
     app = _app_entry(t) if t.udid else None
@@ -2005,8 +2016,8 @@ def ios_recover() -> str:
     result = "timeout"
     while True:
         answer = _request_outcome(app.udid, since)
-        if answer == "cooldown":
-            result = "cooldown"
+        if answer is not None and answer != "accepted":
+            result = answer             # nothing was restarted
             break
         now = _app_entry(t) or app
         moved = (now.chain_epoch is not None and start_epoch is not None
@@ -2030,6 +2041,8 @@ def ios_recover() -> str:
             pass
         out["hint"] = ("iMirror did not pick up the request; an older build "
                        "ignores them. Tap the phone's WDA status in iMirror instead.")
+    elif result in _RECOVER_HINTS:
+        out["hint"] = _RECOVER_HINTS[result]
     return json.dumps(out)
 
 

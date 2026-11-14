@@ -294,7 +294,9 @@ moves to `events.jsonl.1`, replacing the old one.
 writing `{"udid", "requested_at", "requested_by"}` (`requested_by` is a short
 name). The app deletes the file, treats it like a tap on Retry unless it
 honoured a request for that phone in the last 60 s, and logs a `request`
-event with `detail` `accepted` or `cooldown`. A request never types a passcode.
+event with `detail` `accepted` or `cooldown` (`stale` for a request over 2
+minutes old, `not_attached` when no chain runs for that UDID, such as a
+Simulator). A request never types a passcode.
 
 **`expected-resets/<udid>.json`** — before `devicectl device install` or
 `launch`, which reset the phone's USB link, a client writes

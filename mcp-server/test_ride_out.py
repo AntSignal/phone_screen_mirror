@@ -467,6 +467,16 @@ def test_recover_sees_an_answer_in_the_same_millisecond(live, monkeypatch):
     assert json.loads(m.ios_recover())["result"] == "cooldown"
 
 
+@pytest.mark.parametrize("detail", ["not_attached", "stale"])
+def test_recover_returns_at_once_when_the_app_restarts_nothing(live, detail):
+    m, app = live
+    answer_request(app, detail)
+    t0 = time.monotonic()
+    out = json.loads(m.ios_recover())
+    assert out["result"] == detail and out["hint"]
+    assert time.monotonic() - t0 < 2
+
+
 def test_recover_ignores_an_answer_to_an_older_request(live, monkeypatch):
     m, app = live
     monkeypatch.setattr(m, "_RECOVER_WAIT_S", 0.3)
