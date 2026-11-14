@@ -29,7 +29,10 @@ final class WDAClient {
 
     let base: URL
     private(set) var sessionId: String?
-    private(set) var deviceSize: CGSize?   // logical points (portrait)
+    private(set) var deviceSize: CGSize?   // current orientation's logical points
+    /// Bumped when the picture changes shape (a rotation). A window-size
+    /// reply sent before the bump describes the old shape and is dropped.
+    private var geometryRevision = 0
 
     init(base: URL = URL(string: "http://127.0.0.1:8100")!) {
         precondition(base.host == "127.0.0.1" || base.host == "localhost",
@@ -82,21 +85,41 @@ final class WDAClient {
     private func applyMJPEGSettings(sid: String) {
         send("POST", "/session/\(sid)/appium/settings",
              ["settings": ["mjpegServerFramerate": 30,
+                           // Frames follow the screen's rotation, as touches do.
+                           "mjpegFixOrientation": true,
                            "mjpegServerScreenshotQuality": 60,
                            "mjpegScalingFactor": 100]]) { _, _, _ in }
     }
 
     private func fetchWindowSize(completion: @escaping (Result<CGSize, Error>) -> Void) {
         guard let sid = sessionId else { completion(.failure(WDAError.notConnected)); return }
+        let revision = geometryRevision
         send("GET", "/session/\(sid)/window/size", nil) { [weak self] _, json, error in
+            guard let self, self.isCurrent(revision: revision, sid: sid) else {
+                completion(.failure(WDAError.superseded))
+                return
+            }
             if let error { completion(.failure(error)); return }
             guard let size = WDAParse.windowSize(json) else {
                 completion(.failure(WDAError.badResponse("no window size")))
                 return
             }
-            self?.deviceSize = size
+            self.deviceSize = size
             completion(.success(size))
         }
+    }
+
+    private func isCurrent(revision: Int, sid: String) -> Bool {
+        geometryRevision == revision && sessionId == sid
+    }
+
+    /// The video changed shape (a rotation): the cached size would map taps
+    /// to the wrong place, so drop it now and ask WDA again. From upstream
+    /// fed3fb9. Main thread.
+    func refreshDisplayGeometry(completion: @escaping (Result<CGSize, Error>) -> Void = { _ in }) {
+        geometryRevision += 1
+        deviceSize = nil
+        fetchWindowSize(completion: completion)
     }
 
     // MARK: Health
@@ -113,11 +136,13 @@ final class WDAClient {
             }
             guard WDAParse.ready(json) else { completion(.down); return }
             guard let sid = self.sessionId else { self.adopt(statusJSON: json, completion); return }
+            let revision = self.geometryRevision
             self.send("GET", "/session/\(sid)/window/size", nil) { [weak self] code, sizeJSON, error in
                 guard let self else { return }
                 if error == nil, let code, (200..<300).contains(code),
                    let size = WDAParse.windowSize(sizeJSON) {
-                    self.deviceSize = size
+                    // Sent before a rotation: the size is the old shape's.
+                    if self.isCurrent(revision: revision, sid: sid) { self.deviceSize = size }
                     completion(.alive)
                 } else if error != nil {
                     completion(.alive)                         // /status answered; just slow
@@ -144,7 +169,8 @@ final class WDAClient {
         applyMJPEGSettings(sid: active)
         fetchWindowSize { [weak self] result in
             switch result {
-            case .success: completion(.alive)
+            // A rotation raced the join; the session itself is fine.
+            case .success, .failure(WDAError.superseded): completion(.alive)
             case .failure:
                 self?.sessionId = nil
                 completion(.needsSession)
@@ -304,11 +330,14 @@ final class WDAClient {
 enum WDAError: LocalizedError {
     case notConnected
     case badResponse(String)
+    /// A rotation or new session made this reply out of date.
+    case superseded
 
     var errorDescription: String? {
         switch self {
         case .notConnected: return "WDA not connected"
         case .badResponse(let s): return "WDA bad response: \(s)"
+        case .superseded: return "WDA reply out of date (display or session changed)"
         }
     }
 }

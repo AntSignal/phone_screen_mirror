@@ -513,8 +513,9 @@ distribute the notarized DMG directly.
   Apple's private wire protocols, so a new iOS major version can break the chain
   until those projects catch up. Pinned versions in
   [SECURITY-AUDIT.md](SECURITY-AUDIT.md) are what's actually tested.
-- **Landscape** adapts via WDA `window/size` (refreshed each poll) but hasn't been
-  physically rotation-tested.
+- **Landscape** adapts via WDA `window/size` (refreshed each poll, and at once
+  when the video changes shape; the video follows the rotation through WDA's
+  `mjpegFixOrientation`) but hasn't been physically rotation-tested.
 - Relaunching the app in quick succession can still briefly wedge the device's
   `testmanagerd`. Recovery now escalates in stages: a readiness-deadline
   auto-restart of the runner, then a chain restart, then a tunnel restart, then
