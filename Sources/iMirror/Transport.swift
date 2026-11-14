@@ -88,6 +88,14 @@ final class ManagedProcess {
     /// Called on any queue after every spawn, respawns included. Set it
     /// before start(). A runner or tunnel start resets the phone's USB.
     var onSpawn: (() -> Void)?
+    /// Called on any queue with each batch of whole output lines (stdout
+    /// and stderr together). Set it before start().
+    var onLines: (([String]) -> Void)?
+    /// Asked on any queue: is the child waiting on a person? Then it is
+    /// never readiness-killed and respawns at a steady pace (PasscodeHold).
+    var holdCheck: (() -> Bool)?
+    // The last 16 KB of output, for diagnosis. Guarded by `lock`.
+    private var output = OutputRing()
 
     // Readiness deadline: a wedged `runwda` never exits, so the exit-triggered
     // respawn above never fires for it. If a readiness check is supplied, poll it
@@ -124,6 +132,12 @@ final class ManagedProcess {
     private var isStopped: Bool {
         lock.lock(); defer { lock.unlock() }
         return stopped
+    }
+
+    /// The child's recent output, newest last.
+    var recentOutput: String {
+        lock.lock(); defer { lock.unlock() }
+        return output.text
     }
 
     /// The pid of the currently running spawn, if any. Test-only introspection.
@@ -199,9 +213,11 @@ final class ManagedProcess {
             // sleep between polls can't skew the elapsed time and trigger a
             // spurious kill right after wake.
             let uptime = ProcessInfo.processInfo.systemUptime - start
+            let held = self.holdCheck?() ?? false
             self.lock.lock()
             let shouldKill = self.generation == myGeneration && !self.stopped
-                && managedProcessShouldKillForUnreadiness(uptime: uptime, readySeen: self.readySeen, readyWithin: self.readyWithin)
+                && managedProcessShouldKillForUnreadiness(uptime: uptime, readySeen: self.readySeen,
+                                                          readyWithin: self.readyWithin, held: held)
             if shouldKill { self.killedUnready = true }
             self.lock.unlock()
 
@@ -221,18 +237,31 @@ final class ManagedProcess {
         // go-ios writes selfIdentity.plist + pair records into its cwd; the app's
         // default cwd is "/" (read-only), so point it at a writable dir.
         p.currentDirectoryURL = workDir
-        // Child output is discarded by default. Set IMIRROR_DEBUG=1 to capture it
-        // to <workDir>/<label>.log (truncated per spawn, so it stays bounded).
+        // Output goes to a bounded ring (it used to go to /dev/null, which
+        // hid why runwda failed). IMIRROR_DEBUG=1 also copies it to
+        // <workDir>/<label>.log, truncated per spawn.
+        var debugFile: FileHandle?
         if ProcessInfo.processInfo.environment["IMIRROR_DEBUG"] != nil {
             let logURL = workDir.appendingPathComponent("\(label).log")
             FileManager.default.createFile(atPath: logURL.path, contents: nil)
-            if let fh = try? FileHandle(forWritingTo: logURL) {
-                p.standardOutput = fh
-                p.standardError = fh
+            debugFile = try? FileHandle(forWritingTo: logURL)
+        }
+        let pipe = Pipe()
+        p.standardOutput = pipe
+        p.standardError = pipe
+        pipe.fileHandleForReading.readabilityHandler = { [weak self] h in
+            let chunk = h.availableData
+            guard !chunk.isEmpty else {                 // EOF: the child is gone
+                h.readabilityHandler = nil
+                try? debugFile?.close()
+                return
             }
-        } else {
-            p.standardOutput = FileHandle.nullDevice
-            p.standardError = FileHandle.nullDevice
+            try? debugFile?.write(contentsOf: chunk)
+            guard let self else { return }
+            self.lock.lock()
+            let lines = self.output.append(chunk)
+            self.lock.unlock()
+            if !lines.isEmpty { self.onLines?(lines) }
         }
         p.terminationHandler = { [weak self] _ in
             guard let self else { return }
@@ -243,7 +272,10 @@ final class ManagedProcess {
             let ranFor = self.spawnedAt.map { ProcessInfo.processInfo.systemUptime - $0 } ?? 0
             let wasKilledUnready = self.killedUnready
             self.killedUnready = false
-            if wasKilledUnready {
+            let held = self.holdCheck?() ?? false
+            if held {
+                // Waiting on a person is not a failed launch.
+            } else if wasKilledUnready {
                 // A readiness-deadline kill is a failed launch no matter how long
                 // the wedged process happened to sit there — it never actually
                 // served WDA, so it must NOT reset the streak like a healthy exit
@@ -262,8 +294,8 @@ final class ManagedProcess {
             // retrying at the cap — a later replug still recovers on its own —
             // but fire onGaveUp exactly once when we cross the threshold so the
             // app can surface a terminal-looking state instead of silent looping.
-            let delay = min(self.restartDelay * pow(2.0, Double(max(0, failures - 1))), 60)
-            if failures == self.maxQuickFailures {
+            let delay = managedProcessRespawnDelay(base: self.restartDelay, failures: failures, held: held)
+            if !held, failures == self.maxQuickFailures {
                 NSLog("iMirror: \(self.label) failed \(failures)x — backing off to "
                       + "\(Int(delay))s (device/OS may not support WDA, or phone is unplugged)")
                 self.onGaveUp?(self.label)

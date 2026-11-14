@@ -25,11 +25,16 @@ public enum DeviceReason: String, CaseIterable, Sendable {
     case recovering
     /// First bring-up: WDA has not answered yet.
     case booting
+    /// The phone does not trust this Mac ("Trust This Computer"), or the
+    /// runner's developer (Settings > General > VPN & Device Management).
+    case untrusted
 }
 
 /// What `deviceReason` looks at. The app fills it from its controller.
 public struct DeviceReasonInputs: Equatable, Sendable {
     public var ready: Bool
+    /// What runwda's output says needs a person (RunwdaLog.swift).
+    public var runwda: RunwdaLogClass?
     public var gaveUp: Bool
     public var macAsleep: Bool
     /// A USB reset restarted the chain and WDA has not answered since.
@@ -39,9 +44,9 @@ public struct DeviceReasonInputs: Equatable, Sendable {
     public var restarting: Bool
     public var everConnected: Bool
 
-    public init(ready: Bool, gaveUp: Bool = false, macAsleep: Bool = false, usbReset: Bool = false,
+    public init(ready: Bool, runwda: RunwdaLogClass? = nil, gaveUp: Bool = false, macAsleep: Bool = false, usbReset: Bool = false,
                 tunnelHasDevice: Bool = true, restarting: Bool = false, everConnected: Bool = false) {
-        self.ready = ready; self.gaveUp = gaveUp; self.macAsleep = macAsleep
+        self.ready = ready; self.runwda = runwda; self.gaveUp = gaveUp; self.macAsleep = macAsleep
         self.usbReset = usbReset; self.tunnelHasDevice = tunnelHasDevice
         self.restarting = restarting; self.everConnected = everConnected
     }
@@ -51,6 +56,7 @@ public struct DeviceReasonInputs: Equatable, Sendable {
 /// client can act on, or wait out, comes before the generic ones.
 public func deviceReason(_ i: DeviceReasonInputs) -> DeviceReason? {
     if i.ready { return nil }
+    if let r = i.runwda { return r.reason }   // a person can fix it now
     if i.gaveUp { return .gaveUp }
     if i.macAsleep { return .macAsleep }
     if i.usbReset { return .usbReset }

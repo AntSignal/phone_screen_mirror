@@ -37,6 +37,8 @@ final class DeviceController {
     /// Set by the sleep/wake hooks (B1d); published as mac_asleep.
     var macAsleep = false { didSet { if macAsleep != oldValue { onChange?() } } }
     private var published = PublishedState()
+    /// What runwda last said needs a person; cleared once WDA answers.
+    private(set) var runwdaClass: RunwdaLogClass?
     private var lastDetachEventAt: TimeInterval?
     private(set) var ladder = ChainLadderState()
     private var resetWatch = USBResetWatch()
@@ -81,6 +83,7 @@ final class DeviceController {
         }
         chain?.onRunnerInstall = { [weak self] event in self?.runnerInstall(event) }
         chain?.onOwnUSBChange = { [weak self] in self?.noteOwnUSBChange() }
+        chain?.onRunwdaLog = { [weak self] cls, err in self?.runwdaSaid(cls, err) }
         chain?.onWDAUnrecoverable = { [weak self] in
             guard let self, self.running, self.health == .down else { return }
             self.unrecoverable = true
@@ -128,6 +131,7 @@ final class DeviceController {
     func userRetry() {
         guard ladder.hardStopped else { probeNow(); return }
         log(.restart, detail: "user retry")
+        forgetRunwdaClass()
         ladder.forceRetry(now: ProcessInfo.processInfo.systemUptime)
         unrecoverable = false
         status("Retrying WebDriverAgent on \(alias)…")
@@ -137,6 +141,7 @@ final class DeviceController {
     /// Settings → Restart: this phone's chain only.
     func restartChain() {
         log(.restart, detail: "user restart")
+        forgetRunwdaClass()
         ladder.forceRetry(now: ProcessInfo.processInfo.systemUptime)
         unrecoverable = false
         status("Restarting \(alias)'s connection…")
@@ -205,7 +210,7 @@ final class DeviceController {
 
     var reason: DeviceReason? {
         deviceReason(DeviceReasonInputs(
-            ready: registryState == .ready, gaveUp: ladder.hardStopped, macAsleep: macAsleep,
+            ready: registryState == .ready, runwda: runwdaClass, gaveUp: ladder.hardStopped, macAsleep: macAsleep,
             usbReset: usbResetPending, tunnelHasDevice: chain == nil || tunnelHasDevice(),
             restarting: ladder.stage >= 1, everConnected: ladder.hadSuccessfulConnection))
     }
@@ -300,6 +305,7 @@ final class DeviceController {
             ladder.onConnected()
             unrecoverable = false
             usbResetPending = false
+            forgetRunwdaClass()
             // Recovered: "won't start… retrying" would now be a lie.
             if old != .connected { detail = nil; lastError = nil }
         case .connecting:
@@ -317,7 +323,8 @@ final class DeviceController {
     private func runWatchdog() {
         guard chain != nil, health == .down else { return }
         let action = ladder.tick(now: ProcessInfo.processInfo.systemUptime,
-                                 othersHealthy: othersHealthy(), tunnelHasDevice: tunnelHasDevice())
+                                 othersHealthy: othersHealthy(), tunnelHasDevice: tunnelHasDevice(),
+                                 held: chain?.passcodeHeld ?? false)
         switch action {
         case .wait:
             break
@@ -359,6 +366,35 @@ final class DeviceController {
     private func restartOwnOrTunnel(tunnelAllowed: Bool = true) {
         if tunnelHasDevice() || !tunnelAllowed || !requestTunnelRestart() { chain?.restart() }
         onChange?()
+    }
+
+    /// runwda's output named a cause and/or an error (DeviceChain.runwdaSaid).
+    private func runwdaSaid(_ cls: RunwdaLogClass?, _ err: String?) {
+        guard running else { return }
+        if let err { lastError = err }
+        if let cls, cls != runwdaClass, health != .connected {
+            runwdaClass = cls
+            status(Self.runwdaMessage(cls, alias: alias))
+        }
+        onChange?()
+    }
+
+    private func forgetRunwdaClass() {
+        runwdaClass = nil
+        chain?.clearPasscodeHold()
+    }
+
+    static func runwdaMessage(_ cls: RunwdaLogClass, alias: String) -> String {
+        switch cls {
+        case .needsPasscode:
+            return "\(alias) is asking for its passcode to allow UI Automation — enter it on the "
+                 + "phone. WebDriverAgent starts by itself once it is answered."
+        case .locked:
+            return "\(alias) is locked — unlock it and WebDriverAgent comes back by itself."
+        case .untrusted:
+            return "\(alias) doesn't trust this Mac or WebDriverAgent's developer — tap Trust on the "
+                 + "phone, or trust it in Settings ▸ General ▸ VPN & Device Management."
+        }
     }
 
     private func runnerInstall(_ event: RunnerInstallEvent) {
