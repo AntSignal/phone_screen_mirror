@@ -12,7 +12,7 @@
 # Pure Apple toolchain (swift, codec/codesign, /bin). No third-party tools.
 set -euo pipefail
 
-# -P: the running app's path is the physical one, so compare that.
+# -P: running apps report physical paths; compare those.
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd -P)"
 cd "$ROOT"
 source "$ROOT/scripts/lib/imirror-procs.sh"
@@ -30,7 +30,7 @@ for arg in "$@"; do
 done
 
 APP="$ROOT/build/iMirror.app"
-# Refuse before a long build; quit only once the build has worked.
+# Refuse before building; quit only after a good build.
 imirror_guard_bundle "$APP" "$RESTART" || exit 1
 
 echo "==> swift build ($CONFIG)"

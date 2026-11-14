@@ -69,7 +69,7 @@ if [ -f "$STATE/owner-follows" ]; then
     printf "{\n  \"owner_pid\" : %s,\n  \"schema\" : 1\n}\n" "$pid" > "$T/devices.json"
 fi'
 
-# Refuse to run at all unless every dangerous tool resolves to a stub.
+# Run nothing unless every risky tool resolves to its stub.
 for tool in ps open osascript swift codesign lipo security hdiutil; do
     if [[ "$(PATH="$TEST_PATH" command -v "$tool")" != "$STUBS/$tool" ]]; then
         echo "FATAL: $tool does not resolve to its stub; not running anything" >&2
@@ -97,7 +97,7 @@ fake_app() {
     echo "$pid"
 }
 
-old_bundle() {   # a built bundle with a marker the scripts must not delete
+old_bundle() {   # a bundle with a marker that must survive
     mkdir -p "$APP/Contents/MacOS"
     echo old > "$APP/marker"
 }

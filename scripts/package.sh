@@ -20,7 +20,7 @@
 #   xcrun notarytool store-credentials imirror \
 #       --apple-id you@example.com --team-id HOMEKARETEAMID --password <app-specific-pw>
 set -euo pipefail
-# -P: the running app's path is the physical one, so compare that.
+# -P: running apps report physical paths; compare those.
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd -P)"
 cd "$ROOT"
 source "$ROOT/scripts/lib/imirror-procs.sh"
@@ -38,7 +38,7 @@ APP="$ROOT/build/iMirror.app"
 DMG="$ROOT/build/iMirror.dmg"
 ENT="$ROOT/Resources/iMirror.entitlements"
 
-# Same bundle as run.sh: refuse to delete it under a running app.
+# Like run.sh: never delete the bundle under a running app.
 imirror_guard_bundle "$APP" "$RESTART" || exit 1
 
 echo "==> swift build (release, universal2: arm64 + x86_64)"
@@ -137,7 +137,7 @@ else
     SIGNED=0
 fi
 
-# Put back the app --restart quit, before the slow DMG and notary steps.
+# Relaunch what --restart quit, before the slow DMG steps.
 if [[ -n "$IMIRROR_STOPPED_PIDS" ]]; then
     echo "==> relaunching"
     imirror_launch_bundle "$APP" || exit 1

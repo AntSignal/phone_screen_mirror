@@ -85,7 +85,7 @@ imirror_stop_bundle() {
 # (default 30) bounds the wait.
 imirror_launch_bundle() {
     local app="$1" limit="${IMIRROR_OWNER_TIMEOUT_S:-30}" new="" owner=""
-    # -n: never activate a same-bundle-id app running from another path.
+    # -n: never activate a same-bundle-id app elsewhere.
     open -n "$app"
     local deadline=$((SECONDS + limit))
     while (( SECONDS < deadline )); do
