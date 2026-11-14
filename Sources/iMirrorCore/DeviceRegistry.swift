@@ -8,6 +8,9 @@ import Foundation
 // same golden file, mcp-server/testdata/devices.sample.json: Swift encodes it
 // byte-for-byte, Python decodes it — so a key renamed on one side fails a test
 // on the other instead of silently dropping a phone.
+//
+// Keys added since schema 1 are optional and additive, so the schema stays 1
+// and older readers ignore what they do not know.
 
 /// One phone (or the Simulator) the app is running WebDriverAgent on.
 public struct RegisteredDevice: Codable, Equatable, Sendable {
@@ -32,48 +35,72 @@ public struct RegisteredDevice: Codable, Equatable, Sendable {
     public var mjpegPort: Int?
     public var state: State
     public var detail: String?
+    /// Why the device is not ready: a `DeviceReason` raw value. A String so
+    /// a reader never fails on a reason a newer app adds.
+    public var reason: String?
+    /// When `state` or `reason` last changed (UTC ISO-8601).
+    public var stateSince: String?
+    /// Goes up by one each time this phone's chain starts.
+    public var chainEpoch: Int?
+    /// The last error worth showing, short and secret-free.
+    public var lastError: String?
+    /// When a given-up phone retries by itself (UTC ISO-8601).
+    public var nextRetryAt: String?
 
     public init(udid: String, alias: String, kind: Kind, productType: String? = nil,
                 iosVersion: String? = nil, connection: String? = nil, slot: Int? = nil,
-                wdaURL: String, mjpegPort: Int? = nil, state: State, detail: String? = nil) {
+                wdaURL: String, mjpegPort: Int? = nil, state: State, detail: String? = nil,
+                reason: String? = nil, stateSince: String? = nil, chainEpoch: Int? = nil,
+                lastError: String? = nil, nextRetryAt: String? = nil) {
         self.udid = udid; self.alias = alias; self.kind = kind
         self.productType = productType; self.iosVersion = iosVersion
         self.connection = connection; self.slot = slot; self.wdaURL = wdaURL
         self.mjpegPort = mjpegPort; self.state = state; self.detail = detail
+        self.reason = reason; self.stateSince = stateSince; self.chainEpoch = chainEpoch
+        self.lastError = lastError; self.nextRetryAt = nextRetryAt
     }
 
     enum CodingKeys: String, CodingKey {
-        case udid, alias, kind, connection, slot, state, detail
+        case udid, alias, kind, connection, slot, state, detail, reason
         case productType = "product_type"
         case iosVersion = "ios_version"
         case wdaURL = "wda_url"
         case mjpegPort = "mjpeg_port"
+        case stateSince = "state_since"
+        case chainEpoch = "chain_epoch"
+        case lastError = "last_error"
+        case nextRetryAt = "next_retry_at"
     }
 }
 
 /// The whole file. `ownerPid` lets a reader tell a live list from one a
 /// crashed app left behind: the MCP server ignores the file unless that
-/// process is alive.
+/// process is alive. `ownerUniqueID` (the kernel's p_uniqueid, never reused
+/// within a boot) also catches a pid the system has handed to someone else.
 public struct DeviceRegistryFile: Codable, Equatable, Sendable {
     public static let schemaVersion = 1
 
     public var schema: Int
     public var ownerPid: Int32
+    public var ownerUniqueID: UInt64?
     public var appVersion: String
     public var updatedAt: String
     /// The go-ios binary the app drives, so `ios_install_app` uses the same one.
     public var goios: String?
     public var devices: [RegisteredDevice]
 
-    public init(ownerPid: Int32, appVersion: String, updatedAt: String, goios: String?,
-                devices: [RegisteredDevice], schema: Int = DeviceRegistryFile.schemaVersion) {
-        self.schema = schema; self.ownerPid = ownerPid; self.appVersion = appVersion
-        self.updatedAt = updatedAt; self.goios = goios; self.devices = devices
+    public init(ownerPid: Int32, ownerUniqueID: UInt64? = nil, appVersion: String, updatedAt: String,
+                goios: String?, devices: [RegisteredDevice],
+                schema: Int = DeviceRegistryFile.schemaVersion) {
+        self.schema = schema; self.ownerPid = ownerPid; self.ownerUniqueID = ownerUniqueID
+        self.appVersion = appVersion; self.updatedAt = updatedAt; self.goios = goios
+        self.devices = devices
     }
 
     enum CodingKeys: String, CodingKey {
         case schema, goios, devices
         case ownerPid = "owner_pid"
+        case ownerUniqueID = "owner_uniqueid"
         case appVersion = "app_version"
         case updatedAt = "updated_at"
     }

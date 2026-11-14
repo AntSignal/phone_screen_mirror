@@ -30,6 +30,14 @@ final class DeviceController {
     private(set) var unrecoverable = false
     /// The last thing worth telling a user about this phone.
     private(set) var detail: String?
+    /// The last error worth publishing (devices.json last_error).
+    private(set) var lastError: String?
+    /// A USB reset restarted the chain and WDA has not answered since.
+    private var usbResetPending = false
+    /// Set by the sleep/wake hooks (B1d); published as mac_asleep.
+    var macAsleep = false { didSet { if macAsleep != oldValue { onChange?() } } }
+    private var published = PublishedState()
+    private var lastDetachEventAt: TimeInterval?
     private(set) var ladder = ChainLadderState()
     private var resetWatch = USBResetWatch()
     private var strikes = ProbeStrikes()
@@ -119,6 +127,7 @@ final class DeviceController {
     /// user asking to retry, which re-arms the ladder.
     func userRetry() {
         guard ladder.hardStopped else { probeNow(); return }
+        log(.restart, detail: "user retry")
         ladder.forceRetry(now: ProcessInfo.processInfo.systemUptime)
         unrecoverable = false
         status("Retrying WebDriverAgent on \(alias)…")
@@ -127,6 +136,7 @@ final class DeviceController {
 
     /// Settings → Restart: this phone's chain only.
     func restartChain() {
+        log(.restart, detail: "user restart")
         ladder.forceRetry(now: ProcessInfo.processInfo.systemUptime)
         unrecoverable = false
         status("Restarting \(alias)'s connection…")
@@ -146,9 +156,13 @@ final class DeviceController {
     /// IOKit or the poll saw the phone leave USB.
     func usbDetached() {
         guard running, chain != nil else { return }
-        if resetWatch.onDetached(now: ProcessInfo.processInfo.systemUptime) {
-            NSLog("iMirror: \(alias) left USB — checking WebDriverAgent once it is back")
-        }
+        let now = ProcessInfo.processInfo.systemUptime
+        let suspect = resetWatch.onDetached(now: now)
+        // IOKit and the poll both see one reset.
+        if let last = lastDetachEventAt, now - last < 5 { return }
+        lastDetachEventAt = now
+        // Ignored: we caused it, or WDA was not up.
+        log(suspect ? .usbReset : .usbResetIgnored, expected: EventLog.shared.resetIsExpected(udid: udid))
     }
 
     /// The phone is back. If its reset is suspect, probe soon: the probe
@@ -161,6 +175,8 @@ final class DeviceController {
 
     /// A reset killed WDA: rebuild now instead of waiting out the ladder's grace.
     private func restartAfterUSBReset() {
+        log(.restart, reason: .usbReset, expected: EventLog.shared.resetIsExpected(udid: udid))
+        usbResetPending = true
         ladder.noteOutsideRestart()             // a fresh chain needs 90 s to boot
         status("\(alias)'s USB connection reset — reconnecting…")
         chain?.restart()
@@ -170,6 +186,7 @@ final class DeviceController {
     /// The shared tunnel was just restarted for everyone: this chain was
     /// rebuilt too, so a give-up here no longer holds.
     func tunnelRestarted() {
+        log(.restart, detail: "shared tunnel restarted")
         if ladder.hardStopped { ladder.forceRetry(now: ProcessInfo.processInfo.systemUptime) }
     }
 
@@ -184,6 +201,42 @@ final class DeviceController {
         case .connecting: return .starting
         case .down: return ladder.hadSuccessfulConnection ? .down : .starting
         }
+    }
+
+    var reason: DeviceReason? {
+        deviceReason(DeviceReasonInputs(
+            ready: registryState == .ready, gaveUp: ladder.hardStopped, macAsleep: macAsleep,
+            usbReset: usbResetPending, tunnelHasDevice: chain == nil || tunnelHasDevice(),
+            restarting: ladder.stage >= 1, everConnected: ladder.hadSuccessfulConnection))
+    }
+
+    /// This phone's devices.json entry. Logs a state event when the state
+    /// or reason moved since the last write.
+    func registryEntry(now: Date) -> RegisteredDevice {
+        let state = registryState, why = reason
+        if let change = published.update(state: state, reason: why, now: now) {
+            log(.state, from: change.from?.rawValue, to: state.rawValue, reason: why,
+                detail: state == .ready ? nil : detail)
+        }
+        let retryAt = ladder.nextAutoRetryAt.map {
+            DeviceRegistryCodec.timestamp(now.addingTimeInterval($0 - ProcessInfo.processInfo.systemUptime))
+        }
+        return RegisteredDevice(
+            udid: udid, alias: alias, kind: .device, productType: attached.productType,
+            iosVersion: attached.productVersion, connection: attached.connection, slot: slot.index,
+            wdaURL: slot.relayURL, mjpegPort: Int(slot.mjpegPort), state: state, detail: detail,
+            reason: why?.rawValue, stateSince: published.since.map(DeviceRegistryCodec.timestamp),
+            chainEpoch: chain?.epoch, lastError: lastError, nextRetryAt: retryAt)
+    }
+
+    /// Mac-wide sleep or wake, logged per phone so every line has one.
+    func logPower(_ kind: DeviceEventKind) { log(kind) }
+
+    private func log(_ kind: DeviceEventKind, from: String? = nil, to: String? = nil,
+                     reason: DeviceReason? = nil, detail: String? = nil, expected: Bool? = nil) {
+        EventLog.shared.write(DeviceEvent(at: Date(), udid: udid, alias: alias, event: kind,
+                                          from: from, to: to, reason: reason?.rawValue,
+                                          detail: detail, expected: expected))
     }
 
     // MARK: Health probe + recovery ladder
@@ -246,6 +299,9 @@ final class DeviceController {
         case .connected:
             ladder.onConnected()
             unrecoverable = false
+            usbResetPending = false
+            // Recovered: "won't start… retrying" would now be a lie.
+            if old != .connected { detail = nil; lastError = nil }
         case .connecting:
             break
         case .down:
@@ -266,6 +322,7 @@ final class DeviceController {
         case .wait:
             break
         case .autoRetry:
+            log(.autoRetry, detail: "after give-up \(ladder.giveUps)")
             unrecoverable = false
             status("Retrying WebDriverAgent on \(alias)…")
             restartOwnOrTunnel(tunnelAllowed: ChainLadderState.retryMayRestartTunnel(
@@ -274,18 +331,25 @@ final class DeviceController {
             // Don't reseed the clock here: onRunwdaStarted does once the new
             // runwda spawns, and a chain that never gets that far still ages
             // toward the next stage instead of sitting on .wait forever.
+            log(.restart, detail: "ladder: this phone's chain")
             status("WebDriverAgent on \(alias) is taking longer than usual — restarting its connection…")
             chain?.restart()
+            onChange?()
         case .restartTunnelAndChains:
             status("WebDriverAgent on \(alias) is taking longer than usual — resetting the USB connection…")
             // The tunnel was just restarted: restart this phone's chain instead.
-            if !requestTunnelRestart() { chain?.restart() }
+            if !requestTunnelRestart() {
+                log(.restart, detail: "ladder: tunnel busy, this phone's chain")
+                chain?.restart()
+            }
+            onChange?()
         case .giveUp:
             // Stop the children outright, or runwda keeps respawning (and being
             // killed by its readiness deadline) forever after a give-up. The
             // relay stays up, so a retry can bring the chain back.
             chain?.stopChildren()
             let wait = Int(ChainLadderState.autoRetryDelay(afterGiveUps: ladder.giveUps) / 60)
+            log(.giveUp, reason: .gaveUp, detail: "retrying in \(wait) min")
             status("WebDriverAgent won't start on \(alias). Retrying in \(wait) min — "
                  + "or tap WDA to retry now.")
             onChange?()
@@ -314,6 +378,7 @@ final class DeviceController {
             case .alreadyPresent, .noBundle:
                 break                           // normal boot; the probe takes over
             case .failed(let err):
+                if case .other(let raw) = err { lastError = String(raw.prefix(200)) }
                 setHealth(.down)
                 status(Self.installFailureMessage(err, alias: alias))
             }

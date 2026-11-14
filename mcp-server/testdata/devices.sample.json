@@ -15,14 +15,17 @@
     },
     {
       "alias" : "phone2",
+      "chain_epoch" : 1,
       "connection" : "USB",
       "detail" : "waiting for WebDriverAgent",
       "ios_version" : "26.6",
       "kind" : "device",
       "mjpeg_port" : 9120,
       "product_type" : "iPhone18,3",
+      "reason" : "booting",
       "slot" : 1,
       "state" : "starting",
+      "state_since" : "2026-09-28T21:29:40Z",
       "udid" : "00008150-001928E01404401C",
       "wda_url" : "http://127.0.0.1:8110"
     },

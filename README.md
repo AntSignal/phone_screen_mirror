@@ -266,6 +266,43 @@ clients work). The loopback relay normalises the connection, keeping the USB
 transport and loopback-only security. If the bundled go-ios is ever missing,
 `scripts/wda-up.sh` + `scripts/wda_relay.py` are a manual fallback.
 
+## Files other tools read
+
+All live in `~/Library/Application Support/iMirror/` (with
+`IMIRROR_DEVICES_FILE` set, next to that file instead). None of them ever holds
+a secret.
+
+**`devices.json`** — every phone and Simulator the app drives, rewritten
+atomically on each change (format: `Sources/iMirrorCore/DeviceRegistry.swift`).
+Top level: `schema` (1), `owner_pid`, `owner_uniqueid` (the app's kernel
+`p_uniqueid`, never reused within a boot: a reader that finds a live `owner_pid`
+with a different uniqueid knows the file is stale), `app_version`, `updated_at`,
+`goios`, `devices`. Each device has `udid`, `alias`, `kind`, `wda_url`, `state`
+(`starting|installing|ready|down|failed`), `detail`, and:
+
+| key | meaning |
+|---|---|
+| `reason` | absent/null when ready; else one of `usb_reset`, `wda_wedged`, `needs_passcode`, `locked`, `tunnel_down`, `mac_asleep`, `gave_up`, `recovering`, `booting`. Accept values you don't know. |
+| `state_since` | UTC ISO-8601: when `state` or `reason` last changed |
+| `chain_epoch` | +1 each time the phone's chain (runwda + forwards) starts |
+| `last_error` | short, or absent |
+| `next_retry_at` | UTC ISO-8601 while the ladder has given up: when it retries by itself |
+
+**`events.jsonl`** — one JSON object per line, appended; at 5 MB it moves to
+`events.jsonl.1` (one old file kept). Keys: `ts` (UTC ISO-8601 with ms),
+`udid`, `alias`, `event`, and optionally `from`, `to`, `reason`, `detail`,
+`expected` (bool). `event` is one of `state` (`from`/`to` are states),
+`restart`, `give_up`, `auto_retry`, `usb_reset` (a reset the app is checking),
+`usb_reset_ignored` (its own start/stop did it, or WDA was not up), `request`,
+`wake`, `sleep`, `passcode`. The same lines go to the unified log, subsystem
+`com.local.imirror`, category `events`, in the clear.
+
+**`expected-resets/<udid>.json`** — written by a client, not the app. Before
+`devicectl device install|launch`, write `{"until": <now + 90 s, ISO-8601>,
+"by": "devicectl install"}`. A USB reset of that phone before `until` is logged
+with `"expected": true`. Recovery still runs as usual; the note only stops the
+reset reading as a fault. A note more than 10 min ahead is ignored.
+
 ## Dependency security policy
 
 Supply-chain risk is treated as a first-class constraint:
