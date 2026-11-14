@@ -465,6 +465,9 @@ final class DeviceController {
                 setHealth(.down)
                 status(Self.installFailureMessage(err, alias: alias))
             }
+        case .abandoned:
+            // The chain restarted mid-install; the new bring-up checks again.
+            installingRunner = false
         }
         onChange?()
     }
