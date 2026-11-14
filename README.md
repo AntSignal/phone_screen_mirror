@@ -321,6 +321,17 @@ like Settings → Restart: this phone's chain only, never the shared tunnel. It
 never types a passcode. While the phone shows `needs_passcode`, don't send one:
 a new runner raises the sheet again.
 
+**`scripts/imirror-ctl`** reads and writes these files (system `python3`, no
+dependencies). `device` is an alias, a UDID, or a unique UDID prefix/suffix of
+4+ characters, as in the MCP server.
+
+```bash
+scripts/imirror-ctl status                 # every phone: state, reason, since, epoch
+scripts/imirror-ctl status phone2 -n 20    # one phone, with its last 20 events
+scripts/imirror-ctl restart phone2         # exit 0 accepted, 3 cooldown, 4 timeout
+scripts/imirror-ctl events --device phone2 --since 1h
+```
+
 ## Dependency security policy
 
 Supply-chain risk is treated as a first-class constraint:
