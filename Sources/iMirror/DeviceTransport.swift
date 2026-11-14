@@ -197,6 +197,9 @@ final class DeviceChain {
     private var forward: ManagedProcess?
     private var mjpegForward: ManagedProcess?
     private var relayUp = false
+    /// Goes up each time the chain starts (devices.json chain_epoch), so a
+    /// client can tell "same WDA, slow" from "rebuilt under me".
+    private(set) var epoch = 0
 
     private let readinessSession: URLSession = {
         let cfg = URLSessionConfiguration.ephemeral
@@ -245,6 +248,7 @@ final class DeviceChain {
             catch { NSLog("iMirror: relay :\(slot.relayPort) failed: \(error.localizedDescription)") }
         }
         generation += 1
+        epoch += 1
         onOwnUSBChange?()
         bringUp(generation: generation)
     }
@@ -269,6 +273,7 @@ final class DeviceChain {
     func restart() {
         NSLog("iMirror: restarting chain for \(udid)")
         stopChildren()
+        epoch += 1
         let gen = generation
         let pattern = GoIOS.sweepPattern(bin: bin.path, udid: udid)
         DispatchQueue.global().asyncAfter(deadline: .now() + 4) { [weak self] in

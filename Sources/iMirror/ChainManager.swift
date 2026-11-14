@@ -11,6 +11,7 @@
 //
 // Main thread only.
 
+import AppKit
 import Darwin
 import Foundation
 import iMirrorCore
@@ -69,6 +70,19 @@ final class ChainManager {
         // Tunnel starts reset every phone's USB; those resets are ours.
         tunnel?.onSpawn = { [weak self] in
             DispatchQueue.main.async { self?.controllers.forEach { $0.noteOwnUSBChange() } }
+        }
+        watchPower()
+    }
+
+    /// Log Mac sleep and wake per phone. B1d will act on them; for now they
+    /// only explain the outage that follows a lid close.
+    private func watchPower() {
+        let nc = NSWorkspace.shared.notificationCenter
+        nc.addObserver(forName: NSWorkspace.willSleepNotification, object: nil, queue: .main) { [weak self] _ in
+            self?.controllers.forEach { $0.logPower(.sleep) }
+        }
+        nc.addObserver(forName: NSWorkspace.didWakeNotification, object: nil, queue: .main) { [weak self] _ in
+            self?.controllers.forEach { $0.logPower(.wake) }
         }
     }
 
@@ -146,6 +160,8 @@ final class ChainManager {
                 guard let self else { return }
                 self.polling = false
                 guard self.running else { return }
+                // A lost or regained route changes a phone's reason.
+                if tunneled != self.tunnelUDIDs { self.scheduleWrite() }
                 self.tunnelUDIDs = tunneled
                 // A failed `ios list` says nothing about what's attached: never
                 // tear a phone down on it.
@@ -324,16 +340,12 @@ final class ChainManager {
     }
 
     private func snapshot() -> DeviceRegistryFile {
-        var devices = controllers.map { c in
-            RegisteredDevice(udid: c.udid, alias: c.alias, kind: .device,
-                             productType: c.attached.productType, iosVersion: c.attached.productVersion,
-                             connection: c.attached.connection, slot: c.slot.index,
-                             wdaURL: c.slot.relayURL, mjpegPort: Int(c.slot.mjpegPort),
-                             state: c.registryState, detail: c.detail)
-        }
+        let now = Date()
+        var devices = controllers.map { $0.registryEntry(now: now) }
         devices.append(contentsOf: simulatorEntries)
         let version = Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "dev"
-        return DeviceRegistryFile(ownerPid: getpid(), appVersion: version,
+        return DeviceRegistryFile(ownerPid: getpid(), ownerUniqueID: ProcessIdentity.ownUniqueID,
+                                  appVersion: version,
                                   updatedAt: DeviceRegistryCodec.timestamp(Date()),
                                   goios: bin?.path, devices: devices)
     }
