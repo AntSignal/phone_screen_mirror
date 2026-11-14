@@ -168,6 +168,11 @@ restart it once. It never types a passcode.
 
 ## Setup
 
+The app's one-click install (Settings → MCP server) does all of this for you, and
+registers a frozen copy at `~/Library/Application Support/iMirror/mcp/current/`
+rather than this tree (see the main README). The steps below are the manual,
+run-from-the-checkout route, which is what you want while developing the server.
+
 ```bash
 python3 -m venv mcp-server/.venv
 mcp-server/.venv/bin/pip install -r mcp-server/requirements.txt pytest
