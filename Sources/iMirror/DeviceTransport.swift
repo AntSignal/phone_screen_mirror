@@ -195,6 +195,8 @@ final class DeviceChain {
     /// Runs bring-ups and the restart sweep. Tests pass a queue they can
     /// suspend, to land a stop between a step and its callback.
     private let startupQueue: DispatchQueue
+    /// The runner ipa to install. Tests pass their own.
+    private let bundledIPA: URL?
     private let relay: LocalRelay
     private var wda: ManagedProcess?
     private var forward: ManagedProcess?
@@ -267,12 +269,14 @@ final class DeviceChain {
     private var tag: String { String(udid.replacingOccurrences(of: "-", with: "").suffix(6)) }
 
     init(udid: String, slot: PortSlot, bin: URL, workDir: URL,
-         startupQueue: DispatchQueue = .global(qos: .userInitiated)) {
+         startupQueue: DispatchQueue = .global(qos: .userInitiated),
+         bundledIPA: URL? = Bundle.main.url(forResource: "WebDriverAgent", withExtension: "ipa")) {
         self.udid = udid
         self.slot = slot
         self.bin = bin
         self.workDir = workDir
         self.startupQueue = startupQueue
+        self.bundledIPA = bundledIPA
         self.relay = LocalRelay(listen: slot.relayPort, backend: slot.forwardPort)
     }
 
@@ -438,10 +442,13 @@ final class DeviceChain {
     private func installOrUpgradeRunner(generation gen: Int) -> RunnerInstall {
         let emit = { (e: RunnerInstallEvent) in self.emitInstall(e, generation: gen) }
         emit(.checking)
-        guard let ipa = Bundle.main.url(forResource: "WebDriverAgent", withExtension: "ipa") else {
+        guard let ipa = bundledIPA else {
             emit(.done(.noBundle))
             return .noBundle
         }
+        installLock.lock(); defer { installLock.unlock() }
+        // Replaced while waiting: bringUp drops this result anyway.
+        guard generation == gen else { return .alreadyPresent }
         let installed = installedRunnerVersion()
         let bundled = Self.bundledRunnerVersion(ipa: ipa)
         switch runnerAction(installed: installed, bundled: bundled, failedUpgradeTo: failedUpgradeTo) {
@@ -450,14 +457,15 @@ final class DeviceChain {
             return .alreadyPresent
         case .install:
             emit(.installing)
-            let result = installWithRetry(ipa: ipa)
+            let result = installWithRetry(ipa: ipa, generation: gen)
             emit(.done(result))
             return result
         case .upgrade:
             let from = installed ?? "", to = bundled ?? ""
             emit(.upgrading(from: from, to: to))
-            let attempt = installWithRetry(ipa: ipa)
-            if case .failed(let err) = attempt {
+            let attempt = installWithRetry(ipa: ipa, generation: gen)
+            // A replaced bring-up stops retrying early; that is no failure.
+            if case .failed(let err) = attempt, generation == gen {
                 failedUpgradeTo = to
                 emit(.upgradeFailed(kept: from, raw: err.raw))
             }
@@ -467,8 +475,14 @@ final class DeviceChain {
         }
     }
 
+    /// One `ios install` per phone at a time. A restart starts a new
+    /// bring-up while the old one may still be installing; two installs at
+    /// once can fail each other and mark the upgrade failed for good.
+    private let installLock = NSLock()
+
     /// `ios install` with retries: `.installed` or the last `.failed`.
-    private func installWithRetry(ipa: URL) -> RunnerInstall {
+    /// Stops retrying once the chain has moved past generation `gen`.
+    private func installWithRetry(ipa: URL, generation gen: Int) -> RunnerInstall {
         // The tunnel is briefly unusable right after it appears; retry the
         // unrecognised (transient) failures, stop at once on a definite one
         // (not provisioned for this phone, phone locked).
@@ -478,7 +492,9 @@ final class DeviceChain {
             if r.status == 0 { result = .installed; break }
             let cls = classifyInstallError(r.err)
             result = .failed(cls)
-            if case .other = cls, attempt < 7 { Thread.sleep(forTimeInterval: 2); continue }
+            if case .other = cls, attempt < 7, generation == gen {
+                Thread.sleep(forTimeInterval: 2); continue
+            }
             break
         }
         return result
