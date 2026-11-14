@@ -316,10 +316,21 @@ final class LocalRelay {
     private let backendPort: UInt16
     private let queue = DispatchQueue(label: "imirror.relay")
     private var listener: NWListener?
+    // Touched on `queue`; read from main, hence the lock.
+    private let lock = NSLock()
+    private var waiting = InFlightRequests()
+    private var nextConnection = 0
 
     init(listen: UInt16 = 8100, backend: UInt16 = 8101) {
         self.listenPort = listen
         self.backendPort = backend
+    }
+
+    /// Requests waiting on WDA right now. The health probe reads it to tell a
+    /// busy WDA from a dead one.
+    var inFlight: Int {
+        lock.lock(); defer { lock.unlock() }
+        return waiting.count
     }
 
     func start() throws {
@@ -343,22 +354,31 @@ final class LocalRelay {
         let backend = NWConnection(host: "127.0.0.1",
                                    port: NWEndpoint.Port(rawValue: backendPort)!,
                                    using: .tcp)
+        nextConnection += 1                     // only touched on `queue`
+        let id = nextConnection
         client.start(queue: queue)
         backend.start(queue: queue)
-        pump(client, backend)
-        pump(backend, client)
+        pump(client, backend, id: id) { $0.clientSent(id) }
+        pump(backend, client, id: id) { $0.backendSent(id) }
     }
 
-    private func pump(_ from: NWConnection, _ to: NWConnection) {
+    private func track(_ change: (inout InFlightRequests) -> Void) {
+        lock.lock(); change(&waiting); lock.unlock()
+    }
+
+    private func pump(_ from: NWConnection, _ to: NWConnection, id: Int,
+                      onData: @escaping (inout InFlightRequests) -> Void) {
         from.receive(minimumIncompleteLength: 1, maximumLength: 65536) { data, _, isComplete, error in
             if let data, !data.isEmpty {
+                self.track(onData)
                 to.send(content: data, completion: .contentProcessed { _ in })
             }
             if isComplete || error != nil {
+                self.track { $0.closed(id) }
                 from.cancel(); to.cancel()
                 return
             }
-            self.pump(from, to)
+            self.pump(from, to, id: id, onData: onData)
         }
     }
 }

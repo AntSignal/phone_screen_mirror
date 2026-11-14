@@ -297,19 +297,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSToolbarDelegate {
     private var controlEnabled = false
     private var automationEnabled = false
 
-    // MJPEG partial-wedge watchdog (see nextMjpegRecoveryAction in
-    // iMirrorCore): WDA's /status can stay healthy while the MJPEG stream has
-    // silently died, so `health == .connected` alone isn't proof frames are
-    // still arriving.
+    // MJPEG watchdog (see nextMjpegRecoveryAction in iMirrorCore): WDA's
+    // /status can stay healthy while the MJPEG stream has silently died, so
+    // `health == .connected` alone isn't proof frames are still arriving.
     private var mjpegLastFrameAt: TimeInterval?
-    private var mjpegBounced = false
+    /// When the forward was last bounced for this stall; nil after a frame.
+    private var mjpegBouncedAt: TimeInterval?
     private let mjpegNoFrameThresholdSec: TimeInterval = 20
-    /// Counts `.escalate` outcomes for the current connected session, reset
-    /// ONLY when a real frame arrives (not on every `setHealth(.connected)`,
-    /// which fires on every probe tick once connected). Past 2, a chain
-    /// restart clearly isn't bringing the stream back — stop looping and
-    /// surface a terminal state instead of restarting forever.
-    private var mjpegEscalationCount = 0
 
     // MARK: Lifecycle
 
@@ -883,51 +877,34 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSToolbarDelegate {
     /// user explicitly asking the selected phone to retry.
     @objc private func forceProbe() {
         guard let c = selected else { return }
-        if c.ladder.hardStopped {
-            // Give the user's retry its own two-strike video allowance.
-            mjpegEscalationCount = 0
-            mjpegBounced = false
-        }
         c.userRetry()
     }
 
     private func resetMjpegWatchdog() {
         mjpegLastFrameAt = nil
-        mjpegBounced = false
-        mjpegEscalationCount = 0
+        mjpegBouncedAt = nil
     }
 
-    /// MJPEG partial-wedge watchdog, for the phone on screen (only its stream is
-    /// open): WDA's HTTP session can be healthy while the video underneath has
-    /// silently died. Cheapest fix first (bounce that phone's MJPEG forward);
-    /// escalate to restarting that phone's chain only if frames don't return.
+    /// MJPEG watchdog, for the phone on screen (only its stream is open):
+    /// WDA's HTTP side can be healthy while the video underneath has died.
+    /// It only bounces that phone's MJPEG forward, and only while /status
+    /// answers; it never restarts a WDA that agents may be driving.
     private func checkMjpegWatchdog() {
         guard let c = selected, health == .connected, mjpeg != nil, let lastFrame = mjpegLastFrameAt else { return }
-        // With an external WDA there's no chain to bounce; once hard-stopped,
-        // this watchdog goes quiet until the user retries.
-        guard c.chain != nil, !c.ladder.hardStopped else { return }
-        let noFrameFor = ProcessInfo.processInfo.systemUptime - lastFrame
-        switch nextMjpegRecoveryAction(noFrameForSec: noFrameFor, alreadyBounced: mjpegBounced, thresholdSec: mjpegNoFrameThresholdSec) {
+        // With an external WDA there's no chain to bounce.
+        guard c.chain != nil else { return }
+        let now = ProcessInfo.processInfo.systemUptime
+        let noFrameFor = now - lastFrame
+        switch nextMjpegRecoveryAction(noFrameForSec: noFrameFor,
+                                       sinceBounceSec: mjpegBouncedAt.map { now - $0 },
+                                       statusAnswers: c.statusAnswers,
+                                       thresholdSec: mjpegNoFrameThresholdSec) {
         case .wait:
             break
         case .bounceForward:
-            mjpegBounced = true
+            mjpegBouncedAt = now
             NSLog("iMirror: no MJPEG frames from \(c.alias) for \(Int(noFrameFor))s — bouncing its MJPEG forward")
             c.bounceMJPEGForward()
-        case .escalate:
-            mjpegEscalationCount += 1
-            if mjpegEscalationCount >= 2 {
-                // Two restarts with no real frame in between: restarting isn't
-                // fixing this. Stop looping and surface a terminal state.
-                NSLog("iMirror: MJPEG from \(c.alias) still stalled after \(mjpegEscalationCount) restarts — giving up")
-                c.hardStopForStalledVideo()
-                return
-            }
-            // Restart the no-frame clock so this doesn't fire again on the next
-            // tick before health actually flips to .down.
-            mjpegLastFrameAt = ProcessInfo.processInfo.systemUptime
-            mjpegBounced = false
-            c.restartForStalledVideo()
         }
     }
 
@@ -1013,9 +990,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSToolbarDelegate {
             DispatchQueue.main.async {
                 guard let self, self.selectedUDID == udid else { return }
                 self.mjpegLastFrameAt = ProcessInfo.processInfo.systemUptime
-                // A real frame arrived — earlier escalations no longer count
-                // toward the two-strike give-up.
-                self.mjpegEscalationCount = 0
+                self.mjpegBouncedAt = nil       // this stall is over
                 self.lastFrame = cg
                 self.previewView.setFrame(cg)
                 if !self.mirroring {
@@ -1039,7 +1014,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSToolbarDelegate {
         // Seed the no-frame clock at start so the watchdog measures from
         // "stream just opened," not from an already-ancient nil baseline.
         mjpegLastFrameAt = ProcessInfo.processInfo.systemUptime
-        mjpegBounced = false
+        mjpegBouncedAt = nil
         client.start()
     }
 

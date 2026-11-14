@@ -211,9 +211,9 @@ final class DeviceRecoveryTests: XCTestCase {
     }
 
     func testTheLadderTable() {
-        // Stage 0: own chain only when that can't be the tunnel's fault and others are up.
+        // Stage 0: own chain first whenever the tunnel lists the phone.
         XCTAssertEqual(action(stage: 0, others: true, tunnel: true), .restartDeviceChain)
-        XCTAssertEqual(action(stage: 0, others: false, tunnel: true), .restartTunnelAndChains)
+        XCTAssertEqual(action(stage: 0, others: false, tunnel: true), .restartDeviceChain)
         XCTAssertEqual(action(stage: 0, others: true, tunnel: false), .restartTunnelAndChains)
         // Stage 1: the tunnel only if it's implicated or nobody would notice.
         XCTAssertEqual(action(stage: 1, others: true, tunnel: false), .restartTunnelAndChains)
@@ -222,19 +222,22 @@ final class DeviceRecoveryTests: XCTestCase {
         XCTAssertEqual(action(stage: 2, others: false, tunnel: false), .giveUp)
     }
 
-    /// With one phone (never any healthy "others") the new ladder must be the
-    /// old one: one full restart, then give up.
-    func testSinglePhoneMatchesTheSinglePhoneLadder() {
+    /// One phone used to go straight to a tunnel restart, which relaunches
+    /// the runner (and risks its passcode sheet) for nothing when the tunnel
+    /// is fine. Own chain, then tunnel, then a timed pause.
+    func testOnePhoneRestartsItsOwnChainBeforeTheTunnel() {
         var ladder = ChainLadderState()
         ladder.onRunwdaStarted(now: 0)
         XCTAssertEqual(ladder.tick(now: 89, othersHealthy: false, tunnelHasDevice: true), .wait)
-        XCTAssertEqual(ladder.tick(now: 90, othersHealthy: false, tunnelHasDevice: true), .restartTunnelAndChains)
-        XCTAssertEqual(nextChainRecoveryAction(downForSec: 90, stage: 0, graceSec: 90), .restartChain)
+        XCTAssertEqual(ladder.tick(now: 90, othersHealthy: false, tunnelHasDevice: true), .restartDeviceChain)
         ladder.onRunwdaStarted(now: 100)                    // the restarted chain's runwda
         XCTAssertEqual(ladder.tick(now: 189, othersHealthy: false, tunnelHasDevice: true), .wait)
-        XCTAssertEqual(ladder.tick(now: 190, othersHealthy: false, tunnelHasDevice: true), .giveUp)
+        XCTAssertEqual(ladder.tick(now: 190, othersHealthy: false, tunnelHasDevice: true), .restartTunnelAndChains)
+        ladder.onRunwdaStarted(now: 200)
+        XCTAssertEqual(ladder.tick(now: 290, othersHealthy: false, tunnelHasDevice: true), .giveUp)
         XCTAssertTrue(ladder.hardStopped)
-        XCTAssertEqual(ladder.tick(now: 999, othersHealthy: false, tunnelHasDevice: true), .wait)
+        XCTAssertEqual(ladder.tick(now: 409, othersHealthy: false, tunnelHasDevice: true), .wait)
+        XCTAssertEqual(ladder.tick(now: 410, othersHealthy: false, tunnelHasDevice: true), .autoRetry)
     }
 
     func testMidSessionOutageUsesTheShortGraceAndStartsOnDown() {
@@ -282,48 +285,95 @@ final class DeviceRecoveryTests: XCTestCase {
         ladder.hardStop(now: 5)
         ladder.forceRetry(now: 10)
         XCTAssertFalse(ladder.hardStopped)
-        XCTAssertEqual(ladder.stage, 0)
+        XCTAssertNil(ladder.nextAutoRetryAt)
+        // The retry was stage 0, so 90 s of grace.
+        XCTAssertEqual(ladder.stage, 1)
         XCTAssertEqual(ladder.wedgeSince, 10)
     }
 
     /// The 16e's USB resets mid-session. Giving up must not need a human:
-    /// a phone that has worked retries by itself, again after each give-up.
-    func testAPhoneThatWorkedRetriesAfterGivingUp() {
+    /// it retries by itself after 2 min, then 5 min, then every 10 min.
+    func testGiveUpBacksOffTwoThenFiveThenTenMinutes() {
         var ladder = ChainLadderState()
         ladder.onRunwdaStarted(now: 0)
         ladder.onConnected()
         ladder.onDown(now: 100)
-        XCTAssertEqual(ladder.tick(now: 130, othersHealthy: false, tunnelHasDevice: true), .restartTunnelAndChains)
-        XCTAssertEqual(ladder.tick(now: 220, othersHealthy: false, tunnelHasDevice: true), .giveUp)
-        XCTAssertTrue(ladder.hardStopped)
-        XCTAssertEqual(ladder.tick(now: 339, othersHealthy: false, tunnelHasDevice: true), .wait)
-        XCTAssertEqual(ladder.tick(now: 340, othersHealthy: false, tunnelHasDevice: true), .restartDeviceChain)
+        XCTAssertEqual(ladder.tick(now: 130, othersHealthy: false, tunnelHasDevice: true), .restartDeviceChain)
+        XCTAssertEqual(ladder.tick(now: 220, othersHealthy: false, tunnelHasDevice: true), .restartTunnelAndChains)
+        XCTAssertEqual(ladder.tick(now: 310, othersHealthy: false, tunnelHasDevice: true), .giveUp)
+        XCTAssertEqual(ladder.nextAutoRetryAt, 430)
+        XCTAssertEqual(ladder.tick(now: 429, othersHealthy: false, tunnelHasDevice: true), .wait)
+        XCTAssertEqual(ladder.tick(now: 430, othersHealthy: false, tunnelHasDevice: true), .autoRetry)
         XCTAssertFalse(ladder.hardStopped)
-        XCTAssertEqual(ladder.stage, 0)
-        XCTAssertEqual(ladder.wedgeSince, 340)
-        // Still down: the ladder climbs again, and the next give-up retries too.
-        XCTAssertEqual(ladder.tick(now: 370, othersHealthy: false, tunnelHasDevice: true), .restartTunnelAndChains)
-        XCTAssertEqual(ladder.tick(now: 460, othersHealthy: false, tunnelHasDevice: true), .giveUp)
-        XCTAssertEqual(ladder.tick(now: 580, othersHealthy: false, tunnelHasDevice: true), .restartDeviceChain)
+        XCTAssertEqual(ladder.wedgeSince, 430)
+        // Still down: tunnel, then a 5-minute pause.
+        XCTAssertEqual(ladder.tick(now: 520, othersHealthy: false, tunnelHasDevice: true), .restartTunnelAndChains)
+        XCTAssertEqual(ladder.tick(now: 610, othersHealthy: false, tunnelHasDevice: true), .giveUp)
+        XCTAssertEqual(ladder.tick(now: 909, othersHealthy: false, tunnelHasDevice: true), .wait)
+        XCTAssertEqual(ladder.tick(now: 910, othersHealthy: false, tunnelHasDevice: true), .autoRetry)
+        // Then 10 minutes, and 10 minutes for good.
+        for retry in [1_690.0, 2_470.0] {
+            _ = ladder.tick(now: retry - 690, othersHealthy: false, tunnelHasDevice: true)
+            XCTAssertEqual(ladder.tick(now: retry - 600, othersHealthy: false, tunnelHasDevice: true), .giveUp)
+            XCTAssertEqual(ladder.tick(now: retry - 1, othersHealthy: false, tunnelHasDevice: true), .wait)
+            XCTAssertEqual(ladder.tick(now: retry, othersHealthy: false, tunnelHasDevice: true), .autoRetry)
+        }
     }
 
-    /// Never connected (say, the phone wants its passcode for UI Automation):
-    /// retrying cannot help, so it still waits for the user.
-    func testAPhoneThatNeverWorkedStaysStopped() {
+    func testBackoffStartsOverOnceWDAAnswers() {
+        var ladder = ChainLadderState()
+        ladder.hardStop(now: 0)
+        ladder.hardStop(now: 0)
+        XCTAssertEqual(ladder.nextAutoRetryAt, 300)
+        ladder.onConnected()
+        ladder.hardStop(now: 1_000)
+        XCTAssertEqual(ladder.nextAutoRetryAt, 1_120)
+    }
+
+    /// Never connected (say, the phone wants its passcode for UI Automation)
+    /// used to wait for a human forever. The user may answer the sheet, so
+    /// it retries on the same backoff.
+    func testAPhoneThatNeverWorkedRetriesToo() {
         var ladder = ChainLadderState()
         ladder.onRunwdaStarted(now: 0)
         _ = ladder.tick(now: 90, othersHealthy: false, tunnelHasDevice: true)
-        XCTAssertEqual(ladder.tick(now: 180, othersHealthy: false, tunnelHasDevice: true), .giveUp)
-        XCTAssertEqual(ladder.tick(now: 10_000, othersHealthy: false, tunnelHasDevice: true), .wait)
-        XCTAssertTrue(ladder.hardStopped)
+        _ = ladder.tick(now: 180, othersHealthy: false, tunnelHasDevice: true)
+        XCTAssertEqual(ladder.tick(now: 270, othersHealthy: false, tunnelHasDevice: true), .giveUp)
+        XCTAssertEqual(ladder.tick(now: 389, othersHealthy: false, tunnelHasDevice: true), .wait)
+        XCTAssertEqual(ladder.tick(now: 390, othersHealthy: false, tunnelHasDevice: true), .autoRetry)
     }
 
-    func testAStalledVideoStopRetriesToo() {
+    /// A phone the tunnel can't reach used to restart the shared tunnel on
+    /// every auto retry, knocking a working phone's WDA down for good.
+    func testAnAutoRetryNeverRestartsTheTunnelUnderAWorkingPhone() {
         var ladder = ChainLadderState()
-        ladder.onConnected()
-        ladder.hardStop(now: 50)
-        XCTAssertEqual(ladder.tick(now: 169, othersHealthy: false, tunnelHasDevice: true), .wait)
-        XCTAssertEqual(ladder.tick(now: 170, othersHealthy: false, tunnelHasDevice: true), .restartDeviceChain)
+        ladder.onRunwdaStarted(now: 0)
+        // The first climb may still restart the tunnel.
+        XCTAssertEqual(ladder.tick(now: 90, othersHealthy: true, tunnelHasDevice: false), .restartTunnelAndChains)
+        ladder.onRunwdaStarted(now: 100)
+        XCTAssertEqual(ladder.tick(now: 190, othersHealthy: true, tunnelHasDevice: false), .giveUp)
+        XCTAssertEqual(ladder.tick(now: 310, othersHealthy: true, tunnelHasDevice: false), .autoRetry)
+        XCTAssertFalse(ChainLadderState.retryMayRestartTunnel(giveUps: ladder.giveUps, othersHealthy: true))
+        ladder.onRunwdaStarted(now: 315)
+        XCTAssertEqual(ladder.tick(now: 405, othersHealthy: true, tunnelHasDevice: false), .giveUp)
+        XCTAssertEqual(ladder.giveUps, 2)
+    }
+
+    func testAnAutoRetryMayRestartTheTunnelWhenNoOtherPhoneIsUp() {
+        XCTAssertTrue(ChainLadderState.retryMayRestartTunnel(giveUps: 0, othersHealthy: true))
+        XCTAssertTrue(ChainLadderState.retryMayRestartTunnel(giveUps: 3, othersHealthy: false))
+        var ladder = ChainLadderState()
+        ladder.hardStop(now: 0)
+        XCTAssertEqual(ladder.tick(now: 120, othersHealthy: false, tunnelHasDevice: false), .autoRetry)
+        ladder.onRunwdaStarted(now: 125)
+        XCTAssertEqual(ladder.tick(now: 215, othersHealthy: false, tunnelHasDevice: false), .restartTunnelAndChains)
+    }
+
+    func testTheBackoffTable() {
+        XCTAssertEqual(ChainLadderState.autoRetryDelay(afterGiveUps: 1), 120)
+        XCTAssertEqual(ChainLadderState.autoRetryDelay(afterGiveUps: 2), 300)
+        XCTAssertEqual(ChainLadderState.autoRetryDelay(afterGiveUps: 3), 600)
+        XCTAssertEqual(ChainLadderState.autoRetryDelay(afterGiveUps: 50), 600)
     }
 
     func testTunnelRestartCooldown() {
@@ -446,5 +496,79 @@ final class ActiveSessionTests: XCTestCase {
         XCTAssertNil(WDAParse.activeSessionId(["value": ["ready": true]]))
         XCTAssertNil(WDAParse.activeSessionId(["sessionId": ""]))
         XCTAssertNil(WDAParse.activeSessionId(nil))
+    }
+}
+
+/// One failed 8 s probe used to mark a phone down, so a slow agent call
+/// that kept WDA busy got WDA restarted under it.
+final class ProbeStrikesTests: XCTestCase {
+    func testDownTakesTwoFailuresInARow() {
+        var s = ProbeStrikes()
+        XCTAssertEqual(s.record(.failed, inFlightAtSend: 0, now: 0), .suspect)
+        XCTAssertEqual(s.record(.failed, inFlightAtSend: 0, now: 3), .down)
+        XCTAssertEqual(s.record(.failed, inFlightAtSend: 0, now: 6), .down)
+    }
+
+    func testAnAnswerClearsTheStrike() {
+        var s = ProbeStrikes()
+        XCTAssertEqual(s.record(.failed, inFlightAtSend: 0, now: 0), .suspect)
+        XCTAssertEqual(s.record(.answered, inFlightAtSend: 0, now: 3), .up)
+        XCTAssertEqual(s.record(.failed, inFlightAtSend: 0, now: 6), .suspect)
+    }
+
+    func testATimeoutWithNothingElseWaitingIsAFailure() {
+        var s = ProbeStrikes()
+        XCTAssertEqual(s.record(.timedOut, inFlightAtSend: 0, now: 0), .suspect)
+        XCTAssertEqual(s.record(.timedOut, inFlightAtSend: 0, now: 8), .down)
+    }
+
+    func testATimeoutBehindOtherRequestsIsBusy() {
+        var s = ProbeStrikes()
+        for t in stride(from: 0.0, to: 75, by: 8) {
+            XCTAssertEqual(s.record(.timedOut, inFlightAtSend: 1, now: t), .busy)
+        }
+        XCTAssertEqual(s.failures, 0)
+    }
+
+    /// Busy for longer than any agent waits is a stuck WDA.
+    func testBusyForTooLongCountsAsFailures() {
+        var s = ProbeStrikes()
+        XCTAssertEqual(s.record(.timedOut, inFlightAtSend: 2, now: 0), .busy)
+        XCTAssertEqual(s.record(.timedOut, inFlightAtSend: 2, now: 75), .suspect)
+        XCTAssertEqual(s.record(.timedOut, inFlightAtSend: 2, now: 83), .down)
+    }
+
+    func testBusyIsNoEvidenceEitherWay() {
+        var s = ProbeStrikes()
+        XCTAssertEqual(s.record(.failed, inFlightAtSend: 0, now: 0), .suspect)
+        XCTAssertEqual(s.record(.timedOut, inFlightAtSend: 1, now: 3), .busy)
+        XCTAssertEqual(s.record(.failed, inFlightAtSend: 0, now: 14), .down)
+    }
+
+    func testARefusedConnectionIsNeverBusy() {
+        var s = ProbeStrikes()
+        XCTAssertEqual(s.record(.failed, inFlightAtSend: 3, now: 0), .suspect)
+    }
+}
+
+final class InFlightRequestsTests: XCTestCase {
+    func testARequestWaitsUntilWDAReplies() {
+        var r = InFlightRequests()
+        r.clientSent(1)
+        r.clientSent(1)                     // a body in a second chunk
+        XCTAssertEqual(r.count, 1)
+        r.backendSent(1)
+        XCTAssertEqual(r.count, 0)
+    }
+
+    func testKeepAliveAndSeveralConnections() {
+        var r = InFlightRequests()
+        r.clientSent(1); r.backendSent(1)
+        r.clientSent(1)                     // next request, same connection
+        r.clientSent(2)
+        XCTAssertEqual(r.count, 2)
+        r.closed(2)
+        r.closed(2)
+        XCTAssertEqual(r.count, 1)
     }
 }

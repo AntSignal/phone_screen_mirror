@@ -32,6 +32,10 @@ final class DeviceController {
     private(set) var detail: String?
     private(set) var ladder = ChainLadderState()
     private var resetWatch = USBResetWatch()
+    private var strikes = ProbeStrikes()
+    /// Did the last probe get an answer from /status? The video watchdog
+    /// may only bounce the MJPEG forward while it does.
+    private(set) var statusAnswers = false
 
     private var probing = false
     private var creatingSession = false
@@ -85,6 +89,8 @@ final class DeviceController {
         guard !running else { return }
         running = true
         ladder.reset()
+        strikes = ProbeStrikes()
+        statusAnswers = false
         chain?.start()
         DispatchQueue.main.asyncAfter(deadline: .now() + stagger) { [weak self] in
             guard let self, self.running, self.timer == nil else { return }
@@ -130,13 +136,6 @@ final class DeviceController {
 
     func bounceMJPEGForward() { chain?.bounceMJPEGForward() }
 
-    /// The window's video watchdog gave up on a bounce: restart this chain.
-    func restartForStalledVideo() {
-        ladder.noteOutsideRestart()
-        status("Video stalled — resetting \(alias)'s connection…")
-        chain?.restart()
-    }
-
     // MARK: USB resets (rules in iMirrorCore/USBReset.swift)
 
     /// We changed this phone's USB session (the shared tunnel started).
@@ -168,14 +167,6 @@ final class DeviceController {
         onChange?()
     }
 
-    /// The window's video watchdog gave up for good.
-    func hardStopForStalledVideo() {
-        ladder.hardStop(now: ProcessInfo.processInfo.systemUptime)
-        chain?.stopChildren()
-        status("No video from WebDriverAgent on \(alias). Tap WDA to retry.")
-        onChange?()
-    }
-
     /// The shared tunnel was just restarted for everyone: this chain was
     /// rebuilt too, so a give-up here no longer holds.
     func tunnelRestarted() {
@@ -203,17 +194,32 @@ final class DeviceController {
         // WDA's single XCUITest queue and could time out into a false .down.
         if wda.isGestureInFlight { return }
         probing = true
+        // Read before our probe opens, so it never counts itself.
+        let inFlightAtSend = chain?.relayInFlight ?? 0
         wda.probe { [weak self] result in          // delivered on main
             guard let self else { return }
             self.probing = false
             guard self.running else { return }
+            let now = ProcessInfo.processInfo.systemUptime
+            let outcome: ProbeOutcome
             switch result {
-            case .alive: self.setHealth(.connected)
-            case .down: self.setHealth(.down)
-            case .needsSession: self.createSession()
+            case .alive, .needsSession: outcome = .answered
+            case .timedOut: outcome = .timedOut
+            case .down: outcome = .failed
             }
-            if self.chain != nil, self.resetWatch.onProbe(answered: result != .down,
-                                                          now: ProcessInfo.processInfo.systemUptime) {
+            let call = self.strikes.record(outcome, inFlightAtSend: inFlightAtSend, now: now)
+            self.statusAnswers = call == .up
+            switch call {
+            case .up:
+                if result == .needsSession { self.createSession() } else { self.setHealth(.connected) }
+            case .down:
+                self.setHealth(.down)
+            case .busy, .suspect:
+                self.onHealth?(self.health, self.health)   // no verdict yet
+            }
+            // A busy WDA says nothing about the USB link.
+            if self.chain != nil, call != .busy,
+               self.resetWatch.onProbe(answered: call == .up, now: now) {
                 self.restartAfterUSBReset()
                 return
             }
@@ -259,6 +265,11 @@ final class DeviceController {
         switch action {
         case .wait:
             break
+        case .autoRetry:
+            unrecoverable = false
+            status("Retrying WebDriverAgent on \(alias)…")
+            restartOwnOrTunnel(tunnelAllowed: ChainLadderState.retryMayRestartTunnel(
+                giveUps: ladder.giveUps, othersHealthy: othersHealthy()))
         case .restartDeviceChain:
             // Don't reseed the clock here: onRunwdaStarted does once the new
             // runwda spawns, and a chain that never gets that far still ages
@@ -274,13 +285,15 @@ final class DeviceController {
             // killed by its readiness deadline) forever after a give-up. The
             // relay stays up, so a retry can bring the chain back.
             chain?.stopChildren()
-            status("WebDriverAgent won't start on \(alias). Tap WDA to retry.")
+            let wait = Int(ChainLadderState.autoRetryDelay(afterGiveUps: ladder.giveUps) / 60)
+            status("WebDriverAgent won't start on \(alias). Retrying in \(wait) min — "
+                 + "or tap WDA to retry now.")
             onChange?()
         }
     }
 
-    private func restartOwnOrTunnel() {
-        if tunnelHasDevice() || !requestTunnelRestart() { chain?.restart() }
+    private func restartOwnOrTunnel(tunnelAllowed: Bool = true) {
+        if tunnelHasDevice() || !tunnelAllowed || !requestTunnelRestart() { chain?.restart() }
         onChange?()
     }
 
@@ -332,7 +345,7 @@ final class DeviceController {
     var runnerText: String {
         if health == .connected { return "WebDriverAgent running ✓" }
         if unrecoverable { return "WebDriverAgent won't start — trust the developer on the phone" }
-        if ladder.hardStopped { return "Gave up — press Restart" }
+        if ladder.hardStopped { return "Gave up for now — retries by itself, or press Restart" }
         if installingRunner { return "Installing WebDriverAgent…" }
         switch lastRunnerInstall {
         case .alreadyPresent, .installed: return "WebDriverAgent installed — starting…"

@@ -605,29 +605,45 @@ final class ChainRecoveryGraceSecTests: XCTestCase {
     }
 }
 
+/// The video watchdog used to restart the chain, then hard-stop it, while
+/// WDA itself was fine and agents were driving it.
 final class MjpegRecoveryActionTests: XCTestCase {
+    private func action(noFrame: TimeInterval, sinceBounce: TimeInterval? = nil,
+                        answers: Bool = true) -> MjpegRecoveryAction {
+        nextMjpegRecoveryAction(noFrameForSec: noFrame, sinceBounceSec: sinceBounce,
+                                statusAnswers: answers, thresholdSec: 20)
+    }
+
     func testBelowThresholdWaits() {
-        XCTAssertEqual(nextMjpegRecoveryAction(noFrameForSec: 19.9, alreadyBounced: false, thresholdSec: 20), .wait)
+        XCTAssertEqual(action(noFrame: 19.9), .wait)
     }
 
-    func testBelowThresholdWaitsEvenAlreadyBounced() {
-        XCTAssertEqual(nextMjpegRecoveryAction(noFrameForSec: 5, alreadyBounced: true, thresholdSec: 20), .wait)
+    func testAtThresholdBouncesTheForward() {
+        XCTAssertEqual(action(noFrame: 20), .bounceForward)
+        XCTAssertEqual(action(noFrame: 45), .bounceForward)
     }
 
-    func testAtThresholdNotYetBouncedBouncesForward() {
-        XCTAssertEqual(nextMjpegRecoveryAction(noFrameForSec: 20, alreadyBounced: false, thresholdSec: 20), .bounceForward)
+    func testDoesNothingWhileStatusDoesNotAnswer() {
+        // The ladder owns a WDA that doesn't answer.
+        XCTAssertEqual(action(noFrame: 600, answers: false), .wait)
     }
 
-    func testAboveThresholdNotYetBouncedBouncesForward() {
-        XCTAssertEqual(nextMjpegRecoveryAction(noFrameForSec: 45, alreadyBounced: false, thresholdSec: 20), .bounceForward)
+    func testRebouncesAtMostOncePerInterval() {
+        XCTAssertEqual(action(noFrame: 79, sinceBounce: 59), .wait)
+        XCTAssertEqual(action(noFrame: 80, sinceBounce: 60), .bounceForward)
     }
 
-    func testAtThresholdAlreadyBouncedEscalates() {
-        XCTAssertEqual(nextMjpegRecoveryAction(noFrameForSec: 20, alreadyBounced: true, thresholdSec: 20), .escalate)
-    }
-
-    func testAboveThresholdAlreadyBouncedEscalates() {
-        XCTAssertEqual(nextMjpegRecoveryAction(noFrameForSec: 41, alreadyBounced: true, thresholdSec: 20), .escalate)
+    /// An hour of no video with a healthy /status: only ever bounces.
+    func testALongStallWithAHealthyWDAOnlyEverBounces() {
+        var bouncedAt: TimeInterval?
+        var bounces = 0
+        for t in stride(from: 0.0, through: 3_600, by: 3) {
+            switch action(noFrame: t, sinceBounce: bouncedAt.map { t - $0 }) {
+            case .wait: break
+            case .bounceForward: bounces += 1; bouncedAt = t
+            }
+        }
+        XCTAssertEqual(bounces, 60)
     }
 }
 
