@@ -262,6 +262,45 @@ clients work). The loopback relay normalises the connection, keeping the USB
 transport and loopback-only security. If the bundled go-ios is ever missing,
 `scripts/wda-up.sh` + `scripts/wda_relay.py` are a manual fallback.
 
+## Files other tools read
+
+The app shares state with the MCP server and with test harnesses (such as
+`antsignalctl` and `run.sh`) through files in `~/Library/Application Support/iMirror/`.
+The MCP server finds them next to `devices.json`, so `IMIRROR_DEVICES_FILE`
+moves all of them. Times are ISO-8601 in UTC. None of these files ever holds a
+passcode or other secret.
+
+**`devices.json`** — every phone the app runs WDA on. Top level: `schema` (1),
+`owner_pid` and `owner_uniqueid` (the app's kernel uniqueid; readers ignore the
+file unless that exact process is alive), `goios`, `devices`. Each device:
+`udid`, `alias`, `kind`, `wda_url`, `state` (`starting`, `installing`, `ready`,
+`down`, `failed`), `detail`, and:
+
+| Field | Meaning |
+|---|---|
+| `reason` | why the phone is not ready: null, or `usb_reset`, `wda_wedged`, `needs_passcode`, `locked`, `tunnel_down`, `mac_asleep`, `gave_up`, `recovering`, `booting` |
+| `state_since` | when `state` last changed |
+| `chain_epoch` | an integer, +1 each time the phone's chain starts |
+| `last_error` | a short error, or null |
+| `next_retry_at` | while `gave_up`: when the app retries by itself; else null |
+
+**`events.jsonl`** — one JSON object per line: `ts` (with milliseconds),
+`udid`, `alias`, `event` (`state`, `restart`, `give_up`, `auto_retry`,
+`usb_reset`, `usb_reset_ignored`, `request`, `wake`, `sleep`, `passcode`), and
+optionally `from`, `to`, `reason`, `detail`, `expected` (a bool). At 5 MB it
+moves to `events.jsonl.1`, replacing the old one.
+
+**`requests/restart-<udid>.json`** — a client asks for a chain restart by
+writing `{"udid", "requested_at", "requested_by"}` (`requested_by` is a short
+name). The app deletes the file, treats it like a tap on Retry unless it
+honoured a request for that phone in the last 60 s, and logs a `request`
+event with `detail` `accepted` or `cooldown`. A request never types a passcode.
+
+**`expected-resets/<udid>.json`** — before `devicectl device install` or
+`launch`, which reset the phone's USB link, a client writes
+`{"until": <now + 90 s>, "by": "devicectl install"}`. A USB reset on that phone
+before `until` is logged with `"expected": true`; recovery still runs as usual.
+
 ## Dependency security policy
 
 Supply-chain risk is treated as a first-class constraint:

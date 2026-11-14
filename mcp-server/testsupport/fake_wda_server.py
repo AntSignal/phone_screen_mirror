@@ -73,8 +73,10 @@ class FakeWDAServer:
 
     # ---- lifecycle ----------------------------------------------------------
 
-    def start(self) -> "FakeWDAServer":
-        httpd = _Server(("127.0.0.1", 0), _Handler)
+    def start(self, port: int = 0) -> "FakeWDAServer":
+        """Serve on `port` (0 picks one). Passing a stopped server's port
+        brings that phone's WDA "back" where clients expect it."""
+        httpd = _Server(("127.0.0.1", port), _Handler)
         httpd.fake = self
         self._httpd = httpd
         threading.Thread(target=httpd.serve_forever, kwargs={"poll_interval": 0.05},

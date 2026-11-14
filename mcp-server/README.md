@@ -126,6 +126,30 @@ A server exits as soon as its client is gone: when its stdin closes, or when
 its parent process changes (it was orphaned). It does not wait for a tool
 call still blocked on WDA.
 
+## When a phone's WDA restarts
+
+The iMirror app restarts a phone's chain by itself after a USB reset or a
+wedged WDA, and says so in `devices.json` (see "Files other tools read" in the
+top-level README). A call that cannot reach WDA reads that file, never
+`/status`, so dozens of servers don't hammer a booting WDA:
+
+- **Restarting** (`starting`, `installing`, or a `reason` such as `usb_reset`,
+  `wda_wedged`, `tunnel_down`): the call waits up to 30 s for `ready`. Then a
+  read (screenshot, source, status, waits, asserts) is retried once. A tap,
+  type, swipe or launch is **never** repeated, because it may already have
+  reached the phone: it fails with `RECOVERING` and `retry_after_s=0`. Still
+  restarting after 30 s: `RECOVERING` with `retry_after_s` and `reason`.
+- **`NEEDS_PASSCODE`** (`reason` `needs_passcode` or `locked`): fails at once.
+  iMirror types the passcode if auto-passcode is set up for that phone;
+  otherwise a person must.
+- **`DEVICE_GAVE_UP`**: the app has stopped retrying; `next_retry_at` says
+  when it tries again by itself.
+- A phone the app still calls `ready` gets the plain `unreachable`/`wedged`
+  error, as before.
+
+The extra values ride in the error's tail, e.g.
+`[kind=unreachable code=RECOVERING reason=usb_reset retry_after_s=15]`.
+
 ## Setup
 
 ```bash
