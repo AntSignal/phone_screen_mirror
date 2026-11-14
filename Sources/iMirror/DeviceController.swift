@@ -192,17 +192,19 @@ final class DeviceController {
     private func restartAfterUSBReset() {
         log(.restart, reason: .usbReset, expected: EventLog.shared.resetIsExpected(udid: udid))
         usbResetPending = true
-        ladder.noteOutsideRestart()             // a fresh chain needs 90 s to boot
+        // A fresh chain needs 90 s to boot, counted from now.
+        ladder.noteOutsideRestart(now: ProcessInfo.processInfo.systemUptime)
         status("\(alias)'s USB connection reset — reconnecting…")
         chain?.restart()
         onChange?()
     }
 
     /// The shared tunnel was just restarted for everyone: this chain was
-    /// rebuilt too, so a give-up here no longer holds.
+    /// rebuilt too, so a give-up here no longer holds and the grace
+    /// clock starts again.
     func tunnelRestarted() {
         log(.restart, detail: "shared tunnel restarted")
-        if ladder.hardStopped { ladder.forceRetry(now: ProcessInfo.processInfo.systemUptime) }
+        ladder.noteTunnelRestart(now: ProcessInfo.processInfo.systemUptime)
     }
 
     // MARK: Device file
@@ -371,9 +373,9 @@ final class DeviceController {
             restartOwnOrTunnel(tunnelAllowed: ChainLadderState.retryMayRestartTunnel(
                 giveUps: ladder.giveUps, othersHealthy: othersHealthy()))
         case .restartDeviceChain:
-            // Don't reseed the clock here: onRunwdaStarted does once the new
-            // runwda spawns, and a chain that never gets that far still ages
-            // toward the next stage instead of sitting on .wait forever.
+            // tick() restarted the clock; onRunwdaStarted restarts it again
+            // once the new runwda spawns. A chain that never gets that far
+            // still ages from now toward the next stage.
             log(.restart, detail: "ladder: this phone's chain")
             status("WebDriverAgent on \(alias) is taking longer than usual — restarting its connection…")
             chain?.restart()
@@ -464,6 +466,9 @@ final class DeviceController {
                 setHealth(.down)
                 status(Self.installFailureMessage(err, alias: alias))
             }
+        case .abandoned:
+            // The chain restarted mid-install; the new bring-up checks again.
+            installingRunner = false
         }
         onChange?()
     }

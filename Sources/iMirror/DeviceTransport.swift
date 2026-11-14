@@ -192,6 +192,11 @@ final class DeviceChain {
     let slot: PortSlot
     private let bin: URL
     private let workDir: URL
+    /// Runs bring-ups and the restart sweep. Tests pass a queue they can
+    /// suspend, to land a stop between a step and its callback.
+    private let startupQueue: DispatchQueue
+    /// The runner ipa to install. Tests pass their own.
+    private let bundledIPA: URL?
     private let relay: LocalRelay
     private var wda: ManagedProcess?
     private var forward: ManagedProcess?
@@ -263,12 +268,35 @@ final class DeviceChain {
     /// Short, filesystem-safe tag for log files and process labels.
     private var tag: String { String(udid.replacingOccurrences(of: "-", with: "").suffix(6)) }
 
-    init(udid: String, slot: PortSlot, bin: URL, workDir: URL) {
+    init(udid: String, slot: PortSlot, bin: URL, workDir: URL,
+         startupQueue: DispatchQueue = .global(qos: .userInitiated),
+         bundledIPA: URL? = Bundle.main.url(forResource: "WebDriverAgent", withExtension: "ipa")) {
         self.udid = udid
         self.slot = slot
         self.bin = bin
         self.workDir = workDir
+        self.startupQueue = startupQueue
+        self.bundledIPA = bundledIPA
         self.relay = LocalRelay(listen: slot.relayPort, backend: slot.forwardPort)
+    }
+
+    /// Introspection for lifecycle tests: does any child handle exist?
+    var hasChildHandlesForTesting: Bool { wda != nil || forward != nil || mjpegForward != nil }
+
+    /// Main thread. A new generation makes every queued callback of the
+    /// old one stale; an install the UI saw start is reported abandoned.
+    private func newGeneration() {
+        generation += 1
+        if installGate.superseded() { onRunnerInstall?(.abandoned) }
+    }
+
+    /// Run `body` on main only if the chain is still at generation `gen`.
+    /// A stop or restart between the event and its delivery drops it.
+    private func onMainIfCurrent(_ gen: Int, _ body: @escaping (DeviceChain) -> Void) {
+        DispatchQueue.main.async { [weak self] in
+            guard let self, self.generation == gen else { return }
+            body(self)
+        }
     }
 
     /// Start the relay (once — it stays up across chain restarts so the
@@ -278,7 +306,7 @@ final class DeviceChain {
             do { try relay.start(); relayUp = true }
             catch { NSLog("iMirror: relay :\(slot.relayPort) failed: \(error.localizedDescription)") }
         }
-        generation += 1
+        newGeneration()
         epoch += 1
         onOwnUSBChange?()
         bringUp(generation: generation)
@@ -293,7 +321,7 @@ final class DeviceChain {
 
     /// Stop the children but keep the relay listening (the give-up state).
     func stopChildren() {
-        generation += 1
+        newGeneration()
         onOwnUSBChange?()
         forward?.stop(); mjpegForward?.stop(); wda?.stop()
         forward = nil; mjpegForward = nil; wda = nil
@@ -307,7 +335,7 @@ final class DeviceChain {
         epoch += 1
         let gen = generation
         let pattern = GoIOS.sweepPattern(bin: bin.path, udid: udid)
-        DispatchQueue.global().asyncAfter(deadline: .now() + 4) { [weak self] in
+        startupQueue.asyncAfter(deadline: .now() + 4) { [weak self] in
             guard let self, self.generation == gen else { return }
             GoIOS.pkill(pattern)
             DispatchQueue.main.async {
@@ -329,7 +357,7 @@ final class DeviceChain {
     /// Tunnel route → runner check/install → runwda + forwards. The install and
     /// `apps --list` go through the tunnel on iOS 17+, so they must wait for it.
     private func bringUp(generation gen: Int) {
-        DispatchQueue.global().async { [weak self] in
+        startupQueue.async { [weak self] in
             guard let self else { return }
             let deadline = Date().addingTimeInterval(30)
             while Date() < deadline {
@@ -338,16 +366,13 @@ final class DeviceChain {
                 Thread.sleep(forTimeInterval: 0.5)
             }
             guard self.generation == gen else { return }
-            let install = self.installOrUpgradeRunner()
+            let install = self.installOrUpgradeRunner(generation: gen)
             guard self.generation == gen, shouldSpawnRunwda(after: install) else { return }
-            DispatchQueue.main.async { [weak self] in
-                guard let self, self.generation == gen else { return }
-                self.spawnChildren()
-            }
+            self.onMainIfCurrent(gen) { $0.spawnChildren(generation: gen) }
         }
     }
 
-    private func spawnChildren() {
+    private func spawnChildren(generation gen: Int) {
         let wda = ManagedProcess(
             binary: bin, args: GoIOS.runwdaArgs(udid: udid), label: "runwda-\(tag)",
             restartDelay: 6, workDir: workDir,
@@ -358,8 +383,10 @@ final class DeviceChain {
             readyWithin: 40, readinessPollInterval: 2)
         wda.holdCheck = { [weak self] in self?.passcodeHeld ?? false }
         wda.onLines = { [weak self] lines in self?.runwdaSaid(lines) }
+        // A runner this chain has since replaced must not mark the new one
+        // "won't start" (upstream fed3fb9).
         wda.onGaveUp = { [weak self] _ in
-            DispatchQueue.main.async { self?.onWDAUnrecoverable?() }
+            self?.onMainIfCurrent(gen) { $0.onWDAUnrecoverable?() }
         }
         // Respawns too: each runner start resets the phone's USB.
         wda.onSpawn = { [weak self] in
@@ -389,8 +416,15 @@ final class DeviceChain {
 
     // MARK: Runner check / install
 
-    private func emitInstall(_ event: RunnerInstallEvent) {
-        DispatchQueue.main.async { [weak self] in self?.onRunnerInstall?(event) }
+    // Main thread only.
+    private var installGate = InstallEventGate()
+
+    /// Any queue. Events from a replaced bring-up are dropped (InstallEventGate).
+    private func emitInstall(_ event: RunnerInstallEvent, generation gen: Int) {
+        DispatchQueue.main.async { [weak self] in
+            guard let self, self.installGate.pass(event, from: gen, current: self.generation) else { return }
+            self.onRunnerInstall?(event)
+        }
     }
 
     /// A bundled version whose upgrade failed on this chain (runnerAction).
@@ -405,39 +439,50 @@ final class DeviceChain {
     /// it is missing, and reinstall it when the phone's copy is older. Dev
     /// builds ship no ipa (scripts/build-wda.sh installs the runner), which
     /// is reported as `.noBundle`.
-    private func installOrUpgradeRunner() -> RunnerInstall {
-        emitInstall(.checking)
-        guard let ipa = Bundle.main.url(forResource: "WebDriverAgent", withExtension: "ipa") else {
-            emitInstall(.done(.noBundle))
+    private func installOrUpgradeRunner(generation gen: Int) -> RunnerInstall {
+        let emit = { (e: RunnerInstallEvent) in self.emitInstall(e, generation: gen) }
+        emit(.checking)
+        guard let ipa = bundledIPA else {
+            emit(.done(.noBundle))
             return .noBundle
         }
+        installLock.lock(); defer { installLock.unlock() }
+        // Replaced while waiting: bringUp drops this result anyway.
+        guard generation == gen else { return .alreadyPresent }
         let installed = installedRunnerVersion()
         let bundled = Self.bundledRunnerVersion(ipa: ipa)
         switch runnerAction(installed: installed, bundled: bundled, failedUpgradeTo: failedUpgradeTo) {
         case .keep:
-            emitInstall(.done(.alreadyPresent))
+            emit(.done(.alreadyPresent))
             return .alreadyPresent
         case .install:
-            emitInstall(.installing)
-            let result = installWithRetry(ipa: ipa)
-            emitInstall(.done(result))
+            emit(.installing)
+            let result = installWithRetry(ipa: ipa, generation: gen)
+            emit(.done(result))
             return result
         case .upgrade:
             let from = installed ?? "", to = bundled ?? ""
-            emitInstall(.upgrading(from: from, to: to))
-            let attempt = installWithRetry(ipa: ipa)
-            if case .failed(let err) = attempt {
+            emit(.upgrading(from: from, to: to))
+            let attempt = installWithRetry(ipa: ipa, generation: gen)
+            // A replaced bring-up stops retrying early; that is no failure.
+            if case .failed(let err) = attempt, generation == gen {
                 failedUpgradeTo = to
-                emitInstall(.upgradeFailed(kept: from, raw: err.raw))
+                emit(.upgradeFailed(kept: from, raw: err.raw))
             }
             let result = upgradeResult(attempt)
-            emitInstall(.done(result))
+            emit(.done(result))
             return result
         }
     }
 
+    /// One `ios install` per phone at a time. A restart starts a new
+    /// bring-up while the old one may still be installing; two installs at
+    /// once can fail each other and mark the upgrade failed for good.
+    private let installLock = NSLock()
+
     /// `ios install` with retries: `.installed` or the last `.failed`.
-    private func installWithRetry(ipa: URL) -> RunnerInstall {
+    /// Stops retrying once the chain has moved past generation `gen`.
+    private func installWithRetry(ipa: URL, generation gen: Int) -> RunnerInstall {
         // The tunnel is briefly unusable right after it appears; retry the
         // unrecognised (transient) failures, stop at once on a definite one
         // (not provisioned for this phone, phone locked).
@@ -447,7 +492,9 @@ final class DeviceChain {
             if r.status == 0 { result = .installed; break }
             let cls = classifyInstallError(r.err)
             result = .failed(cls)
-            if case .other = cls, attempt < 7 { Thread.sleep(forTimeInterval: 2); continue }
+            if case .other = cls, attempt < 7, generation == gen {
+                Thread.sleep(forTimeInterval: 2); continue
+            }
             break
         }
         return result

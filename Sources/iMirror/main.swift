@@ -992,7 +992,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSToolbarDelegate {
                 self.mjpegLastFrameAt = ProcessInfo.processInfo.systemUptime
                 self.mjpegBouncedAt = nil       // this stall is over
                 self.lastFrame = cg
+                let previous = self.previewView.lastFrameSize
                 self.previewView.setFrame(cg)
+                // Rotated: taps must not use the old shape's size.
+                if videoShapeChanged(previous: previous, current: CGSize(width: cg.width, height: cg.height)) {
+                    c.wda.refreshDisplayGeometry()
+                }
                 if !self.mirroring {
                     self.mirroring = true
                     self.setEmptyState(hidden: true)

@@ -359,3 +359,64 @@ def test_ensure_up_is_idempotent_spawns_chain_once():
 
     assert first == second == BASE_URL
     assert len(popen.spawned) == spawned_after_first
+
+
+# Ported from upstream fed3fb9, adapted: two phones on one Mac.
+
+def test_runner_install_honors_udid():
+    popen = FakePopen()
+    popen.script((IOS_BIN, 'install'), 0, '')
+    bringup = _make_bringup(popen, ScriptedHttpGet(), FakeClock(),
+                            udid='phone-B', wda_ipa='/tmp/runner.ipa')
+    bringup._install_runner()
+    assert '--udid=phone-B' in popen.argvs[0]
+
+
+def test_shutdown_never_kills_unowned_processes():
+    # The old global pkill also killed every other phone's chain.
+    popen = FakePopen()
+    bringup = _make_bringup(popen, ScriptedHttpGet(), FakeClock())
+    bringup.shutdown()
+    assert popen.argvs == []
+
+
+def test_shutdown_after_bringup_runs_no_pkill():
+    popen = FakePopen()
+    popen.script((IOS_BIN, 'apps'), 0, _apps_list_output(True))
+    http_get = ScriptedHttpGet()
+    http_get.set_sequence(f'{BASE_URL}/status', [(200, _status_body(False)),
+                                                  (200, _status_body(True))])
+    http_get.set(f'{TUNNEL_AGENT}/tunnels', 200, _tunnels_body('phone-A'))
+    bringup = _make_bringup(popen, http_get, FakeClock(), udid='phone-A')
+    bringup.ensure_up(timeout=10)
+    bringup.shutdown()
+    assert all(args[0] != 'pkill' for args in popen.argvs)
+
+
+def test_failed_startup_rolls_back_only_owned_children():
+    popen = FakePopen()
+    popen.script((IOS_BIN, 'apps'), 0, _apps_list_output(False))
+    http_get = ScriptedHttpGet()
+    http_get.set(f'{BASE_URL}/status', 200, _status_body(False))
+    http_get.set(f'{TUNNEL_AGENT}/tunnels', 200, _tunnels_body('phone-B'))
+    bringup = _make_bringup(popen, http_get, FakeClock(), udid='phone-B')
+    with pytest.raises(WDABringupError, match='not installed'):
+        bringup.ensure_up(timeout=2)
+    tunnel = next(p for p in popen.spawned if p.args[1] == 'tunnel')
+    assert tunnel.terminated
+    assert bringup._children == []
+    assert all(args[0] != 'pkill' for args in popen.argvs)
+
+
+def test_timed_out_startup_stops_its_runwda_and_forward():
+    popen = FakePopen()
+    popen.script((IOS_BIN, 'apps'), 0, _apps_list_output(True))
+    http_get = ScriptedHttpGet()
+    http_get.set(f'{BASE_URL}/status', 200, _status_body(False))
+    http_get.set(f'{TUNNEL_AGENT}/tunnels', 200, _tunnels_body('phone-B'))
+    bringup = _make_bringup(popen, http_get, FakeClock(), udid='phone-B')
+    with pytest.raises(WDABringupError, match='timed out'):
+        bringup.ensure_up(timeout=2)
+    long_running = [p for p in popen.spawned if p.args[1] in ('tunnel', 'runwda', 'forward')]
+    assert len(long_running) == 3
+    assert all(p.terminated for p in long_running)

@@ -34,6 +34,41 @@ public enum RunnerInstallEvent: Equatable {
     /// The upgrade failed; the older runner stays and is used.
     case upgradeFailed(kept: String, raw: String)
     case done(RunnerInstall)
+    /// The chain restarted while this install ran. Its own `.done` will
+    /// never be shown, so the UI must stop saying "Installing…".
+    case abandoned
+}
+
+/// Decides which runner-install events reach the UI. A bring-up the chain
+/// has replaced (a restart or stop bumped its generation) must not report:
+/// its late "install failed" would mark the fresh chain down. But when the
+/// UI saw that install start, it is told the install was abandoned, or the
+/// phone would show "Installing…", with its health probe off, for good.
+/// Ported from upstream fed3fb9's generation check on emitInstall.
+public struct InstallEventGate: Equatable, Sendable {
+    /// The UI has seen an install or upgrade start and not its end.
+    public private(set) var installShowing = false
+
+    public init() {}
+
+    /// Should `event`, from the bring-up of generation `from`, reach the
+    /// UI while the chain is at generation `current`?
+    public mutating func pass(_ event: RunnerInstallEvent, from: Int, current: Int) -> Bool {
+        guard from == current else { return false }
+        switch event {
+        case .installing, .upgrading: installShowing = true
+        case .done, .abandoned: installShowing = false
+        case .checking, .upgradeFailed: break
+        }
+        return true
+    }
+
+    /// The chain moved to a new generation. True when the UI must now be
+    /// sent `.abandoned`.
+    public mutating func superseded() -> Bool {
+        defer { installShowing = false }
+        return installShowing
+    }
 }
 
 /// Map go-ios `install` stderr to a classified error. Pure so it's unit-testable

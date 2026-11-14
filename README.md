@@ -268,7 +268,7 @@ named the same way (`locked`, `untrusted`). A phone is called down only after tw
 failed health probes in a row, and a probe that times out while other requests
 (say an agent's slow `/source`) are already waiting on WDA counts as busy, not
 failed. If WDA stays down, a ladder restarts that phone's own chain first, then
-the shared tunnel. If it still won't come up, the app stops the chain and
+the shared tunnel; each restart gets its full grace from the moment it starts. If it still won't come up, the app stops the chain and
 retries by itself after 2 min, then 5 min, then every 10 min; tapping the WDA
 dot retries at once. Those retries never restart the shared tunnel while
 another phone is working. A separate MJPEG no-frame watchdog covers the case where
@@ -413,7 +413,9 @@ walkthrough.
 **Headless automation.** The MCP server can also bring WebDriverAgent up on its
 own, without the Mac app: set `IMIRROR_AUTOWDA=1` and it runs the same go-ios
 tunnel / runwda / forward chain and talks to WDA directly. Useful for driving
-the phone from an agent without launching the GUI.
+the phone from an agent without launching the GUI. A bring-up that fails stops
+the children it started, and only those: it never sweeps other go-ios processes,
+so the app's other phones are left alone.
 
 **iOS Simulators (optional).** No phone handy, or testing a simulator build?
 Enable one or more simulators and iMirror boots each and brings WebDriverAgent up
@@ -513,8 +515,9 @@ distribute the notarized DMG directly.
   Apple's private wire protocols, so a new iOS major version can break the chain
   until those projects catch up. Pinned versions in
   [SECURITY-AUDIT.md](SECURITY-AUDIT.md) are what's actually tested.
-- **Landscape** adapts via WDA `window/size` (refreshed each poll) but hasn't been
-  physically rotation-tested.
+- **Landscape** adapts via WDA `window/size` (refreshed each poll, and at once
+  when the video changes shape; the video follows the rotation through WDA's
+  `mjpegFixOrientation`) but hasn't been physically rotation-tested.
 - Relaunching the app in quick succession can still briefly wedge the device's
   `testmanagerd`. Recovery now escalates in stages: a readiness-deadline
   auto-restart of the runner, then a chain restart, then a tunnel restart, then

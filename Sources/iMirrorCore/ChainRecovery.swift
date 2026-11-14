@@ -284,8 +284,26 @@ public struct ChainLadderState: Equatable, Sendable {
 
     /// Something outside the ladder (a USB-reset restart) restarted the
     /// chain. The new runner needs the full boot grace; stage 0's 30 s
-    /// would restart it again mid-boot.
-    public mutating func noteOutsideRestart() { stage = max(stage, 1) }
+    /// would restart it again mid-boot. Its clock starts now (beginRestart).
+    public mutating func noteOutsideRestart(now: TimeInterval) {
+        stage = max(stage, 1)
+        beginRestart(now: now)
+    }
+
+    /// The shared tunnel restarted, and with it this phone's chain, even
+    /// when another phone asked for it. A given-up phone retries now; any
+    /// other phone is treated as an outside restart. Its old clock would
+    /// restart the new chain while it boots.
+    public mutating func noteTunnelRestart(now: TimeInterval) {
+        if hardStopped { forceRetry(now: now) } else { noteOutsideRestart(now: now) }
+    }
+
+    /// A restart gets a fresh grace from the moment it is asked for, as
+    /// upstream's ChainRecoveryClock does. The clock used to keep the old
+    /// outage's start, so the next 3 s probe found the grace already spent
+    /// and escalated (or gave up) before the new runwda could spawn.
+    /// runwda's start reseeds it again, for WDA's own boot.
+    private mutating func beginRestart(now: TimeInterval) { wedgeSince = now }
 
     public mutating func hardStop(now: TimeInterval) {
         hardStopped = true
@@ -315,8 +333,8 @@ public struct ChainLadderState: Equatable, Sendable {
         }
         switch action {
         case .wait: break
-        case .restartDeviceChain: stage = 1
-        case .restartTunnelAndChains: stage = 2
+        case .restartDeviceChain: stage = 1; beginRestart(now: now)
+        case .restartTunnelAndChains: stage = 2; beginRestart(now: now)
         case .giveUp: hardStop(now: now)
         case .autoRetry: break
         }
