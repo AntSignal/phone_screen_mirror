@@ -29,6 +29,7 @@ import atexit
 import base64
 import concurrent.futures
 import contextvars
+import ctypes
 import dataclasses
 import functools
 import html
@@ -186,6 +187,11 @@ class _Target:
     # always did) while calls to different phones run side by side. Re-entrant
     # so ios_run_sequence's steps can run inside the sequence's own hold.
     call_lock: Any = dataclasses.field(default_factory=threading.RLock)
+    # When WDA said this server's session was gone.
+    session_losses: list[float] = dataclasses.field(default_factory=list)
+    # How this server got its sessions, shown by ios_devices.
+    session_stats: dict[str, int] = dataclasses.field(
+        default_factory=lambda: {"created": 0, "adopted": 0, "lost": 0})
     product_type: str | None = None
     ios_version: str | None = None
     state: str | None = None
@@ -219,17 +225,80 @@ def _devices_file() -> str:
     return os.environ.get("IMIRROR_DEVICES_FILE") or _DEVICES_FILE_DEFAULT
 
 
-def _pid_alive(pid: Any) -> bool:
-    """True if `pid` is a live process we could signal. A dead owner means the
-    iMirror app crashed without deleting its device file, so the ports it lists
-    are stale and must not be driven."""
-    if not isinstance(pid, int) or isinstance(pid, bool) or pid <= 0:
+# proc_pidinfo flavours from <sys/proc_info.h>. The uniqueid one is in the
+# private header, but its layout is checked on macOS 26 by the tests.
+_PROC_PIDT_SHORTBSDINFO = 13
+_PROC_PIDUNIQIDENTIFIERINFO = 17
+_SZOMB = 5                                # p_stat of a zombie
+
+
+class _ProcBSDShortInfo(ctypes.Structure):
+    _fields_ = [("pbsi_pid", ctypes.c_uint32), ("pbsi_ppid", ctypes.c_uint32),
+                ("pbsi_pgid", ctypes.c_uint32), ("pbsi_status", ctypes.c_uint32),
+                ("pbsi_comm", ctypes.c_char * 16), ("pbsi_flags", ctypes.c_uint32),
+                ("pbsi_uid", ctypes.c_uint32), ("pbsi_gid", ctypes.c_uint32),
+                ("pbsi_ruid", ctypes.c_uint32), ("pbsi_rgid", ctypes.c_uint32),
+                ("pbsi_svuid", ctypes.c_uint32), ("pbsi_svgid", ctypes.c_uint32),
+                ("pbsi_rfu", ctypes.c_uint32)]
+
+
+class _ProcUniqIdentifierInfo(ctypes.Structure):
+    _fields_ = [("p_uuid", ctypes.c_uint8 * 16), ("p_uniqueid", ctypes.c_uint64),
+                ("p_puniqueid", ctypes.c_uint64), ("p_idversion", ctypes.c_int32),
+                ("p_orig_ppidversion", ctypes.c_int32), ("p_reserve2", ctypes.c_uint64),
+                ("p_reserve3", ctypes.c_uint64)]
+
+
+_proc_pidinfo_fn: list[Any] = []          # loaded once; [None] off macOS
+
+
+def _proc_info(pid: int, flavor: int, struct: Any) -> Any | None:
+    """One proc_pidinfo read of `pid`, or None when it fails: the process is
+    gone, or a zombie (macOS answers ESRCH for one), or this is not macOS."""
+    if not _proc_pidinfo_fn:
+        fn = None
+        if sys.platform == "darwin":
+            try:
+                fn = ctypes.CDLL("/usr/lib/libSystem.B.dylib", use_errno=True).proc_pidinfo
+                fn.argtypes = [ctypes.c_int, ctypes.c_int, ctypes.c_uint64,
+                               ctypes.c_void_p, ctypes.c_int]
+                fn.restype = ctypes.c_int
+            except (OSError, AttributeError):
+                fn = None
+        _proc_pidinfo_fn.append(fn)
+    fn = _proc_pidinfo_fn[0]
+    if fn is None:
+        return None
+    buf = struct()
+    n = fn(pid, flavor, 0, ctypes.byref(buf), ctypes.sizeof(buf))
+    return buf if n == ctypes.sizeof(buf) else None
+
+
+def _pid_alive(pid: Any, uniqueid: int | None = None) -> bool:
+    """True if `pid` is a live process we could signal and, when `uniqueid`
+    is given, the very process that wrote the device file.
+
+    A dead owner means the iMirror app crashed without deleting its device
+    file, so the ports it lists are stale and must not be driven. kill(pid, 0)
+    alone says yes to a zombie, and to a pid the system has given to a new
+    process. The app records its kernel uniqueid, never reused within a boot,
+    as owner_uniqueid; a file without one gets the pid checks only."""
+    # pid_t is 32-bit; os.kill raises OverflowError past that.
+    if not isinstance(pid, int) or isinstance(pid, bool) or not 0 < pid < 2 ** 31:
         return False
     try:
         os.kill(pid, 0)
     except OSError:
         return False
-    return True
+    info = _proc_info(pid, _PROC_PIDT_SHORTBSDINFO, _ProcBSDShortInfo)
+    if info is None:
+        return _proc_pidinfo_fn[0] is None    # off macOS, kill() is all we have
+    if info.pbsi_status == _SZOMB:
+        return False
+    if uniqueid is None:
+        return True
+    ids = _proc_info(pid, _PROC_PIDUNIQIDENTIFIERINFO, _ProcUniqIdentifierInfo)
+    return ids is not None and ids.p_uniqueid == uniqueid
 
 
 class _Registry:
@@ -247,6 +316,7 @@ class _Registry:
         self._by_udid: dict[str, _Target] = {}
         self._order: list[str] = []
         self._owner: int | None = None
+        self._owner_uniqueid: int | None = None
         self.goios: str | None = None
         self.problem = "no device file yet"
 
@@ -261,6 +331,7 @@ class _Registry:
 
     def _invalidate(self, problem: str) -> None:
         self._owner = None
+        self._owner_uniqueid = None
         self._order = []
         self.goios = None
         self.problem = problem
@@ -276,7 +347,8 @@ class _Registry:
         sig = (path, st.st_mtime_ns, st.st_size, st.st_ino)
         if sig == self._sig:
             # Unchanged file — but the app may have died since we parsed it.
-            if self._owner is not None and not _pid_alive(self._owner):
+            if self._owner is not None and not _pid_alive(self._owner,
+                                                          self._owner_uniqueid):
                 self._invalidate("the iMirror app that wrote the device file is gone")
             return
         self._sig = sig
@@ -293,7 +365,12 @@ class _Registry:
             self._invalidate("device file has an unknown schema")
             return
         owner = doc.get("owner_pid")
-        if not _pid_alive(owner):
+        uniq = doc.get("owner_uniqueid")      # absent in older app builds
+        if uniq is not None and (not isinstance(uniq, int) or isinstance(uniq, bool)
+                                 or uniq <= 0):
+            self._invalidate("device file has a malformed owner_uniqueid")
+            return
+        if not _pid_alive(owner, uniq):
             self._invalidate("the iMirror app that wrote the device file is gone")
             return
         order: list[str] = []
@@ -302,6 +379,7 @@ class _Registry:
             if t is not None and t.key not in order:
                 order.append(t.key)
         self._owner = owner
+        self._owner_uniqueid = uniq
         self._order = order
         goios = doc.get("goios")
         self.goios = goios if isinstance(goios, str) and goios else None
@@ -327,6 +405,7 @@ class _Registry:
             # nothing on the new endpoint.
             t.wda = wda
             t.session["id"] = None
+            t.session_losses.clear()
             t.window.update(size=None, t=0.0)
         t.alias, t.kind = alias, kind
 
@@ -420,11 +499,22 @@ def _resolve(query: str = "", prefer: str | None = None) -> _Target:
     prefer the simulator); else IMIRROR_DEFAULT_DEVICE; else the only physical
     phone (a Simulator switched on beside it doesn't count, so enabling one
     doesn't break calls that name no device); else fail listing the choices —
-    silently driving the wrong phone is worse than asking."""
+    silently driving the wrong phone is worse than asking. For the same
+    reason, fallback mode refuses when IMIRROR_DEFAULT_DEVICE names a phone
+    other than its single :8100 target."""
     mode, targets = _targets()
     q = (query or "").strip()
     if mode != "list":
         t = targets[0]
+        env = os.environ.get("IMIRROR_DEFAULT_DEVICE", "").strip()
+        if not q and mode == "fallback" and env and not _match_one(env, t):
+            # A pinned agent must not drive whatever answers :8100.
+            raise MCPToolError(
+                f"IMIRROR_DEFAULT_DEVICE={env!r} pins this server to one phone, but "
+                f"it is not reading iMirror's device file ({_REGISTRY.problem}). "
+                f"Refusing to drive {t.wda}, which may be another phone. Is the "
+                "iMirror app running? ios_devices shows the mode.",
+                kind=ErrorKind.UNREACHABLE, code="DEVICE_FILE_INVALID")
         if not q or _match_one(q, t):
             return t
         why = ("pinned to one target by IMIRROR_WDA" if mode == "pinned"
@@ -911,9 +1001,68 @@ def _screenshot_quality() -> int:
 
 
 def _ensure_session() -> str:
-    session = _cur().session
-    if session["id"]:
-        return session["id"]  # type: ignore[return-value]
+    """This phone's WDA session: the cached one, else the one already active
+    on the phone (adopted), else a new one.
+
+    WDA keeps one session per phone, and POST /session kills whichever one
+    exists. A server that created a session whenever it had none broke every
+    other client on the phone, the iMirror app's own mirror included.
+    Adopting costs one GET /status, and clients sharing a session all keep
+    working."""
+    t = _cur()
+    sid = t.session["id"]
+    if sid:
+        return sid
+    active = _active_session_id()
+    if active:
+        return _adopt_session(t, active, "status")
+    return _create_session(t)
+
+
+def _active_session_id() -> str | None:
+    """The session WDA reports as active in GET /status, or None."""
+    code, j = _req("GET", "/status", timeout=_TIMEOUT_PROBE)
+    return _body_session_id(j) if code < 400 else None
+
+
+def _body_session_id(j: Any) -> str | None:
+    """The active session WDA names in a reply. Every reply carries it at
+    the top level, null when there is none (FBResponsePayload.m); a create
+    also returns it as value.sessionId."""
+    if not isinstance(j, dict):
+        return None
+    sid = j.get("sessionId")
+    if not sid and isinstance(j.get("value"), dict):
+        sid = j["value"].get("sessionId")
+    return sid if isinstance(sid, str) and sid else None
+
+
+def _may_adopt_foreign(t: _Target, why: str) -> bool:
+    """May this call join a WDA session that another client made on `t`?
+
+    `why` is "status" when this server had no session and found one active
+    (the normal case: the iMirror app's mirror keeps one), or "lost" when
+    another client replaced this server's session mid-use. The device lease
+    is meant to allow "lost" only while this caller holds the phone, so an
+    agent that does not hold it never drives inside someone else's session
+    unnoticed. Until then: always yes, because creating one kills theirs."""
+    return True
+
+
+def _adopt_session(t: _Target, sid: str, why: str) -> str:
+    """Use session `sid`, which another client created, from now on."""
+    if not _may_adopt_foreign(t, why):
+        raise MCPToolError(
+            f"Another client on this phone owns {_label(t)}'s WebDriverAgent "
+            "session, and this call may not take it over. Nothing was sent.",
+            kind=ErrorKind.WDA_HTTP, code="SESSION_STOLEN")
+    t.session["id"] = sid
+    t.session_stats["adopted"] += 1
+    _apply_session_settings(sid)          # settings are global; re-apply anyway
+    return sid
+
+
+def _create_session(t: _Target) -> str:
     # shouldWaitForQuiescence:false slashes gesture latency — measured on-device, a
     # swipe's /actions drops from ~1300ms to ~10-200ms (XCUITest otherwise blocks each
     # gesture until the UI settles). Use settle_ms on scroll/swipe when a following
@@ -924,11 +1073,64 @@ def _ensure_session() -> str:
     sid = (j.get("value") or {}).get("sessionId") or j.get("sessionId")
     if not sid:
         raise RuntimeError(f"WDA session create failed (HTTP {code}): {j}")
-    session["id"] = sid
+    t.session["id"] = sid
+    t.session_stats["created"] += 1
+    _apply_session_settings(sid)
+    return sid
+
+
+# Two losses this close together: something keeps replacing ours.
+_SESSION_CONTEST_WINDOW_S = 60.0
+
+
+def _lost_session(t: _Target, j: dict[str, Any], sid: str) -> str:
+    """WDA said session `sid` is gone. Return the session to retry with.
+
+    The reply's top-level sessionId says what replaced it: null means WDA
+    restarted, so check /status and create if still none; another id means
+    another client made a session, so adopt it. A second such takeover
+    within a minute means something keeps doing that, and recreating would
+    only start a fight over the phone, so raise SESSION_CONTESTED instead.
+    A restart is not a takeover, and iMirror's recovery can restart WDA
+    twice in a minute."""
+    active = _body_session_id(j)
+    rival = active is not None and active != sid
+    if _count_lost_session(t, sid, rival) >= 2:
+        raise _session_contested(t, active)
+    if active and active != sid:
+        return _adopt_session(t, active, "lost")
+    return _ensure_session()
+
+
+def _count_lost_session(t: _Target, sid: str, rival: bool = True) -> int:
+    """Forget session `sid` and return how many were taken in the window.
+    Only a loss to a `rival` session counts toward that."""
+    if t.session["id"] == sid:
+        t.session["id"] = None
+    t.session_stats["lost"] += 1
+    now = time.monotonic()
+    t.session_losses[:] = [x for x in t.session_losses
+                           if now - x < _SESSION_CONTEST_WINDOW_S] + ([now] if rival else [])
+    return len(t.session_losses)
+
+
+def _session_contested(t: _Target, active: str | None) -> MCPToolError:
+    now_on = f" (WDA's session is now {active})" if active else ""
+    return MCPToolError(
+        f"WebDriverAgent on {_label(t)} dropped this server's session twice "
+        f"within {_SESSION_CONTEST_WINDOW_S:.0f}s{now_on}: another client on "
+        "this phone keeps creating sessions. That is usually another agent's "
+        "MCP server or an old iMirror server, or iMirror itself while a system "
+        "alert is up. The action was not run. Take ios_screenshot: if an alert "
+        "is showing, tap it by coordinates; otherwise check ios_devices, and "
+        "do not retry in a loop.", kind=ErrorKind.WDA_HTTP, code="SESSION_CONTESTED")
+
+
+def _apply_session_settings(sid: str) -> None:
     # Disable XCUITest's idle/animation wait — the big latency win (a swipe over
     # animating content drops ~13s -> ~1s, static lists ~1.3s -> near-instant).
-    # Best-effort; the capability above is ignored by this WDA build, but this
-    # per-session settings route is honored.
+    # Best-effort; this WDA build ignores the shouldWaitForQuiescence capability,
+    # but honours this per-session settings route.
     try:
         _req("POST", f"/session/{sid}/appium/settings",
              {"settings": {"waitForIdleTimeout": 0, "animationCoolOffTimeout": 0}}, timeout=_TIMEOUT_PROBE)
@@ -942,7 +1144,6 @@ def _ensure_session() -> str:
              {"settings": {"screenshotQuality": _screenshot_quality()}}, timeout=_TIMEOUT_PROBE)
     except Exception:
         pass
-    return sid
 
 
 def _wda_error(j: Any) -> str | None:
@@ -989,12 +1190,19 @@ def _session_call(method: str, subpath: str, body: dict | None,
     if code != 404:
         return code, j
     err = _wda_error(j)
-    if err is not None and err != "invalid session id":
+    if err == "invalid session id":
+        sid = _lost_session(t, j, sid)
+    elif err is None:
+        # Older WDA builds send a bare 404: recreate once.
+        t.session["id"] = None
+        sid = _ensure_session()
+    else:
         return code, j                      # a miss, a stale element, an unknown route
-    # Session gone, or an old WDA sent a bare 404: recreate once.
-    t.session["id"] = None
-    sid = _ensure_session()
-    return _req(method, f"/session/{sid}{subpath}", body, timeout=timeout)
+    code, j = _req(method, f"/session/{sid}{subpath}", body, timeout=timeout)
+    if code == 404 and _wda_error(j) == "invalid session id":
+        _count_lost_session(t, sid)         # lost again within this one call
+        raise _session_contested(t, _body_session_id(j))
+    return code, j
 
 
 def _session_post(subpath: str, body: dict) -> dict[str, Any]:
@@ -1047,11 +1255,19 @@ def _win_size() -> tuple[float, float]:
     cached = window["size"]
     if cached and now - window["t"] < 30:
         return cached
-    j = _session_get("/window/size")
-    v = j.get("value", j)
+    v = _window_size()
     size = (float(v["width"]), float(v["height"]))
     window.update(size=size, t=now)
     return size
+
+
+def _window_size() -> dict[str, Any]:
+    """GET /window/size on WDA's sessionless route (FBElementCommands.m), so
+    reading the size never creates a session or takes someone else's."""
+    code, j = _req("GET", "/window/size")
+    if code >= 400:
+        raise _wda_http_error(code, j, "/window/size")
+    return j.get("value", j)
 
 
 def _scroll_geom(direction: str, distance_pct: float,
@@ -1394,8 +1610,11 @@ def ios_devices() -> str:
     """List the devices this server can drive, and whether each one answers.
 
     Returns JSON {"mode", "default", "devices": [{"alias", "udid", "kind",
-    "product_type", "ios", "wda", "app_state", "wda_ready", "is_default"}]}.
-    Pass a device's `alias` (or its UDID) as `device` to any other tool.
+    "product_type", "ios", "wda", "app_state", "wda_ready", "is_default",
+    "session"}]}. `session` counts how this server got its WDA sessions
+    (created, adopted from another client, lost): losses mean another
+    client on this phone. Pass a device's `alias` (or its UDID) as `device`
+    to any other tool.
     `mode` is "list" when the iMirror app is publishing its phones, "pinned"
     when IMIRROR_WDA fixes one target, and "fallback" when neither (then only
     127.0.0.1:8100 is known). `default` is the device a call without `device`
@@ -1415,6 +1634,8 @@ def ios_devices() -> str:
             "product_type": t.product_type, "ios": t.ios_version or p.get("ios"),
             "wda": t.wda, "app_state": t.state, "wda_ready": p["wda_ready"],
             "is_default": t.alias == default,
+            # Many adoptions or losses mean another client shares the phone.
+            "session": {"cached": bool(t.session["id"]), **t.session_stats},
             **({"error": p["error"]} if "error" in p else {}),
         })
     out: dict[str, Any] = {"mode": mode, "default": default, "devices": devices}
@@ -1431,8 +1652,7 @@ def ios_window_size() -> str:
     The width/height swap when the device is in landscape, so call this before
     computing coordinates if the orientation may have changed.
     """
-    j = _session_get("/window/size")
-    return json.dumps(j.get("value", j))
+    return json.dumps(_window_size())
 
 
 def _img_kind(data: bytes) -> tuple[str, str]:
@@ -1469,12 +1689,14 @@ def _img_kind(data: bytes) -> tuple[str, str]:
 def _screenshot_bytes_wda() -> bytes:
     """Capture a screenshot over WDA. Used directly on a device, and as the
     simulator's fallback when the simctl fast path fails."""
-    # Ensure a session exists first so the screenshotQuality settings POST (in
-    # _ensure_session) has run even when a screenshot is the very first tool call
-    # of a session — otherwise the sessionless /screenshot route below returns a
-    # full PNG because quality settings were never applied. Cheap/cached after
-    # the first call.
-    _ensure_session()
+    # screenshotQuality is a session setting. Apply it through the phone's
+    # active session when this server has none yet, but never create one for
+    # a screenshot: that would kill whichever session another client uses.
+    t = _cur()
+    if not t.session["id"]:
+        active = _active_session_id()
+        if active and _may_adopt_foreign(t, "status"):
+            _adopt_session(t, active, "status")
     _, j = _req("GET", "/screenshot")
     b64 = j.get("value")
     if not b64:

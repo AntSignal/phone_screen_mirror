@@ -156,3 +156,127 @@ def test_a_wda_timeout_on_a_find_keeps_the_poll_going(m, fake):
     fake.find_ids["OK"] = ["e1"]
     fake.fail_next("POST", "/element", 408, "timeout", "snapshot timed out")
     assert "found 'OK' after 2 check(s)" == m.ios_wait_for("OK", timeout_s=5)
+
+
+# ---- mcp-core-4: adopt the phone's session; never steal one to read ----------
+
+def test_a_fresh_server_adopts_the_session_already_on_the_phone(m, fake):
+    """WDA keeps one session per phone and POST /session kills it. A new
+    server joins the session another client (the iMirror app's mirror,
+    another agent) already has, and re-applies its settings there."""
+    theirs = fake.new_session()
+    fake.find_ids["OK"] = ["e1"]
+    m.ios_wait_for("OK", timeout_s=1)
+    assert fake.count("POST", "/session") == 0
+    assert fake.count("POST", f"/session/{theirs}/element") == 1
+    assert fake.settings["waitForIdleTimeout"] == 0
+    assert fake.settings["screenshotQuality"] == 1
+
+
+def test_screenshot_and_window_size_never_create_a_session(m, fake):
+    m.ios_screenshot()
+    assert json.loads(m.ios_window_size()) == fake.window
+    m._win_size()
+    assert fake.count("POST", "/session") == 0
+    assert fake.paths("GET").count("/window/size") == 2       # sessionless route
+
+
+def test_a_screenshot_applies_its_quality_through_an_active_session(m, fake):
+    fake.new_session()
+    m.ios_screenshot()
+    assert fake.count("POST", "/session") == 0
+    assert fake.settings["screenshotQuality"] == 1
+
+
+def test_a_session_taken_once_by_another_client_is_adopted(m, fake):
+    m.ios_tap(1, 1)
+    theirs = fake.new_session()
+    m.ios_tap(2, 2)
+    assert fake.count("POST", f"/session/{theirs}/actions") == 1
+    assert fake.count("POST", "/session") == 1                # only the first
+    session = json.loads(m.ios_devices())["devices"][0]["session"]
+    assert session == {"cached": True, "created": 1, "adopted": 1, "lost": 1}
+
+
+def test_two_lost_sessions_within_a_minute_raise_session_contested(m, fake):
+    m.ios_tap(1, 1)
+    fake.new_session()
+    m.ios_tap(2, 2)
+    last = fake.new_session()
+    with pytest.raises(m.MCPToolError) as e:
+        m.ios_tap(3, 3)
+    assert e.value.error_code == "SESSION_CONTESTED"
+    assert "another client on this phone" in str(e.value)
+    assert fake.count("POST", f"/session/{last}/actions") == 0   # tap not sent
+    assert fake.count("POST", "/session") == 1                   # and no fight
+
+
+def test_wda_restarting_twice_in_a_minute_is_not_a_contest(m, fake):
+    """A restart leaves no session on the phone, so nobody took ours.
+    iMirror's recovery can restart WDA twice in a minute; the second
+    restart used to fail the call as SESSION_CONTESTED."""
+    m.ios_tap(1, 1)
+    fake.restart()
+    m.ios_tap(2, 2)
+    fake.restart()
+    m.ios_tap(3, 3)
+    assert fake.count("POST", "/session") == 3
+    assert fake.count("POST", f"/session/{fake.active}/actions") == 1
+
+
+def test_a_takeover_after_a_restart_is_still_adopted(m, fake):
+    m.ios_tap(1, 1)
+    fake.restart()
+    m.ios_tap(2, 2)
+    theirs = fake.new_session()
+    m.ios_tap(3, 3)
+    assert fake.count("POST", f"/session/{theirs}/actions") == 1
+
+
+def test_lost_sessions_a_minute_apart_are_just_adopted(m, fake, monkeypatch):
+    import time
+    monkeypatch.setattr(m, "_SESSION_CONTEST_WINDOW_S", 0.2)
+    m.ios_tap(1, 1)
+    fake.new_session()
+    m.ios_tap(2, 2)
+    time.sleep(0.3)
+    last = fake.new_session()
+    m.ios_tap(3, 3)
+    assert fake.count("POST", f"/session/{last}/actions") == 1
+
+
+def test_a_session_lost_twice_in_one_call_raises_session_contested(m, fake):
+    m.ios_tap(1, 1)
+    for _ in range(2):
+        fake.fail_next("POST", "/actions", 404, "invalid session id",
+                       "Session does not exist")
+    with pytest.raises(m.MCPToolError) as e:
+        m.ios_tap(2, 2)
+    assert e.value.error_code == "SESSION_CONTESTED"
+    assert fake.count("POST", "/session") == 1
+
+
+def test_without_leave_to_adopt_a_taken_session_raises_session_stolen(m, fake, monkeypatch):
+    """The hook the device lease will use: an agent that does not hold the
+    phone must not quietly drive inside another client's session."""
+    m.ios_tap(1, 1)
+    theirs = fake.new_session()
+    asked = []
+    monkeypatch.setattr(m, "_may_adopt_foreign", lambda t, why: asked.append(why))
+    with pytest.raises(m.MCPToolError) as e:
+        m.ios_tap(2, 2)
+    assert e.value.error_code == "SESSION_STOLEN"
+    assert fake.count("POST", f"/session/{theirs}/actions") == 0
+    assert fake.count("POST", "/session") == 1
+    m.ios_screenshot()                          # observing still works
+    assert fake.active == theirs
+    assert asked == ["lost", "status"]
+
+
+def test_without_leave_to_adopt_a_fresh_server_refuses_too(m, fake, monkeypatch):
+    theirs = fake.new_session()
+    monkeypatch.setattr(m, "_may_adopt_foreign", lambda t, why: why != "status")
+    with pytest.raises(m.MCPToolError) as e:
+        m.ios_tap(1, 1)
+    assert e.value.error_code == "SESSION_STOLEN"
+    assert fake.count("POST", "/session") == 0 and fake.active == theirs
