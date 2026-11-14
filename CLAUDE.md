@@ -17,7 +17,8 @@ mcp-server/.venv/bin/python -m pytest mcp-server
 ```
 
 (`mcp-server` runs every suite: `test_imirror_mcp.py`, `test_multi_device.py`,
-`test_sim_control.py` and `test_wda_bringup.py`; the live ones skip themselves.)
+`test_sim_control.py`, `test_wda_bringup.py` and `test_imirror_ctl.py`, which
+covers `scripts/imirror-ctl`; the live ones skip themselves.)
 
 First-time setup (creates the venv the command above expects):
 
