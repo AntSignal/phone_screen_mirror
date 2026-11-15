@@ -1,0 +1,254 @@
+{
+  "boot": "56B0E428-3E94-45AF-BA8C-FD57CC500F00",
+  "ended": [
+    {
+      "anchor": [
+        60001,
+        4209000
+      ],
+      "at_mono": 81234.5,
+      "covered": [
+        [
+          60003,
+          4209002
+        ]
+      ],
+      "key": "wda:127.0.0.1:8100",
+      "lease_id": "9f2c41aa0e6b7d13"
+    }
+  ],
+  "keys": {
+    "device:00008140-0006423002D3401C": {
+      "epoch": 2,
+      "holders": [
+        {
+          "ancestors": [
+            [
+              1100,
+              1100
+            ]
+          ],
+          "anchor": {
+            "name": "2.1.304",
+            "pid": 3376,
+            "uniqueid": 4162500
+          },
+          "claim_until_mono": null,
+          "covered": [],
+          "cwd": "/Users/manaf/Documents/Github/Purpose/Purpose-iOS",
+          "epoch": 1,
+          "frozen": {
+            "at_mono": 81239.5,
+            "hold_left_s": 0.0
+          },
+          "hold_until_mono": 0.0,
+          "idle_s": 300.0,
+          "kind": "session",
+          "label": "",
+          "last_used_mono": 81234.5,
+          "lease_id": "5d0e9b8c7a6f4e21",
+          "mode": "auto",
+          "purpose": "ios_tap",
+          "since": "2026-10-19T21:00:05Z",
+          "since_mono": 81234.5,
+          "via": "imirror-mcp 1.4.0"
+        },
+        {
+          "ancestors": [
+            [
+              53142,
+              4201000
+            ],
+            [
+              3376,
+              4162500
+            ],
+            [
+              1100,
+              1100
+            ]
+          ],
+          "anchor": {
+            "name": "bash",
+            "pid": 61234,
+            "uniqueid": 4210000
+          },
+          "claim_until_mono": null,
+          "covered": [
+            [
+              61300,
+              4210066
+            ]
+          ],
+          "cwd": "/Users/manaf/Documents/Github/Purpose/Purpose-iOS",
+          "epoch": 2,
+          "frozen": null,
+          "hold_until_mono": 83039.5,
+          "idle_s": 300.0,
+          "kind": "run",
+          "label": "",
+          "last_used_mono": 81246.5,
+          "lease_id": "c03b7e5512d9a846",
+          "mode": "reserve",
+          "purpose": "Testing/run.sh 20261019-210000 · 07-extension-lock (7/14)",
+          "since": "2026-10-19T21:00:10Z",
+          "since_mono": 81239.5,
+          "via": "imirror-lease acquire"
+        }
+      ],
+      "last_release": null,
+      "tombstone": null
+    },
+    "device:00008150-001928E01404401C": {
+      "epoch": 1,
+      "holders": [
+        {
+          "ancestors": [
+            [
+              1180,
+              1180
+            ]
+          ],
+          "anchor": {
+            "name": "2.1.302",
+            "pid": 5528,
+            "uniqueid": 4100000
+          },
+          "claim_until_mono": null,
+          "covered": [],
+          "cwd": "/Users/manaf/Documents/Github/imirror-wt/f3",
+          "epoch": 1,
+          "frozen": null,
+          "hold_until_mono": 0.0,
+          "idle_s": 300.0,
+          "kind": "session",
+          "label": "explorer",
+          "last_used_mono": 81254.5,
+          "lease_id": "77a1f0e2b94c5d38",
+          "mode": "auto",
+          "purpose": "ios_find_and_tap",
+          "since": "2026-10-19T21:00:25Z",
+          "since_mono": 81254.5,
+          "via": "imirror-mcp 1.4.0"
+        }
+      ],
+      "last_release": null,
+      "tombstone": null
+    },
+    "sim:5B3C1F2A-0000-4000-8000-00000000A1B2": {
+      "epoch": 1,
+      "holders": [],
+      "last_release": {
+        "at": "2026-10-19T21:01:05Z",
+        "at_mono": 81294.5,
+        "holder": {
+          "cwd": "/Users/manaf/Documents/Github/imirror-wt/f3",
+          "kind": "session",
+          "pid": 5528,
+          "purpose": "ios_screenshot",
+          "via": "imirror-mcp 1.4.0"
+        },
+        "lease_id": "0badc0ffee123456",
+        "note": "iMirror Settings: Free",
+        "reason": "broken"
+      },
+      "tombstone": {
+        "anchors": [
+          [
+            5528,
+            4100000
+          ]
+        ],
+        "at": "2026-10-19T21:01:05Z",
+        "at_mono": 81294.5,
+        "by": "iMirror app",
+        "reason": "iMirror Settings: Free",
+        "until_mono": 81894.5
+      }
+    },
+    "wda:127.0.0.1:8100": {
+      "epoch": 1,
+      "holders": [],
+      "last_release": {
+        "at": "2026-10-19T21:00:05Z",
+        "at_mono": 81234.5,
+        "holder": {
+          "cwd": "/Users/manaf/Documents/Github/Purpose/Purpose-iOS",
+          "kind": "run",
+          "pid": 60001,
+          "purpose": "Testing/run.sh 20261019-204000",
+          "via": "imirror-lease acquire"
+        },
+        "lease_id": "9f2c41aa0e6b7d13",
+        "reason": "anchor-gone"
+      },
+      "tombstone": null
+    }
+  },
+  "protocol": 1,
+  "seq": 2,
+  "tickets": [
+    {
+      "ancestors": [
+        [
+          1180,
+          1180
+        ]
+      ],
+      "anchor": {
+        "name": "2.1.303",
+        "pid": 7001,
+        "uniqueid": 4300000
+      },
+      "cwd": "/Users/manaf/Documents/Github/x",
+      "enqueued_mono": 81264.5,
+      "hold_s": 900.0,
+      "keys": [
+        "device:00008150-001928E01404401C"
+      ],
+      "kind": "session",
+      "label": "",
+      "mode": "explicit",
+      "purpose": "check the buddy screen",
+      "seen_mono": 81264.5,
+      "seq": 1,
+      "since": "2026-10-19T21:00:35Z",
+      "ticket": "t-e4d2c1b0a9f8e7d6",
+      "via": "imirror-mcp 1.4.0"
+    },
+    {
+      "ancestors": [
+        [
+          1180,
+          1180
+        ]
+      ],
+      "anchor": {
+        "name": "2.1.290",
+        "pid": 8001,
+        "uniqueid": 4400000
+      },
+      "cwd": "/Users/manaf/Documents/Github/y",
+      "enqueued_mono": 81274.5,
+      "hold_s": 0.0,
+      "keys": [
+        "device:00008140-0006423002D3401C",
+        "device:00008150-001928E01404401C"
+      ],
+      "kind": "session",
+      "label": "",
+      "mode": "explicit",
+      "purpose": "two-phone buddy flow",
+      "seen_mono": 81274.5,
+      "seq": 2,
+      "since": "2026-10-19T21:00:45Z",
+      "ticket": "t-1a2b3c4d5e6f7081",
+      "via": "imirror-mcp 1.4.0"
+    }
+  ],
+  "updated_at": "2026-10-19T21:01:05Z",
+  "writer": {
+    "pid": 812,
+    "version": "1.0.0"
+  }
+}
