@@ -121,8 +121,8 @@ mirror, every agent's MCP server), so this server avoids creating one:
   showing; otherwise check `ios_devices` rather than retrying in a loop. Its
   per-device `session` counts (`created`, `adopted`, `lost`) show the history.
 
-Nothing here orders two servers' calls to one phone: calls are serialised per
-phone only within one server process.
+Calls are serialised per phone within one server process; across servers,
+device leases order them (next section).
 
 A server exits as soon as its client is gone: when its stdin closes, or when
 its parent process changes (it was orphaned). It does not wait for a tool
@@ -149,8 +149,47 @@ imirror-lease release device:<UDID> --anchor-pid $$
 ```
 
 Exit codes: 0 ok, 2 usage, 3 busy, 4 deadlock, 5 not held or lost, 6 the lease
-system itself failed. Leases are cooperative, and **this server does not check
-them yet**: until its tools do, a lease only orders the callers that ask.
+system itself failed. Leases are cooperative: they order only the callers that
+ask, and this server asks before every device call.
+
+### How the server's tools use leases
+
+Each device tool has an access class:
+
+| Class | Tools | On a device someone else holds |
+|-------|-------|--------------------------------|
+| observe | `ios_status`, `ios_devices`, `ios_screenshot`, `ios_window_size`, `ios_app_state`, `ios_start_run` | runs; never checked |
+| inspect | `ios_source`, `ios_wait_for`, `ios_await_idle`, `ios_assert_*`, `ios_clipboard_get`, `ios_orientation` and `ios_alert` reads | `DEVICE_BUSY` |
+| drive | everything else, `ios_recover` included | `DEVICE_BUSY` |
+
+- **A drive call on a free device takes it** for the caller: an automatic
+  hold that ends after 5 idle minutes, or when the caller's Claude session
+  exits. An inspect call on a free device runs without taking it.
+- **`DEVICE_BUSY` fails at once and sends nothing.** It names the holder and
+  says how to wait in line (`ios_reserve_device`). Don't retry the call in a loop.
+- **`agent`**: every drive and inspect tool takes an optional `agent` name.
+  Subagents of one session share one MCP server, so the name is the only
+  thing that tells them apart: two names in one session are two holders, and
+  once a named agent holds a device, an unnamed call from that session is
+  refused too. A named agent does not share an unnamed hold from its own
+  session either (the parent's tap): it gets `DEVICE_BUSY` until that hold
+  has been idle 30 s, then the hold passes to that one agent. An unnamed
+  hold taken by antsignalctl (`imirror-lease`) is still shared, because it
+  cannot carry a name.
+- **A hold can end mid-call** (it lapsed, the user freed the device, or a run
+  you started took it). The server re-checks before every WDA request,
+  devicectl/simctl run and `ios_run_sequence` step, and stops with
+  `DEVICE_RESERVATION_LOST`; the rest of the call is not sent. The next call
+  that finds its hold gone gets `DEVICE_RESERVATION_LOST` once: take a
+  screenshot before acting again.
+- **Waiting is use.** While a call is in flight (riding out a WDA restart,
+  `ios_recover`, or an install waiting for `devicectl.lock`) a heartbeat
+  renews the hold every few seconds, so the wait never counts as idle time.
+  Order is lease, then the per-device call lock, then `devicectl.lock`, so
+  they cannot deadlock.
+- Keys are UDIDs, never aliases. A server pinned by `IMIRROR_WDA` finds its
+  UDID through `IMIRROR_UDID` or the device file's `wda_url`; with neither it
+  locks `wda:127.0.0.1:<port>`, which excludes only other pinned servers.
 
 ## When a phone's WDA restarts
 
@@ -328,6 +367,9 @@ mcp-server/.venv/bin/python -m pytest mcp-server
 leases live sessions use. `test_devicelease.py` covers the pure rules;
 `test_devicelease_store.py` runs the CLI and the store against real child
 processes, also under the Mac's own `/usr/bin/python3` (3.9).
+`test_lease_hook.py` drives the tools against another agent's hold (a real
+child process) and checks nothing reaches WDA, including mid-call losses
+over real HTTP.
 
 ## Security
 

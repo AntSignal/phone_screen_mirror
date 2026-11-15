@@ -460,10 +460,11 @@ class Config:
     claim_live_s: float = 90.0              # grant to a waiter seen recently
     claim_absent_s: float = 10.0            # grant to a waiter not seen lately
     claim_seen_s: float = 30.0
-    ticket_s: float = 180.0                 # a ticket nobody refreshes dies
-    seen_refresh_s: float = 15.0
+    ticket_s: float = 35.0                  # re-call within 30 s to stay queued
+    seen_refresh_s: float = 5.0             # so a ticket is never 5 s+ stale
     autowait_s: float = 20.0                # auto calls wait only this long
     tombstone_s: float = 600.0              # after a break by the user
+    handoff_idle_s: float = 30.0            # idle unnamed hold passes to a named agent
     push_depth: int = 4
     touch_s: float = 0.0                    # renew last_used at most this often
     ended_keep_s: float = 86400.0
@@ -839,7 +840,7 @@ class Outcome:
         return out
 
 
-_OK = ("grant", "renew", "covered", "push", "free")
+_OK = ("grant", "renew", "covered", "push", "free", "handoff")
 _CODES = {"busy": "DEVICE_BUSY", "queued": "DEVICE_BUSY", "deadlock": "DEVICE_DEADLOCK",
           "lost": "DEVICE_RESERVATION_LOST", "freed_by_user": "DEVICE_FREED_BY_USER"}
 _MODE_RANK = {"auto": 0, "explicit": 1, "reserve": 2}
@@ -898,6 +899,14 @@ def _label_verdict(top: Dict[str, Any], me: Caller) -> Optional[str]:
     return None
 
 
+def _named_on_unnamed(top: Dict[str, Any], me: Caller) -> bool:
+    """A named MCP agent meeting an unnamed agent hold of its own session.
+    Riding it let two named subagents drive one phone at once. An unnamed
+    antsignalctl hold (imirror-lease) may still be ridden: it cannot be named."""
+    return (me.client == "mcp" and bool(me.label) and not norm_label(top.get("label"))
+            and not str(top.get("via") or "").startswith("imirror-lease"))
+
+
 def _eval_key(st: Dict[str, Any], key: str, req: Request, me: Caller, now: float,
               cfg: Config, my_seq: Optional[int]) -> Tuple[str, str, Optional[Dict[str, Any]]]:
     """(verdict, reason, entry) for one key. Order: coverage on the real chain,
@@ -951,6 +960,12 @@ def _eval_key(st: Dict[str, Any], key: str, req: Request, me: Caller, now: float
         lv = _label_verdict(top, me)
         if lv:
             return "busy", lv, top
+        if _named_on_unnamed(top, me):
+            idle = now - float(top.get("last_used_mono") or now)
+            if idle < cfg.handoff_idle_s or top.get("claim_until_mono") is not None:
+                return "busy", "unnamed", top
+            # Idle, so no call of the unnamed agent is in flight.
+            return ("free", "", None) if req.op == "inspect" else ("handoff", "", top)
         return "renew", "", top
 
     # 4. My own run holds it; mine may be suspended.
@@ -1156,6 +1171,15 @@ def _do_acquire(st: Dict[str, Any], req: Request, keys: Tuple[str, ...], me: Cal
                 ks["holders"].append(e)
                 events.append(_event("granted", key=k, lease_id=lease_new, pid=me.anchor.pid,
                                      purpose=req.purpose, mode=e["mode"]))
+            elif v == "handoff":
+                old = ks["holders"].pop()
+                ks["last_release"] = _release_record(old, "handoff", now, cfg)
+                events.append(_event("handed-off", key=k, lease_id=old.get("lease_id"),
+                                     label=me.label))
+                lease_new = lease_new or new_id()
+                ks["epoch"] += 1
+                e = _new_entry(lease_new, ks["epoch"], me, req, now, cfg)
+                ks["holders"].append(e)
             elif v == "renew":
                 _renew(e, req, now, cfg)
             elif v == "covered":
@@ -1197,7 +1221,10 @@ def _do_acquire(st: Dict[str, Any], req: Request, keys: Tuple[str, ...], me: Cal
 
     etas = []
     for k, (v, reason, e) in fails.items():
-        if e is not None and reason != "ticket-ahead":
+        if e is not None and reason == "unnamed":
+            etas.append(max(0.0, float(e.get("last_used_mono") or now)
+                            + cfg.handoff_idle_s - now))
+        elif e is not None and reason != "ticket-ahead":
             etas.append(max(0.0, _expiry(e, cfg) - now))
         else:
             etas.append(None)
@@ -1327,7 +1354,8 @@ def view(state: Dict[str, Any], me: Optional[Caller], now: float,
         waiting = [t for t in tickets if k in t["keys"]]
         if top is None:
             state_name = "free"
-        elif me is not None and _anchor(top) == me.anchor and _label_verdict(top, me) is None:
+        elif (me is not None and _anchor(top) == me.anchor and _label_verdict(top, me) is None
+              and not _named_on_unnamed(top, me)):
             state_name = "yours"
         elif me is not None and _anchor(top) != me.anchor and _anchor(top) in set(me.chain):
             state_name = "covered"
@@ -1405,6 +1433,10 @@ def describe(out: Outcome, *, now: float, cfg: Config, names: Optional[Dict[str,
                 f"to you when that run ends.")
     elif reason == "subagent":
         lead = f"Nothing was sent. {name} is held by your subagent \"{h.get('label', '')}\"."
+    elif reason == "unnamed":
+        lead = (f"Nothing was sent. {name} is held by an agent in this session that gave no "
+                f"agent name (your parent, or a subagent that left it out). It passes to "
+                f"you once that hold has been idle {int(cfg.handoff_idle_s)} s.")
     elif reason == "label":
         lead = (f"Nothing was sent. {name} is held by a named agent in this session "
                 f"(\"{h.get('label', '')}\"); pass agent=<your name> on every call.")
@@ -1985,11 +2017,13 @@ class Locker:
                 return out
             sleep(0.5)
 
-    def enter(self, key: str, label: str = "", purpose: str = "", access: str = "drive") -> Hold:
+    def enter(self, key: str, label: str = "", purpose: str = "", access: str = "drive",
+              autowait: bool = True) -> Hold:
         """Before a tool call. observe: never checked (a holder's observe call
         renews, best effort). inspect: BUSY if someone else holds; runs free
         on a free device; after LOST it runs with a warning. drive: needs the
-        hold, taken automatically if free. Raises LeaseError or StateError."""
+        hold, taken automatically if free. autowait=False answers BUSY at once
+        (the MCP server's rule). Raises LeaseError or StateError."""
         key = normalize_key(key)
         label = norm_label(label)
         if not self.enabled:
@@ -2002,7 +2036,10 @@ class Locker:
             return Hold(key, label, access, active=False)
         self._guard()
         with self._mutex:
-            self._revoked.pop((key, label), None)
+            # Bug: a second call cleared a revocation the first still had to
+            # see, so the first went on driving a phone it had lost.
+            if not self._inflight.get((key, label)):
+                self._revoked.pop((key, label), None)
         if access == "inspect":
             out = self.attempt(Request(op="inspect", keys=(key,), mode="auto",
                                        believed=self._beliefs((key,), label)), label)
@@ -2013,7 +2050,7 @@ class Locker:
             if out.status not in ("held", "covered"):
                 raise LeaseError(out)
         else:
-            out = self.ensure((key,), label=label, purpose=purpose)
+            out = self.ensure((key,), label=label, purpose=purpose, autowait=autowait)
             if out.status not in ("held", "covered"):
                 raise LeaseError(out)
         with self._mutex:

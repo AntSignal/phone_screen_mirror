@@ -67,6 +67,7 @@ from pydantic import Field
 _saved_dont_write_bytecode = sys.dont_write_bytecode
 sys.dont_write_bytecode = True
 try:
+    import devicelease
     import sim_control
     import wda_bringup
 finally:
@@ -87,11 +88,13 @@ class ErrorKind:
     UNSUPPORTED = "unsupported"
     # A change may have reached WDA; its reply was lost.
     OUTCOME_UNKNOWN = "outcome_unknown"
+    # Another agent holds the device, or this call lost its hold.
+    LEASE = "lease"
 
 
 _ERROR_KINDS = {ErrorKind.VALIDATION, ErrorKind.NOT_FOUND, ErrorKind.WDA_HTTP,
                 ErrorKind.UNREACHABLE, ErrorKind.WEDGED, ErrorKind.TIMEOUT,
-                ErrorKind.UNSUPPORTED, ErrorKind.OUTCOME_UNKNOWN}
+                ErrorKind.UNSUPPORTED, ErrorKind.OUTCOME_UNKNOWN, ErrorKind.LEASE}
 
 
 class MCPToolError(RuntimeError):
@@ -1085,13 +1088,171 @@ _riding: contextvars.ContextVar[Any] = contextvars.ContextVar("imirror_riding",
                                                               default=None)
 
 
+# ---- Device leases: which agent may drive a device now --------------------------
+#
+# Many agents share a few devices, and two drivers on one WDA trample each
+# other, so every device call asks devicelease first. _tool's `access`:
+#   observe  never checked (status, screenshots).
+#   inspect  BUSY if someone else holds it; else runs without taking it.
+#   drive    needs the hold, taken automatically when the device is free.
+# Default: inspect for read_only tools, drive for the rest; both get an
+# `agent` argument. A busy device fails at once and nothing is sent. Order:
+# lease, then call_lock, then devicectl.lock, so they cannot deadlock.
+
+# Settings that pick the lease runtime; only tests change them.
+_LEASE_ENV = ("IMIRROR_LEASE", "IMIRROR_LEASE_DIR", "IMIRROR_LEASE_IDLE_S",
+              "IMIRROR_LEASE_TESTING", "IMIRROR_LEASE_CONTEXT", "IMIRROR_LEASE_REQUIRED",
+              "IMIRROR_LEASE_LABELS")
+_lease_rt: dict[str, Any] = {"env": None, "locker": None}
+_lease_rt_lock = threading.Lock()
+
+_AGENT_DOC = ("Your agent name, if you are a subagent or one of several agents in "
+              "this session: pass the same name on every call and to "
+              "ios_reserve_device, so other agents in the session cannot drive "
+              "a device you hold. Omit it if you are the only agent.")
+
+_BUSY_HINT_REASONS = ("foreign", "ticket-ahead", "subagent", "label", "unnamed")
+
+
+def _leases() -> devicelease.Locker:
+    """This server's lease runtime, made on first use (never at import, when
+    a test has not yet pointed IMIRROR_LEASE_DIR at its own folder). It is
+    rebuilt only when the IMIRROR_LEASE_* settings change, which only tests
+    do; the old one's heartbeat thread is stopped."""
+    env = tuple(os.environ.get(n) for n in _LEASE_ENV)
+    with _lease_rt_lock:
+        lk = _lease_rt["locker"]
+        if lk is None or _lease_rt["env"] != env:
+            if lk is not None:
+                lk.close()
+            lk = devicelease.Locker(client="mcp", via=f"imirror-mcp {__version__}")
+            _lease_rt.update(env=env, locker=lk)
+        return lk
+
+
+def _leases_close() -> None:
+    """Stop the lease heartbeat (tests make a runtime per test)."""
+    with _lease_rt_lock:
+        lk = _lease_rt["locker"]
+        _lease_rt.update(env=None, locker=None)
+    if lk is not None:
+        lk.close()
+
+
+def _lease_key(t: _Target) -> str:
+    """The lease key of `t`: always its hardware or Simulator UDID when
+    known, because aliases follow plug-in order. A pinned server finds the
+    UDID in the device file by its WDA URL; with none it locks the URL."""
+    udid, is_sim = t.udid, t.is_sim
+    if not udid:
+        valid, targets = _REGISTRY.snapshot()
+        hit = next((x for x in targets if x.udid and x.wda == t.wda.rstrip("/")),
+                   None) if valid else None
+        if hit is not None:
+            udid, is_sim = hit.udid, hit.is_sim
+    if udid:
+        with contextlib.suppress(devicelease.UsageError):
+            return (devicelease.sim_key if is_sim else devicelease.device_key)(udid)
+    parts = urlsplit(t.wda)
+    return devicelease.wda_key(parts.hostname or "127.0.0.1", parts.port or 80)
+
+
+def _lease_name(t: _Target) -> str:
+    return t.alias if t is not _LEGACY else _label(t)
+
+
+def _lease_error(e: Exception, t: _Target, key: str, *,
+                 mid_call: bool = False) -> MCPToolError:
+    """A lease refusal as the agent reads it: the device by name, not by
+    key, and the next call to make."""
+    name = _lease_name(t)
+    if not isinstance(e, devicelease.LeaseError):       # the lease system broke
+        msg = str(e)
+        if "nothing was sent" not in msg.lower():
+            msg += f". Nothing was sent to {name}."
+        return MCPToolError(f"Device leases cannot answer: {msg} Retry shortly.",
+                            kind=ErrorKind.LEASE,
+                            code=getattr(e, "code", "RESERVATION_STATE_ERROR"),
+                            fields={"retry_after_s": 1})
+    msg = str(e).replace(key, name)
+    code = e.code
+    if mid_call and code != "DEVICE_FREED_BY_USER":
+        code = "DEVICE_RESERVATION_LOST"
+    elif code == "DEVICE_BUSY" and any(
+            r in _BUSY_HINT_REASONS for r in e.outcome.reasons.values()):
+        alias = t.alias if t is not _LEGACY else ""
+        dev = f"device={alias!r}, " if alias else ""
+        msg += (f" To wait your turn, call ios_reserve_device({dev}agent=<your name>) "
+                "and call it again while it says queued; or use another device "
+                "(ios_devices). Don't retry this call in a loop.")
+    return MCPToolError(msg, kind=ErrorKind.LEASE, code=code,
+                        fields={"retry_after_s": e.outcome.retry_after_s})
+
+
+# The hold the running call is under, for _lease_check.
+_lease_ctx: contextvars.ContextVar[Any] = contextvars.ContextVar("imirror_lease",
+                                                                 default=None)
+
+
+def _lease_enter(t: _Target, access: str, agent: str, tool: str) -> Any:
+    """Ask for `t` before a call. Returns (locker, hold, target, key), or
+    None for observe calls. Raises MCPToolError(kind=lease) with nothing
+    sent when someone else holds it."""
+    if access == "observe":
+        with contextlib.suppress(Exception):    # never fails an observe call
+            _leases().enter(_lease_key(t), label=agent, access="observe")
+        return None
+    lk = _leases()
+    key = _lease_key(t)
+    who = f"agent {devicelease.norm_label(agent)!r}" if agent else "an agent"
+    try:
+        hold = lk.enter(key, label=agent, purpose=f"{who}, last call {tool}",
+                        access=access, autowait=False)
+    except (devicelease.LeaseError, devicelease.StateError) as e:
+        raise _lease_error(e, t, key) from None
+    return lk, hold, t, key
+
+
+def _lease_check() -> None:
+    """Stop the running call if its hold was taken away mid-call: a break
+    from iMirror, a lapse, or a run that took the device. Called before
+    every WDA request and every devicectl/simctl run. Cheap: a dict lookup
+    unless the heartbeat has not looked for a while."""
+    ctx = _lease_ctx.get()
+    if ctx is None:
+        return
+    lk, hold, t, key = ctx
+    if not hold.active:
+        return
+    try:
+        lk.check(hold.key, hold.label)
+    except devicelease.LeaseError as e:
+        raise _lease_error(e, t, key, mid_call=True) from None
+
+
+def _lease_note(result: Any, warning: str) -> Any:
+    """Mark an inspect result read after this caller's hold ended."""
+    note = ("Your hold on this device ended and another agent may have used it "
+            "since your last call; this read ran anyway.")
+    if not warning or not isinstance(result, str):
+        return result
+    if result.startswith("{"):
+        try:
+            j = json.loads(result)
+        except ValueError:
+            j = None
+        if isinstance(j, dict):
+            return json.dumps({**j, "lease_warning": note})
+    return f"WARNING: {note}\n{result}"
+
+
 _DEVICE_DOC = ("Which device to drive: an alias or UDID from ios_devices (a unique "
                "UDID prefix or suffix of 4+ characters also works). Omit it when "
                "only one phone is attached.")
 
 
 def _tool(*, per_device: bool = True, lock: bool = True, optional: bool = False,
-          prefer: str | None = None, read_only: bool = False):
+          prefer: str | None = None, read_only: bool = False, access: Any = None):
     """Register a tool with FastMCP; for device tools, add a `device` argument.
 
     Returns a plain sync function under the tool's own name, so tests,
@@ -1114,18 +1275,34 @@ def _tool(*, per_device: bool = True, lock: bool = True, optional: bool = False,
     it runs other tool calls from one message one after another. Such a call
     is also retried once after a chain restart (see _ride_out); any other
     call waits for the restart but is never repeated.
+    `access`: the lease class, or a function of the call's arguments (see
+    "Device leases").
     """
+    if access is None:
+        access = "inspect" if read_only else "drive"
+
     def deco(fn):
         sig = inspect.signature(fn, eval_str=True)
+        fn_sig = sig
+
+        def access_of(args: tuple, kwargs: dict) -> str:
+            if not callable(access):
+                return access
+            try:
+                return access(fn_sig.bind_partial(*args, **kwargs).arguments)
+            except TypeError:
+                return "drive"          # the call itself will fail
         if per_device:
-            sig = sig.replace(parameters=[
-                *sig.parameters.values(),
-                inspect.Parameter("device", inspect.Parameter.KEYWORD_ONLY, default="",
-                                  annotation=Annotated[str, Field(description=_DEVICE_DOC)]),
-            ])
+            extra = [inspect.Parameter("device", inspect.Parameter.KEYWORD_ONLY, default="",
+                                       annotation=Annotated[str, Field(description=_DEVICE_DOC)])]
+            if access != "observe":
+                extra.append(inspect.Parameter(
+                    "agent", inspect.Parameter.KEYWORD_ONLY, default="",
+                    annotation=Annotated[str, Field(description=_AGENT_DOC)]))
+            sig = sig.replace(parameters=[*sig.parameters.values(), *extra])
 
             @functools.wraps(fn)
-            def entry(*args: Any, device: str = "", **kwargs: Any) -> Any:
+            def entry(*args: Any, device: str = "", agent: str = "", **kwargs: Any) -> Any:
                 active = _current.get()
                 if active is not None:
                     if device and not _match_one(device, active):
@@ -1144,12 +1321,17 @@ def _tool(*, per_device: bool = True, lock: bool = True, optional: bool = False,
                         with t.call_lock:
                             return fn(*args, **kwargs)
                     return fn(*args, **kwargs)
+                acc = access_of(args, kwargs)
+                # Before call_lock: a busy device must not queue here.
+                lease = _lease_enter(t, acc, agent, fn.__name__)
+                lease_token = _lease_ctx.set(lease)
                 token = _current.set(t)
                 riding = _riding.set(fn)
                 start_epoch = t.chain_epoch
                 try:
                     try:
-                        return once()
+                        result = once()
+                        return _lease_note(result, lease[1].warning) if lease else result
                     except MCPToolError as e:
                         if not _rides_out(e):
                             raise
@@ -1165,6 +1347,10 @@ def _tool(*, per_device: bool = True, lock: bool = True, optional: bool = False,
                 finally:
                     _riding.reset(riding)
                     _current.reset(token)
+                    _lease_ctx.reset(lease_token)
+                    if lease:
+                        # Ends "in flight", not the hold: it lapses when idle.
+                        lease[0].exit(lease[1])
             entry.__signature__ = sig  # type: ignore[attr-defined]
         else:
             entry = fn
@@ -1224,6 +1410,7 @@ def _http(method: str, path: str, data: bytes | None,
     current target and return (status, raw_body). Raises the underlying
     socket/http.client error on a connection-level failure (the caller decides
     whether to retry)."""
+    _lease_check()                 # nothing goes out on a lost hold
     base = _cur().wda
     parts = urlsplit(base)
     host, port = parts.hostname, parts.port or 80
@@ -2040,7 +2227,7 @@ def _render_source_text(root: dict[str, Any]) -> str:
 
 # ---- Read-only tools -----------------------------------------------------------
 
-@_tool(read_only=True)
+@_tool(read_only=True, access="observe")
 def ios_status() -> str:
     """Check whether WebDriverAgent is up and ready to accept commands.
 
@@ -2209,7 +2396,7 @@ def ios_recover() -> str:
     return json.dumps(out)
 
 
-@_tool(read_only=True)
+@_tool(read_only=True, access="observe")
 def ios_window_size() -> str:
     """Get the device's logical screen size in points for the CURRENT orientation.
 
@@ -2286,7 +2473,7 @@ def _screenshot_bytes_simctl() -> bytes:
             pass
 
 
-@_tool(read_only=True)
+@_tool(read_only=True, access="observe")
 def ios_screenshot() -> Image:
     """Capture the iPhone's current screen. Returns a PNG by default. On a
     physical device, IMIRROR_SCREENSHOT_QUALITY=1/2 makes WDA return smaller,
@@ -2680,7 +2867,7 @@ def _alert_call(method: str, route: str, body: dict | None = None) -> tuple[bool
     return True, (j.get("value") if isinstance(j, dict) else None)
 
 
-@_tool()
+@_tool(access=lambda a: "inspect" if a.get("action", "get") == "get" else "drive")
 def ios_alert(action: str = "get", button_label: str = "") -> str:
     """Read a system alert, or accept or dismiss it.
 
@@ -2828,7 +3015,7 @@ def _wait_for_timeout_snapshot() -> str:
         return f"(could not read current screen: {e})"
 
 
-@_tool()
+@_tool(access=lambda a: "drive" if a.get("set_to") else "inspect")
 def ios_orientation(set_to: str = "") -> str:
     """Get the device orientation, or set it.
 
@@ -2875,7 +3062,7 @@ def ios_activate_app(bundle_id: str) -> str:
     return f"activated {bundle_id}"
 
 
-@_tool(read_only=True)
+@_tool(read_only=True, access="observe")
 def ios_app_state(bundle_id: str) -> str:
     """Report an app's running state as JSON: not-installed / not-running /
     background / foreground (WDA numeric code included)."""
@@ -3096,6 +3283,7 @@ def _install_on_device(path: str) -> None:
     if udid:
         args.append(f"--udid={udid}")
     with _mac_wide_install_lock():
+        _lease_check()                 # the lock wait may have been long
         _write_expected_reset(udid)
         try:
             subprocess.run(args, check=True, capture_output=True, text=True)
@@ -3109,6 +3297,7 @@ def _install_on_device(path: str) -> None:
 
 def _install_on_simulator(path: str) -> None:
     """Install `path` on the simulator via `xcrun simctl install <sim>`."""
+    _lease_check()
     try:
         subprocess.run(["xcrun", "simctl", "install", _sim_udid(), path],
                        check=True, capture_output=True, text=True)
@@ -3154,6 +3343,7 @@ def _simctl(*args: str, strip: bool = True) -> str:
     clipboard content read via `pbpaste`.
     """
     _require_sim()
+    _lease_check()
     try:
         r = subprocess.run(["xcrun", "simctl", *args],
                            check=True, capture_output=True, text=True)
@@ -3386,7 +3576,7 @@ def sim_disable(simulator: str) -> str:
 
 # ---- Test-run recording & report -----------------------------------------------
 
-@_tool(lock=False, optional=True)
+@_tool(lock=False, optional=True, access="observe")
 def ios_start_run(label: str = "test") -> str:
     """Begin recording a test run so a report can be generated at the end.
 
@@ -3723,8 +3913,8 @@ def ios_run_sequence(steps: list[dict]) -> str:
     `device` picks the phone for the WHOLE sequence; steps can't carry their
     own. The sequence holds that phone for its full length, so other calls to
     the same phone from this server wait until it finishes, while calls to
-    other phones carry on. It is still not atomic against a second MCP server
-    (another agent session) driving the same phone.
+    other phones carry on. Its device lease covers every step; if the lease
+    is taken away mid-way (DEVICE_RESERVATION_LOST), the rest is not run.
     """
     if not isinstance(steps, list) or not steps:
         raise MCPToolError("steps must be a non-empty list", kind=ErrorKind.VALIDATION)
@@ -3739,6 +3929,7 @@ def ios_run_sequence(steps: list[dict]) -> str:
         kwargs = {k: v for k, v in step.items() if k != "action"}
         ran = i
         try:
+            _lease_check()             # a lost hold stops the rest
             detail = _SEQ_ACTIONS[action]["fn"](**kwargs)
             results.append({"i": i, "action": action, "status": "pass", "detail": detail})
         except Exception as e:

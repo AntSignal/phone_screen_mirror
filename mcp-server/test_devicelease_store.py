@@ -711,6 +711,21 @@ def test_heartbeat_stops_a_call_when_the_user_frees_the_device():
     assert not h.active
 
 
+def test_a_second_call_never_clears_the_first_calls_lost_hold():
+    """Two calls by one agent on one phone: the user frees it while the
+    first runs. The second call's start must not wipe the first's stop."""
+    locker = dl.Locker(client="mcp", via="test", heartbeat_s=0.05)
+    user = as_caller(dl.Proc(os.getpid(), dl.proc_unique(os.getpid())[0]), kind="terminal")
+    with locker.hold(K1, label="a"):
+        decide_as(user, "break", [K1], reason="Free")
+        wait_for(lambda: (K1, "a") in locker._revoked, what="the heartbeat")
+        with pytest.raises(dl.LeaseError):
+            locker.enter(K1, label="a")           # refused: the user has it
+        with pytest.raises(dl.LeaseError) as e:
+            locker.check(K1, "a")
+        assert e.value.code == "DEVICE_FREED_BY_USER", "the first call still stops"
+
+
 def test_the_heartbeat_never_calls_time_sleep_and_close_stops_it(monkeypatch):
     """The MCP suite patches time.sleep in dozens of tests; a heartbeat that
     called it spun and polluted their sleep logs. close() ends the thread."""
