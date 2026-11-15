@@ -111,13 +111,15 @@ public enum DongleProtocol {
     public static let pairGraceSec: TimeInterval = 10
 
     /// A SEND's own delays can pass 30 s (128 steps of up to 2 s), so it
-    /// gets the dongle's 15 s connect wait, 1 s settle and its delays, plus slack.
+    /// gets 30 s on top of them. The dongle may spend about 21 s outside
+    /// the delays: up to 2 s hanging up before, 15 s connect wait, 1 s
+    /// settle, up to 2 s hanging up after, plus a little per report.
     public static func timeout(for c: DongleCommand) -> TimeInterval {
         switch c {
         case .hello: return helloTimeoutSec
         case .send(_, let steps):
             let delays = TimeInterval(steps.reduce(0) { $0 + max($1.delayAfterMs, 0) }) / 1000
-            return max(sendTimeoutSec, 15 + 1 + delays + 4)
+            return sendTimeoutSec + delays
         case .pair(_, let s): return TimeInterval(s) + pairGraceSec
         default: return otherTimeoutSec
         }
