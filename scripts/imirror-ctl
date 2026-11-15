@@ -24,11 +24,11 @@ from datetime import datetime, timedelta, timezone
 
 DEFAULT_DEVICES = "~/Library/Application Support/iMirror/devices.json"
 RESTART_WAIT_S = 30.0
-# The app's pairing window is 120 s; it picks a request up within 5 s.
+# App: 120 s pairing window, picked up within 5 s.
 KEYBOARD_WAIT_S = {"pair": 130.0, "forget": 30.0, "test": 30.0}
-# The app's rule: lower-case words and digits, with at least one letter,
-# so a numeric passcode can never be sent as test text.
-TEST_TEXT = re.compile(r"(?=.*[a-z])[a-z0-9 ]{1,32}")
+# The app's rule: lower-case words and digits, with at least one letter
+# and at most three digits, so test text is never a passcode attempt.
+TEST_TEXT = re.compile(r"(?=.*[a-z])(?!(?:[^0-9]*[0-9]){4})[a-z0-9 ]{1,32}")
 # The keyboard event details that answer each request.
 KEYBOARD_ANSWERS = {
     "pair": {"paired", "ambiguous", "timeout", "failed"},
@@ -249,7 +249,7 @@ def write_keyboard_request(folder, udid, now, action, text=None):
     extra = {"action": action}
     if action == "test":
         if not isinstance(text, str) or not TEST_TEXT.fullmatch(text):
-            raise CtlError("test text must be 1-32 of a-z, 0-9 and space, with at least one letter")
+            raise CtlError("test text must be 1-32 of a-z, 0-9 and space, with a letter and at most 3 digits")
         extra["text"] = text
     elif text is not None:
         raise CtlError(f"keyboard {action} takes no text")
@@ -355,7 +355,7 @@ def main(argv=None):
     k = sub.add_parser("keyboard", help="pair, test or forget iMirror's Bluetooth keyboard for a phone")
     k.add_argument("action", choices=["pair", "forget", "test", "status"])
     k.add_argument("device")
-    k.add_argument("text", nargs="?", help="test only: a-z, 0-9 and space, with a letter")
+    k.add_argument("text", nargs="?", help="test only: a-z, 0-9 and space; a letter, at most 3 digits")
     k.add_argument("--wait", type=float, help="seconds to wait (default 130 for pair, else 30)")
     k.add_argument("-n", type=int, default=10, help="status: keyboard events to show (default 10)")
     a = p.parse_args(argv)
