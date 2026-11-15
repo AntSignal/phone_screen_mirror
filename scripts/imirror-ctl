@@ -155,7 +155,7 @@ def format_event(e):
     what = str(e.get("event", "?"))
     if e.get("from") or e.get("to"):
         what += f" {e.get('from') or '-'} -> {e.get('to') or '-'}"
-    for k in ("reason", "detail"):
+    for k in ("reason", "detail", "transport"):
         if e.get(k):
             what += f" {k}={e[k]}"
     if isinstance(e.get("chars"), int):
@@ -165,10 +165,11 @@ def format_event(e):
     return f"{e.get('ts', '?')}  {e.get('alias') or e.get('udid', '?')}  {what}"
 
 
-def format_device(d):
+def format_device(d, pairs=None):
     rows = [("state", d.get("state")), ("reason", d.get("reason")), ("state_since", d.get("state_since")),
             ("chain_epoch", d.get("chain_epoch")), ("next_retry_at", d.get("next_retry_at")),
-            ("last_error", d.get("last_error")), ("detail", d.get("detail"))]
+            ("last_error", d.get("last_error")), ("detail", d.get("detail")),
+            ("keyboard", describe_pair((pairs or {}).get(d.get("udid"))))]
     lines = [f"{d.get('alias')} ({d.get('udid')}, {d.get('kind', 'device')})"]
     lines += [f"  {k:<14}{'-' if v is None else v}" for k, v in rows]
     return "\n".join(lines)
@@ -257,7 +258,8 @@ def write_keyboard_request(folder, udid, now, action, text=None):
 
 
 def read_pairs(folder):
-    """keyboard-pairs.json as {udid: {"central", "paired_at"}}; {} if absent."""
+    """keyboard-pairs.json as {udid: entry}; {} if absent. An entry has
+    "transport" ("dongle": "slot", "peer"; "corebluetooth" or none: "central")."""
     try:
         with open(os.path.join(folder, "keyboard-pairs.json"), encoding="utf-8") as f:
             data = json.load(f)
@@ -303,6 +305,8 @@ KEYBOARD_HINTS = {
     "not_paired": "pair it first: imirror-ctl keyboard pair <device>",
     "not_connected": "the phone did not connect; is Bluetooth on, and is it still paired?",
     "bluetooth_unavailable": "Bluetooth is off, or iMirror was refused Bluetooth access (System Settings > Privacy).",
+    "dongle_unavailable": "this phone is paired with the USB dongle; plug it in (Settings shows 'dongle connected').",
+    "dongle_error": "the dongle did not answer in time; unplug it, plug it back in and try again.",
 }
 
 
@@ -329,9 +333,17 @@ def keyboard_device(query, devices, pairs):
         return {"udid": hit, "alias": hit, "kind": "device"}
 
 
+def describe_pair(p):
+    """One line for a phone's keyboard tie; an old entry has no transport."""
+    if not p:
+        return "not paired"
+    if p.get("transport") == "dongle":
+        return f"paired via dongle, slot {p.get('slot')}, peer {p.get('peer')}, at {p.get('paired_at')}"
+    return f"paired via this Mac, central {p.get('central')}, at {p.get('paired_at')}"
+
+
 def format_keyboard_status(dev, pairs, events):
-    p = pairs.get(dev.get("udid"))
-    tie = f"paired with central {p.get('central')} at {p.get('paired_at')}" if p else "not paired"
+    tie = describe_pair(pairs.get(dev.get("udid")))
     lines = [f"{dev.get('alias')} ({dev.get('udid')})", f"  keyboard      {tie}",
              f"last {len(events)} keyboard events:"]
     lines += ["  " + format_event(e) for e in events] or ["  (none)"]
@@ -385,9 +397,10 @@ def main(argv=None):
             d = resolve(a.device, devices)
             evs = read_events(folder, d.get("udid"))[-max(a.n, 0):] if a.n > 0 else []
             if a.json:
-                print(json.dumps({"device": d, "events": evs}, indent=2))
+                kb = read_pairs(folder).get(d.get("udid"))
+                print(json.dumps({"device": d, "events": evs, "keyboard": kb}, indent=2))
             else:
-                print(format_device(d))
+                print(format_device(d, read_pairs(folder)))
                 print(f"last {len(evs)} events:")
                 print("\n".join("  " + format_event(ev) for ev in evs) or "  (none)")
             return 0
