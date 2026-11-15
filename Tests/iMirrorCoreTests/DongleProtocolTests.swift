@@ -24,8 +24,10 @@ final class DongleProtocolTests: XCTestCase {
     func testTimeouts() {
         XCTAssertEqual(DongleProtocol.timeout(for: .hello), 2)
         XCTAssertEqual(DongleProtocol.timeout(for: .send(slot: slot, steps: [])), 30)
+        let typing = HIDKeyboard.textReports("ab")!   // 4 steps of 30 ms
+        XCTAssertEqual(DongleProtocol.timeout(for: .send(slot: slot, steps: typing)), 30.12, accuracy: 0.001)
         let slow = Array(repeating: KeyStep(report: HIDKeyboard.releaseReport, delayAfterMs: 2000), count: 128)
-        XCTAssertEqual(DongleProtocol.timeout(for: .send(slot: slot, steps: slow)), 276)
+        XCTAssertEqual(DongleProtocol.timeout(for: .send(slot: slot, steps: slow)), 286)
         XCTAssertEqual(DongleProtocol.timeout(for: .pair(slot: slot, seconds: 120)), 130)
         XCTAssertEqual(DongleProtocol.timeout(for: .forget(slot: slot)), 5)
     }

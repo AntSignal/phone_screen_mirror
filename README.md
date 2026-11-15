@@ -433,7 +433,7 @@ Code: `Sources/iMirrorCore/DongleProtocol.swift`.
   arriving meanwhile gets `ERR BUSY`. A phone other than the target never gets
   a report.
 - iMirror's timeouts, write to final line: `HELLO` 2 s, `PAIR` its window +
-  10 s, `SEND` 30 s (or 20 s plus its delays, if longer), others 5 s.
+  10 s, `SEND` 30 s plus its steps' delays, others 5 s.
 
 **Settings → iPhones → "Type passcode now"** shows on each paired phone. A
 click reads that phone's passcode from the passcode file (the field under the
