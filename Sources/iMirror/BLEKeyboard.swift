@@ -1,13 +1,12 @@
 // BLEKeyboard — iMirror as a Bluetooth LE keyboard (HID over GATT), to type
 // where WDA cannot: the lock screen and the "Enable UI Automation" sheet.
-// macOS is always the host for classic HID, so an iPhone is reached only
-// through a CoreBluetooth peripheral with the HOGP service tree (HOGP 1.0,
-// HIDS 1.0, DIS 1.1, BAS 1.0). Bytes and rules live in iMirrorCore. Rules:
+// macOS is always the classic HID host, so iPhones are reached only through
+// a CoreBluetooth peripheral with HOGP services. Bytes live in iMirrorCore.
 // - SIG UUIDs as full 128-bit strings; the 16-bit form is refused.
-// - No .extendedProperties: its extra descriptor breaks the host's HID binding.
+// - No .extendedProperties: its descriptor breaks HID binding.
 // - Send a key-up report on subscribe, or some hosts stall.
-// - Every value needs encryption, so the phone must bond first.
-// Reports may spell a passcode: log counts, never bytes. Main thread only.
+// - Every value needs encryption, so phones must bond.
+// Reports may spell a passcode: log counts. Main thread only.
 
 import CoreBluetooth
 import Foundation
@@ -36,6 +35,8 @@ private final class Waiter: @unchecked Sendable {
 final class BLEKeyboard: NSObject {
     static let pairingSettleSec: TimeInterval = 5
     static let sendTimeoutSec: TimeInterval = 2
+    /// Subscribe-to-first-key pause; a lost first digit costs an attempt.
+    static let linkSettleSec: TimeInterval = 1
 
     /// "180A" → the full SIG base UUID. See the platform rules above.
     nonisolated static func sig(_ short: String) -> CBUUID {
@@ -51,7 +52,7 @@ final class BLEKeyboard: NSObject {
     // Made lazily: making it shows the Bluetooth prompt.
     private var manager: CBPeripheralManager?
     private var running = false
-    // Bumped by stop(), so a pairing or connect wait ends at once.
+    // stop() bumps it, ending any pairing or connect wait.
     private var stopEpoch = 0
     private var servicesAdded = false
     private var addFailed = false
@@ -59,6 +60,8 @@ final class BLEKeyboard: NSObject {
     // Phones subscribed to each input characteristic, by central id.
     private var reportSubs: [UUID: CBCentral] = [:]
     private var bootSubs: [UUID: CBCentral] = [:]
+    // When each central first subscribed, for linkSettleSec.
+    private var subscribedAt: [UUID: Date] = [:]
     private var subscriptionLog: [(central: String, at: Date)] = []
     private var protocolMode = HIDKeyboard.reportProtocol
     private var leds: UInt8 = 0
@@ -72,7 +75,7 @@ final class BLEKeyboard: NSObject {
     // Centrals subscribed at the last link report.
     private var linked: Set<UUID> = []
 
-    /// A phone's keyboard link came up (true) or went down (false).
+    /// A phone's keyboard link came up (true) or down.
     var onLinkChange: ((UUID, Bool) -> Void)?
 
     init(pairsURL: URL = BLEKeyboard.defaultPairsURL) {
@@ -135,6 +138,8 @@ final class BLEKeyboard: NSObject {
             manager?.stopAdvertising()
             guard allSubscribed()[central] != nil else { throw BLEKeyboardError.notConnected }
         }
+        let settle = Self.linkSettleSec - Date().timeIntervalSince(subscribedAt[central] ?? .distantPast)
+        if settle > 0 { try await Task.sleep(nanoseconds: UInt64(settle * 1e9)) }
         do {
             for step in reports {
                 try await send(Data(step.report), to: central)
@@ -156,6 +161,10 @@ final class BLEKeyboard: NSObject {
         servicesAdded = false
         reportSubs = [:]
         bootSubs = [:]
+        subscribedAt = [:]
+        // HIDS: each new connection starts in report mode.
+        protocolMode = HIDKeyboard.reportProtocol
+        leds = 0
         publishLinks()
         fireAll(&subscribeWaiters, false)
         fireAll(&readyWaiters, false)
@@ -329,6 +338,7 @@ final class BLEKeyboard: NSObject {
         if ch === chars.inputReport { target = chars.inputReport; reportSubs[central.identifier] = central }
         else if ch === chars.bootInput { target = chars.bootInput; bootSubs[central.identifier] = central }
         else { return }
+        if subscribedAt[central.identifier] == nil { subscribedAt[central.identifier] = Date() }
         subscriptionLog.append((central.identifier.uuidString, Date()))
         if subscriptionLog.count > 64 { subscriptionLog.removeFirst(subscriptionLog.count - 64) }
         // Baseline key-up report, or some hosts never start reading.
@@ -342,6 +352,7 @@ final class BLEKeyboard: NSObject {
     fileprivate func handleUnsubscribe(_ central: CBCentral, _ ch: CBCharacteristic) {
         if ch === chars.inputReport { reportSubs[central.identifier] = nil }
         if ch === chars.bootInput { bootSubs[central.identifier] = nil }
+        if allSubscribed()[central.identifier] == nil { subscribedAt[central.identifier] = nil }
         publishLinks()
         fireAll(&readyWaiters, false)
     }
@@ -352,6 +363,7 @@ final class BLEKeyboard: NSObject {
             servicesAdded = false
             reportSubs = [:]
             bootSubs = [:]
+            subscribedAt = [:]
             publishLinks()
             fireAll(&readyWaiters, false)
         }

@@ -28,19 +28,19 @@ public struct KeyStroke: Equatable, Sendable {
 }
 
 public enum HIDKeyboard {
-    /// The one report ID in the report map, for both directions.
+    /// The report map's only report ID, both directions.
     public static let reportID: UInt8 = 1
 
-    /// Left Shift in the modifier byte (usage 0xE1 is bit 1).
+    /// Left Shift: bit 1 of the modifier byte (usage 0xE1).
     public static let leftShift: UInt8 = 0x02
     public static let returnUsage: UInt8 = 0x28
 
-    /// Keeps a key down long enough for iOS to see it.
+    /// Long enough for iOS to see the key down.
     public static let defaultHoldMs = 30
     /// Lets iOS see the release before the next key.
     public static let defaultGapMs = 30
 
-    /// Every key up. Also sent when a phone subscribes, or some hosts stall.
+    /// Every key up. Also sent on subscribe, or hosts stall.
     public static let releaseReport: [UInt8] = [0, 0, 0, 0, 0, 0, 0, 0]
 
     /// The HID report map. The boot keyboard layout plus a report ID, so the
@@ -58,7 +58,7 @@ public enum HIDKeyboard {
         0xC0,
     ]
 
-    /// HID Information: HID 1.11, no country, remote wake + normally connectable.
+    /// HID 1.11, no country, remote wake, normally connectable.
     public static let hidInformation: [UInt8] = [0x11, 0x01, 0x00, 0x03]
 
     /// Report Reference descriptor values: report ID, then type.
@@ -68,7 +68,7 @@ public enum HIDKeyboard {
     /// Protocol Mode value for report protocol (0 would be boot).
     public static let reportProtocol: UInt8 = 0x01
 
-    /// PnP ID: USB-IF vendor source, pid.codes' open VID 0x1209, test PID 1, v1.0.
+    /// USB-IF source, pid.codes VID 0x1209, test PID 1, v1.0.
     public static let pnpID: [UInt8] = [0x02, 0x09, 0x12, 0x01, 0x00, 0x00, 0x01]
 
     /// GAP appearance "Keyboard" (category 0x00F, subcategory 1).
@@ -142,8 +142,10 @@ public enum HIDKeyboard {
     /// Test text may only be short lowercase words and digits, so a passcode
     /// (or anything odd) can never be sent through the test path.
     public static func isValidTestText(_ s: String) -> Bool {
+        // By byte: Character ranges admit combining marks.
         (1...32).contains(s.count) && s.allSatisfy { c in
-            c == " " || ("a"..."z").contains(c) || ("0"..."9").contains(c)
+            guard let b = c.asciiValue else { return false }
+            return b == 0x20 || (0x61...0x7A).contains(b) || (0x30...0x39).contains(b)
         }
     }
 
