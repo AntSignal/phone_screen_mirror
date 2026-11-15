@@ -43,12 +43,7 @@ final class BLEKeyboard: NSObject {
         CBUUID(string: "0000\(short)-0000-1000-8000-00805F9B34FB")
     }
 
-    nonisolated static var defaultPairsURL: URL {
-        FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)
-            .first!.appendingPathComponent("iMirror/keyboard-pairs.json")
-    }
-
-    let pairsURL: URL
+    let pairsFile: KeyboardPairsFile
     // Made lazily: making it shows the Bluetooth prompt.
     private var manager: CBPeripheralManager?
     private var running = false
@@ -78,8 +73,8 @@ final class BLEKeyboard: NSObject {
     /// A phone's keyboard link came up (true) or down.
     var onLinkChange: ((UUID, Bool) -> Void)?
 
-    init(pairsURL: URL = BLEKeyboard.defaultPairsURL) {
-        self.pairsURL = pairsURL
+    init(pairsURL: URL = KeyboardPairsFile.defaultURL) {
+        pairsFile = KeyboardPairsFile(url: pairsURL)
         super.init()
     }
 
@@ -280,21 +275,9 @@ final class BLEKeyboard: NSObject {
 
     // MARK: - Pairs file
 
-    func loadPairs() -> KeyboardPairs {
-        KeyboardPairs.decode(try? Data(contentsOf: pairsURL))
-    }
+    func loadPairs() -> KeyboardPairs { pairsFile.load() }
 
-    /// 0600: which phone is which is this user's business only.
-    func savePairs(_ pairs: KeyboardPairs) {
-        do {
-            try FileManager.default.createDirectory(at: pairsURL.deletingLastPathComponent(),
-                                                    withIntermediateDirectories: true)
-            try pairs.encode().write(to: pairsURL, options: .atomic)
-            try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: pairsURL.path)
-        } catch {
-            NSLog("iMirror: writing \(pairsURL.path) failed: \(error.localizedDescription)")
-        }
-    }
+    func savePairs(_ pairs: KeyboardPairs) { pairsFile.save(pairs) }
 
     // MARK: - Reads and writes from the phone
 
