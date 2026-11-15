@@ -133,6 +133,13 @@ final class HIDKeyboardTests: XCTestCase {
         }
         for bad in ["", "Hello", "a-b", "x\n", String(repeating: "z", count: 33), "caf\u{e9}", "a\u{0301}"] {
             XCTAssertFalse(HIDKeyboard.isValidTestText(bad), bad)
+        }    }
+
+    func testTestTextRefusesACombiningMarkThatSortsInsideAToZ() {
+        // No precomposed form, so it sorts inside "a"..."z".
+        for bad in ["a\u{0332}", "1\u{0332}", "hi a\u{0332}"] {
+            XCTAssertFalse(HIDKeyboard.isValidTestText(bad), bad)
+            XCTAssertNil(HIDKeyboard.textReports(bad), bad)
         }
     }
 }
