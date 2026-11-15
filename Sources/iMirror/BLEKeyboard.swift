@@ -72,6 +72,11 @@ final class BLEKeyboard: NSObject {
     private var readyWaiters: [Waiter] = []
 
     private var chars = Chars()
+    // Centrals subscribed at the last link report.
+    private var linked: Set<UUID> = []
+
+    /// A phone's keyboard link came up (true) or down.
+    var onLinkChange: ((UUID, Bool) -> Void)?
 
     init(pairsURL: URL = BLEKeyboard.defaultPairsURL) {
         self.pairsURL = pairsURL
@@ -160,6 +165,7 @@ final class BLEKeyboard: NSObject {
         // HIDS: each new connection starts in report mode.
         protocolMode = HIDKeyboard.reportProtocol
         leds = 0
+        publishLinks()
         fireAll(&subscribeWaiters, false)
         fireAll(&readyWaiters, false)
     }
@@ -274,12 +280,12 @@ final class BLEKeyboard: NSObject {
 
     // MARK: - Pairs file
 
-    private func loadPairs() -> KeyboardPairs {
+    func loadPairs() -> KeyboardPairs {
         KeyboardPairs.decode(try? Data(contentsOf: pairsURL))
     }
 
     /// 0600: which phone is which is this user's business only.
-    private func savePairs(_ pairs: KeyboardPairs) {
+    func savePairs(_ pairs: KeyboardPairs) {
         do {
             try FileManager.default.createDirectory(at: pairsURL.deletingLastPathComponent(),
                                                     withIntermediateDirectories: true)
@@ -341,6 +347,7 @@ final class BLEKeyboard: NSObject {
         _ = m.updateValue(Data(HIDKeyboard.releaseReport), for: target,
                           onSubscribedCentrals: [central])
         NSLog("iMirror: keyboard central \(central.identifier.uuidString) subscribed")
+        publishLinks()
         fireAll(&subscribeWaiters, true)
     }
 
@@ -348,6 +355,7 @@ final class BLEKeyboard: NSObject {
         if ch === chars.inputReport { reportSubs[central.identifier] = nil }
         if ch === chars.bootInput { bootSubs[central.identifier] = nil }
         if allSubscribed()[central.identifier] == nil { subscribedAt[central.identifier] = nil }
+        publishLinks()
         fireAll(&readyWaiters, false)
     }
 
@@ -358,9 +366,20 @@ final class BLEKeyboard: NSObject {
             reportSubs = [:]
             bootSubs = [:]
             subscribedAt = [:]
+            publishLinks()
             fireAll(&readyWaiters, false)
         }
         fireAll(&stateWaiters, true)
+    }
+
+    /// Reports each central that joined or left since the last call. A phone
+    /// on both input characteristics counts once.
+    private func publishLinks() {
+        let now = Set(allSubscribed().keys)
+        let gone = linked.subtracting(now), new = now.subtracting(linked)
+        linked = now
+        gone.forEach { onLinkChange?($0, false) }
+        new.forEach { onLinkChange?($0, true) }
     }
 
     fileprivate func handleAdd(_ error: Error?) {

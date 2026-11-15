@@ -53,6 +53,8 @@ final class ChainManager {
     var onControllerChange: ((DeviceController) -> Void)?
     var onControllerHealth: ((DeviceController, DeviceController.Health, DeviceController.Health) -> Void)?
     var onControllerStatus: ((DeviceController, String) -> Void)?
+    /// A keyboard request file arrived (KeyboardControl acts on it).
+    var onKeyboardRequest: ((KeyboardRequestFile.Read) -> Void)?
     /// Automation can't start (another iMirror owns the phones).
     var onBlocked: ((String) -> Void)?
 
@@ -268,6 +270,7 @@ final class ChainManager {
     /// Clients' restart requests (README, "Files other tools read").
     private func watchRequests() {
         requests.onRequest = { [weak self] r in self?.handle(r) }
+        requests.onKeyboard = { [weak self] r in self?.onKeyboardRequest?(r) }
         requests.start()
     }
 

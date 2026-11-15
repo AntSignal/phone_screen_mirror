@@ -103,6 +103,8 @@ public enum DeviceEventKind: String, Sendable {
     case usbResetIgnored = "usb_reset_ignored"
     /// The phone's runner is older than the bundled one and is reinstalled.
     case runnerUpgrade = "runner_upgrade"
+    /// The Bluetooth keyboard paired, linked or typed (KeyboardRequests.swift).
+    case keyboard
 }
 
 /// One line of events.jsonl.
@@ -118,15 +120,18 @@ public struct DeviceEvent: Encodable, Equatable, Sendable {
     public var reason: String?
     public var detail: String?
     public var expected: Bool?
+    /// How many characters the keyboard typed. Never what they were.
+    public var chars: Int?
 
     public init(at date: Date, udid: String, alias: String, event: DeviceEventKind,
                 from: String? = nil, to: String? = nil, reason: String? = nil,
-                detail: String? = nil, expected: Bool? = nil) {
+                detail: String? = nil, expected: Bool? = nil, chars: Int? = nil) {
         ts = DeviceEventCodec.timestamp(date)
         self.udid = udid; self.alias = alias; self.event = event.rawValue
         self.from = from; self.to = to; self.reason = reason
         self.detail = detail.map(DeviceEventCodec.clip)
         self.expected = expected
+        self.chars = chars
     }
 }
 
