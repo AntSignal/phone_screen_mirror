@@ -234,8 +234,10 @@ final class BLEKeyboard: NSObject {
     private func startAdvertising() {
         guard let m = manager, !m.isAdvertising else { return }
         // CoreBluetooth cannot advertise an appearance; only name and UUIDs.
+        // Short 1812 on air: the 128-bit form pushed it out of the
+        // 31-byte packet, so iOS Settings never listed the keyboard.
         m.startAdvertising([CBAdvertisementDataLocalNameKey: HIDKeyboard.localName,
-                            CBAdvertisementDataServiceUUIDsKey: [Self.sig("1812")]])
+                            CBAdvertisementDataServiceUUIDsKey: [CBUUID(string: "1812")]])
     }
 
     // MARK: - Sending
