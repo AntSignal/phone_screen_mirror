@@ -406,6 +406,95 @@ def test_sixteen_threads_fifty_cycles_in_one_process():
     assert all(not ks["holders"] for ks in locker.store.read()["keys"].values())
 
 
+# ---- three agents in line for one phone --------------------------------------------
+
+FIFO_AGENT = r"""
+import contextlib, io, json, os, sys, time
+sys.path.insert(0, sys.argv[1])
+import devicelease as dl
+d, key, name, go = sys.argv[2:6]
+me = str(os.getpid())
+
+def log(what, **kw):
+    with open(os.path.join(d, "log.jsonl"), "a") as f:
+        f.write(json.dumps({"agent": name, "what": what, "t": dl.mono(), **kw}) + "\n")
+
+def cli(*args):
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        rc = dl.main(list(args) + ["--json"])
+    return rc, json.loads(buf.getvalue())
+
+rc, out = cli("acquire", key, "--anchor-pid", me, "--wait-s", "40", "--purpose", name)
+assert rc == 0 and out["status"] == "held", (rc, out)
+mark = os.path.join(d, "owner")
+os.close(os.open(mark, os.O_CREAT | os.O_EXCL | os.O_WRONLY))   # overlap -> FileExistsError
+log("got", lease_id=out["lease_id"])
+deadline = time.time() + 40
+while go and not os.path.exists(go):
+    assert time.time() < deadline, "never told to let go"
+    time.sleep(0.02)
+time.sleep(0.3)                                  # use the phone for a moment
+os.unlink(mark)
+log("releasing")
+rc, rel = cli("release", key, "--anchor-pid", me)
+assert rc == 0 and rel["status"] == "released", (rc, rel)
+"""
+
+
+def test_three_agents_wait_in_line_and_each_gets_the_phone_in_turn(tmp_path):
+    """Three real processes want one phone. A holds it; B, then C, join the
+    line and block. Each gets the phone only after the one before lets go,
+    in the order they asked, and within about a second of it."""
+    script = tmp_path / "agent.py"
+    script.write_text(FIFO_AGENT)
+    d = tmp_path / "agents"
+    d.mkdir()
+    go = str(tmp_path / "go-a")
+    procs = {}
+
+    def start(name, go_file=""):
+        procs[name] = subprocess.Popen([sys.executable, str(script), HERE, str(d), K1, name,
+                                        go_file], stderr=subprocess.PIPE, text=True)
+
+    def log():
+        p = d / "log.jsonl"
+        return [json.loads(x) for x in p.read_text().splitlines()] if p.exists() else []
+
+    def tickets():
+        return [t["purpose"] for t in sorted(store().read().get("tickets") or [],
+                                             key=lambda t: t["seq"])]
+    try:
+        start("A", go)
+        wait_for(lambda: any(e["agent"] == "A" and e["what"] == "got" for e in log()),
+                 what="A to hold the phone")
+        start("B")
+        wait_for(lambda: tickets() == ["B"], what="B to queue")
+        start("C")
+        wait_for(lambda: tickets() == ["B", "C"], what="C to queue behind B")
+        time.sleep(1.0)
+        assert [e["agent"] for e in log() if e["what"] == "got"] == ["A"], \
+            "B and C must block while A holds the phone"
+        assert top(K1)["purpose"] == "A"
+        open(go, "w").close()
+        for name, p in procs.items():
+            p.wait(timeout=60)
+            assert p.returncode == 0, f"{name}: {p.stderr.read()}"
+    finally:
+        for p in procs.values():
+            if p.poll() is None:
+                p.kill()
+                p.wait()
+    events = log()
+    got = {e["agent"]: e["t"] for e in events if e["what"] == "got"}
+    let_go = {e["agent"]: e["t"] for e in events if e["what"] == "releasing"}
+    assert [e["agent"] for e in events if e["what"] == "got"] == ["A", "B", "C"]
+    assert let_go["A"] < got["B"] < let_go["A"] + 3.0, "B gets it soon after A, never before"
+    assert let_go["B"] < got["C"] < let_go["B"] + 3.0, "C gets it soon after B, never before"
+    st = store().read()
+    assert not st.get("tickets") and not st["keys"].get(K1, {}).get("holders")
+
+
 # ---- kill -9 and orphans ----------------------------------------------------------
 
 CHILD = r"""
@@ -787,6 +876,11 @@ def test_register_server_and_the_scan(tmp_path):
         (repo_ok / "Testing" / "lib" / "devicelease.sh").write_text("")
         repo_old = tmp_path / "old"
         (repo_old / "Testing").mkdir(parents=True)
+        (repo_old / "Testing" / "run.sh").write_text("claude -p ...\n")
+        repo_ctl = tmp_path / "ctl"          # waits through antsignalctl instead
+        (repo_ctl / "Testing").mkdir(parents=True)
+        (repo_ctl / "Testing" / "run.sh").write_text(
+            '"$CTL" device lease wait --device "$LEASE_KEY" --anchor-pid $$\n')
         uid = os.getuid()
         ps = "\n".join([
             f"{reg.pid} {uid} python /x/mcp/current/imirror_mcp.py",
@@ -795,12 +889,15 @@ def test_register_server_and_the_scan(tmp_path):
             f"70003 {uid} /bin/bash ./Testing/run.sh 07",
             f"70004 {uid} /bin/bash Testing/run.sh",
             f"70005 {uid} /bin/bash ./run.sh 3",
+            f"70006 {uid} /bin/bash Testing/run.sh 02",
             f"{os.getpid()} {uid} python imirror_mcp.py",
             "garbage line",
         ])
         argv = {70003: ["/bin/bash", "./Testing/run.sh", "07"],
-                70004: ["/bin/bash", "Testing/run.sh"], 70005: ["/bin/bash", "./run.sh", "3"]}
-        cwd = {70003: str(repo_old), 70004: str(repo_ok), 70005: str(repo_old / "Testing")}
+                70004: ["/bin/bash", "Testing/run.sh"], 70005: ["/bin/bash", "./run.sh", "3"],
+                70006: ["/bin/bash", "Testing/run.sh", "02"]}
+        cwd = {70003: str(repo_old), 70004: str(repo_ok), 70005: str(repo_old / "Testing"),
+               70006: str(repo_ctl)}
         found = dl.unlocked_servers(lease_dir(), ps_text=ps, argv_of=lambda p: argv.get(p, []),
                                     cwd_of=lambda p: cwd.get(p, ""))
         by_pid = {f["pid"]: f for f in found}

@@ -1735,17 +1735,32 @@ def _registered_pids(lease_dir: str) -> set:
 
 _SCAN_CACHE: Dict[str, Tuple[float, List[Dict[str, Any]]]] = {}
 
+# Purpose-iOS's run.sh takes leases through antsignalctl, with no
+# Testing/lib/devicelease.sh; without this it was listed as ignoring them.
+_RUN_SH_LEASE_MARK = "device lease wait"
+
+
+def _head_text(path: str, limit: int = 1 << 20) -> str:
+    try:
+        with open(path, "rb") as f:
+            return f.read(limit).decode("utf-8", "replace")
+    except OSError:
+        return ""
+
 
 def unlocked_servers(lease_dir: Optional[str] = None, *, ps_text: Optional[str] = None,
                      argv_of: Callable[[int], List[str]] = proc_argv,
                      cwd_of: Callable[[int], str] = proc_cwd,
                      exists: Callable[[str], bool] = os.path.exists,
+                     text_of: Optional[Callable[[str], str]] = None,
                      registered: Optional[set] = None, max_age_s: float = 60.0
                      ) -> List[Dict[str, Any]]:
     """Processes that drive devices but ignore leases: imirror_mcp.py servers
     that never registered (the pre-fork v1.2.0 server, or one started before
-    leases), and Testing/run.sh from a worktree without
-    Testing/lib/devicelease.sh. Cached 60 s; never call it under the flock."""
+    leases), and a Testing/run.sh that neither has Testing/lib/devicelease.sh
+    nor waits through `antsignalctl device lease`. Cached 60 s; never call it
+    under the flock."""
+    text_of = text_of or _head_text
     lease_dir = lease_dir or configured_lease_dir()
     if ps_text is None:
         hit = _SCAN_CACHE.get(lease_dir)
@@ -1784,7 +1799,8 @@ def unlocked_servers(lease_dir: Optional[str] = None, *, ps_text: Optional[str] 
             if not path.endswith(os.sep + os.path.join("Testing", "run.sh")):
                 continue
             repo = os.path.dirname(os.path.dirname(path))
-            if not exists(os.path.join(repo, "Testing", "lib", "devicelease.sh")):
+            if not (exists(os.path.join(repo, "Testing", "lib", "devicelease.sh"))
+                    or _RUN_SH_LEASE_MARK in text_of(path)):
                 out.append({"pid": pid, "kind": "run.sh", "repo": repo, "command": cmd[:300],
                             "reason": "a Testing/run.sh from a worktree without device leases"})
             break
