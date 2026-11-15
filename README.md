@@ -196,6 +196,21 @@ Every phone drops for about 30 s while it does.
 Before committing, run `swift build && swift test` and the MCP suite
 (`mcp-server/.venv/bin/python -m pytest mcp-server`); see `CLAUDE.md`.
 
+#### Signing for development
+
+`run.sh` signs ad hoc unless `IMIRROR_SIGN_IDENTITY` is set. An ad hoc
+signature changes with every build, so macOS forgets iMirror's Bluetooth and
+Documents permissions and asks again. With a stable identity they stay:
+
+```bash
+security find-identity -v -p codesigning     # pick an "Apple Development: …" name
+export IMIRROR_SIGN_IDENTITY="Apple Development: Your Name (TEAMID)"
+./scripts/run.sh
+```
+
+`package.sh` uses it too, ahead of any Developer ID (no hardened runtime, no
+timestamp, not notarizable: for this Mac only).
+
 On launch the app connects to the iPhone and brings up WebDriverAgent
 automatically (health dot green within ~30 s) — the phone stays unlocked and
 keeps its own audio, though iOS shows the "Automation Running" overlay while
@@ -328,8 +343,19 @@ with a different uniqueid knows the file is stale), `app_version`, `updated_at`,
 `usb_reset_ignored` (its own start/stop did it, or WDA was not up), `request`,
 `wake`, `sleep`, `passcode`, `runner_upgrade` (the phone's WebDriverAgent
 runner is older than the bundled one and is reinstalled; `from`/`to` are
-versions; the new runner may raise the passcode sheet once). The same lines go to the unified log, subsystem
+versions; the new runner may raise the passcode sheet once), `keyboard` (see
+below). The same lines go to the unified log, subsystem
 `com.local.imirror`, category `events`, in the clear.
+
+A `keyboard` event is about iMirror's Bluetooth keyboard. `detail` is one of
+`paired`, `ambiguous` (more than one new Bluetooth central subscribed, so none
+was trusted), `timeout` (the 120 s pairing window closed with no new phone),
+`connected`, `disconnected`, `typed_test`, `typed_passcode`, `failed` or
+`forgotten`. A typing line has `chars`: how many characters were typed, never
+what they were. A `failed` line has a `reason`: `bad_request`,
+`unknown_action`, `bad_text`, `stale`, `not_attached`, `not_paired`, `busy`,
+`bluetooth_unavailable`, `setup_failed`, `not_connected`, `send_failed`, and
+for "Type passcode now" `no_file`, `no_passcode` or `untypeable`.
 
 **`expected-resets/<udid>.json`** — written by a client, not the app. Before
 `devicectl device install|launch`, write `{"until": <now + 90 s, ISO-8601>,
@@ -348,6 +374,50 @@ like Settings → Restart: this phone's chain only, never the shared tunnel. It
 never types a passcode. While the phone shows `needs_passcode`, don't send one:
 a new runner raises the sheet again.
 
+**`requests/keyboard-<udid>.json`** — written by a client to drive iMirror's
+Bluetooth keyboard for one phone: `{"udid", "requested_at", "requested_by",
+"action": "pair"|"forget"|"test", "text"}`. Write it like a restart request.
+- `pair` opens a 120 s pairing window: iMirror advertises as "iMirror Keyboard",
+  and the one phone that connects while it is open is tied to this UDID. The
+  phone must be attached by USB.
+- `test` types `text` into that phone only: 1–32 of `a-z`, `0-9` and space,
+  with at least one letter and at most three digits, so it can never be a
+  passcode attempt. `text` is refused on any other action.
+- `forget` removes the tie.
+
+Any other action, or any other key in the file, is refused (event `keyboard`,
+`detail` `failed`). No request can type a passcode; only a click in Settings
+does that (below). After each run iMirror
+stops advertising and drops its Bluetooth services, so the phone gets its
+on-screen keyboard back.
+
+**`keyboard-pairs.json`** — written by the app, mode 0600: `{"<udid>":
+{"central": "<CoreBluetooth central UUID>", "paired_at": ISO-8601}}`.
+
+**Settings → iPhones → "Type passcode now"** shows on each paired phone. A
+click reads that phone's passcode from the passcode file (the field under the
+phone list; default `~/Documents/Github/Purpose/Purpose-iOS/Testing/.env.local`,
+stored as `defaults` key `imirror.passcodeFile`). The file is dotenv style
+(`KEY=VALUE`, optional `export`, quotes, `#` comments). The key is
+`IMIRROR_PASSCODE_<UDID without dashes, upper case>`; failing that,
+`ANTSIGNAL_TEST_DEVICE_PASSCODE`, but only when the file's
+`ANTSIGNAL_DEVICE_UDID` is this phone. iMirror then presses Shift to wake the
+phone, waits 600 ms, types the passcode to that phone's central only (Return
+too, unless it is a 4- or 6-digit code), zeroes its copy and logs `keyboard`
+`typed_passcode` with `chars`. Nothing but that click starts it; a test
+(`PasscodeCallSiteTests`) fails if any other code calls it. A file under
+`~/Documents` makes macOS ask once for access to Documents.
+
+Click it only while the phone shows a passcode prompt (check the mirror or a
+screenshot first). iMirror cannot tell what the phone shows: on an unlocked
+phone the keys go to whatever has focus, and the Return after a non-numeric
+code may send them. A click posted by another program (cliclick, an agent's
+computer use) also counts as a click.
+
+The first pair or type asks for Bluetooth access (System Settings › Privacy &
+Security › Bluetooth). An ad hoc signed build may ask again after each rebuild;
+see "Signing for development".
+
 **`scripts/imirror-ctl`** reads and writes these files (system `python3`, no
 dependencies). `device` is an alias, a UDID, or a unique UDID prefix/suffix of
 4+ characters, as in the MCP server.
@@ -357,7 +427,16 @@ scripts/imirror-ctl status                 # every phone: state, reason, since, 
 scripts/imirror-ctl status phone2 -n 20    # one phone, with its last 20 events
 scripts/imirror-ctl restart phone2         # exit 0 accepted, 3 cooldown, 4 timeout
 scripts/imirror-ctl events --device phone2 --since 1h
+scripts/imirror-ctl keyboard pair phone2           # waits up to 130 s: paired, ambiguous, timeout
+scripts/imirror-ctl keyboard test phone2 "hello 123"
+scripts/imirror-ctl keyboard status phone2         # the tie and the last keyboard events
+scripts/imirror-ctl keyboard forget phone2
 ```
+
+`keyboard` exits 0 on `paired`, `typed_test` or `forgotten`, 1 on anything
+else the app answered, and 4 when it got no answer. `test`, `forget` and
+`status` also take a UDID from `keyboard-pairs.json` for a phone no longer on
+USB.
 
 ### Sleep and wake
 

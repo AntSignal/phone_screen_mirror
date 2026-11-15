@@ -4,9 +4,11 @@
   imirror-ctl status [device] [-n N] [--json]
   imirror-ctl restart <device> [--wait S]
   imirror-ctl events [--device D] [--since 1h] [--json]
+  imirror-ctl keyboard pair|forget|test|status <device> [text]
 
-It only reads the files the app publishes (devices.json, events.jsonl) and
-writes restart requests, as the README's "Files other tools read" describes.
+It only reads the files the app publishes (devices.json, events.jsonl,
+keyboard-pairs.json) and writes restart and keyboard requests, as the
+README's "Files other tools read" describes. It never handles a passcode.
 Standard library only, so it runs on the system python3 (3.9).
 
 Exit codes: 0 ok / accepted, 1 error, 2 usage, 3 cooldown, 4 timeout.
@@ -22,6 +24,17 @@ from datetime import datetime, timedelta, timezone
 
 DEFAULT_DEVICES = "~/Library/Application Support/iMirror/devices.json"
 RESTART_WAIT_S = 30.0
+# App: 120 s pairing window, picked up within 5 s.
+KEYBOARD_WAIT_S = {"pair": 130.0, "forget": 30.0, "test": 30.0}
+# The app's rule: lower-case words and digits, with at least one letter
+# and at most three digits, so test text is never a passcode attempt.
+TEST_TEXT = re.compile(r"(?=.*[a-z])(?!(?:[^0-9]*[0-9]){4})[a-z0-9 ]{1,32}")
+# The keyboard event details that answer each request.
+KEYBOARD_ANSWERS = {
+    "pair": {"paired", "ambiguous", "timeout", "failed"},
+    "forget": {"forgotten", "failed"},
+    "test": {"typed_test", "failed"},
+}
 
 
 class CtlError(Exception):
@@ -145,6 +158,8 @@ def format_event(e):
     for k in ("reason", "detail"):
         if e.get(k):
             what += f" {k}={e[k]}"
+    if isinstance(e.get("chars"), int):
+        what += f" chars={e['chars']}"
     if e.get("expected") is True:
         what += " expected"
     return f"{e.get('ts', '?')}  {e.get('alias') or e.get('udid', '?')}  {what}"
@@ -165,16 +180,16 @@ def format_summary(d):
             f" since {d.get('state_since') or '-'}  epoch {d.get('chain_epoch', '-')}{extra}")
 
 
-def write_request(folder, udid, now, by="imirror-ctl"):
+def write_request(folder, udid, now, by="imirror-ctl", kind="restart", extra=None):
     """Temp file then rename, so the app never reads half a request."""
     if not re.fullmatch(r"[A-Za-z0-9-]{1,64}", udid or ""):
         raise CtlError(f"not a usable UDID: {udid!r}")
     reqs = os.path.join(folder, "requests")
     os.makedirs(reqs, mode=0o700, exist_ok=True)
-    path = os.path.join(reqs, f"restart-{udid}.json")
+    path = os.path.join(reqs, f"{kind}-{udid}.json")
     tmp = f"{path}.{os.getpid()}.tmp"
     with open(tmp, "w", encoding="utf-8") as f:
-        json.dump({"udid": udid, "requested_at": iso(now), "requested_by": by}, f)
+        json.dump({"udid": udid, "requested_at": iso(now), "requested_by": by, **(extra or {})}, f)
     os.replace(tmp, path)
     return path
 
@@ -226,6 +241,103 @@ def restart(dev, path, wait_s=RESTART_WAIT_S, clock=time.monotonic, sleep=time.s
 EXIT = {"accepted": 0, "cooldown": 3, "timeout": 4}
 
 
+# ---- keyboard ----
+
+def write_keyboard_request(folder, udid, now, action, text=None):
+    if action not in KEYBOARD_ANSWERS:
+        raise CtlError(f"unknown keyboard action {action!r}")
+    extra = {"action": action}
+    if action == "test":
+        if not isinstance(text, str) or not TEST_TEXT.fullmatch(text):
+            raise CtlError("test text must be 1-32 of a-z, 0-9 and space, with a letter and at most 3 digits")
+        extra["text"] = text
+    elif text is not None:
+        raise CtlError(f"keyboard {action} takes no text")
+    return write_request(folder, udid, now, kind="keyboard", extra=extra)
+
+
+def read_pairs(folder):
+    """keyboard-pairs.json as {udid: {"central", "paired_at"}}; {} if absent."""
+    try:
+        with open(os.path.join(folder, "keyboard-pairs.json"), encoding="utf-8") as f:
+            data = json.load(f)
+    except (OSError, ValueError):
+        return {}
+    return {k: v for k, v in data.items() if isinstance(v, dict)} if isinstance(data, dict) else {}
+
+
+def keyboard_outcome(events, udid, since, action):
+    """The newest keyboard event after `since` that answers `action`, or None."""
+    for e in reversed(events):
+        ts = parse_iso(e.get("ts"))
+        if (e.get("event") == "keyboard" and e.get("udid") == udid and ts is not None and ts >= since
+                and e.get("detail") in KEYBOARD_ANSWERS[action]):
+            return e
+    return None
+
+
+def keyboard(udid, folder, action, text=None, wait_s=None, clock=time.monotonic, sleep=time.sleep, now=None):
+    """Send one keyboard request and wait for its answer. Returns the answering
+    event, or None when the app did not answer (the request is withdrawn)."""
+    since = now or datetime.now(timezone.utc)
+    since = since.replace(microsecond=since.microsecond // 1000 * 1000)   # the app logs ms
+    req = write_keyboard_request(folder, udid, since, action, text)
+    deadline = clock() + (KEYBOARD_WAIT_S[action] if wait_s is None else wait_s)
+    while True:
+        answer = keyboard_outcome(read_events(folder, udid, since), udid, since, action)
+        if answer is not None:
+            return answer
+        if clock() >= deadline:
+            break
+        sleep(0.5)
+    try:
+        os.unlink(req)   # an old app must not act on it later
+    except OSError:
+        pass
+    return None
+
+
+KEYBOARD_HINTS = {
+    "timeout": "no new phone subscribed in the window. On the phone: Settings > Bluetooth > iMirror Keyboard.",
+    "ambiguous": "more than one new Bluetooth central subscribed; turn the others' Bluetooth off and pair again.",
+    "not_paired": "pair it first: imirror-ctl keyboard pair <device>",
+    "not_connected": "the phone did not connect; is Bluetooth on, and is it still paired?",
+    "bluetooth_unavailable": "Bluetooth is off, or iMirror was refused Bluetooth access (System Settings > Privacy).",
+}
+
+
+def describe_keyboard(alias, answer):
+    if answer is None:
+        return "timeout: iMirror did not answer; an older build ignores keyboard requests."
+    detail, reason = answer.get("detail"), answer.get("reason")
+    line = f"{detail}: {alias}" + (f" ({reason})" if reason else "")
+    if isinstance(answer.get("chars"), int):
+        line += f", {answer['chars']} chars"
+    hint = KEYBOARD_HINTS.get(reason or detail)
+    return f"{line}\n{hint}" if hint else line
+
+
+def keyboard_device(query, devices, pairs):
+    """A listed phone, or failing that a UDID in keyboard-pairs.json, so a
+    phone that has left USB can still be tested or forgotten."""
+    try:
+        return resolve(query, devices)
+    except CtlError:
+        hit = next((u for u in pairs if u.lower() == query.strip().lower()), None)
+        if hit is None:
+            raise
+        return {"udid": hit, "alias": hit, "kind": "device"}
+
+
+def format_keyboard_status(dev, pairs, events):
+    p = pairs.get(dev.get("udid"))
+    tie = f"paired with central {p.get('central')} at {p.get('paired_at')}" if p else "not paired"
+    lines = [f"{dev.get('alias')} ({dev.get('udid')})", f"  keyboard      {tie}",
+             f"last {len(events)} keyboard events:"]
+    lines += ["  " + format_event(e) for e in events] or ["  (none)"]
+    return "\n".join(lines)
+
+
 def main(argv=None):
     p = argparse.ArgumentParser(prog="imirror-ctl", description=__doc__.split("\n\n")[0])
     sub = p.add_subparsers(dest="cmd", required=True)
@@ -240,6 +352,12 @@ def main(argv=None):
     e.add_argument("--device")
     e.add_argument("--since", help="90s, 30m, 1h, 2d or ISO-8601")
     e.add_argument("--json", action="store_true")
+    k = sub.add_parser("keyboard", help="pair, test or forget iMirror's Bluetooth keyboard for a phone")
+    k.add_argument("action", choices=["pair", "forget", "test", "status"])
+    k.add_argument("device")
+    k.add_argument("text", nargs="?", help="test only: a-z, 0-9 and space; a letter, at most 3 digits")
+    k.add_argument("--wait", type=float, help="seconds to wait (default 130 for pair, else 30)")
+    k.add_argument("-n", type=int, default=10, help="status: keyboard events to show (default 10)")
     a = p.parse_args(argv)
 
     path = devices_file()
@@ -255,9 +373,11 @@ def main(argv=None):
         if not owner_alive(reg):
             print(f"warning: iMirror (pid {reg.get('owner_pid')}) is not running; {path} is stale",
                   file=sys.stderr)
-            if a.cmd == "restart":
+            if a.cmd == "restart" or (a.cmd == "keyboard" and a.action != "status"):
                 return 1
         devices = reg["devices"]
+        if a.cmd == "keyboard":
+            return keyboard_main(a, devices, folder)
         if a.cmd == "status":
             if not a.device:
                 print(json.dumps(devices, indent=2) if a.json else "\n".join(map(format_summary, devices)))
@@ -285,6 +405,24 @@ def main(argv=None):
     except CtlError as err:
         print(f"imirror-ctl: {err}", file=sys.stderr)
         return 1
+
+
+def keyboard_main(a, devices, folder):
+    pairs = read_pairs(folder)
+    d = keyboard_device(a.device, devices, pairs)
+    if d.get("kind") == "simulator":
+        raise CtlError(f"{d.get('alias')} is a Simulator; the keyboard is for phones")
+    if a.action == "status":
+        evs = [e for e in read_events(folder, d["udid"]) if e.get("event") == "keyboard"]
+        print(format_keyboard_status(d, pairs, evs[-max(a.n, 0):] if a.n > 0 else []))
+        return 0
+    if a.action == "pair":
+        print(f"On {d.get('alias')}: Settings > Bluetooth, tap 'iMirror Keyboard' within 120 s.", flush=True)
+    answer = keyboard(d["udid"], folder, a.action, a.text, wait_s=a.wait)
+    print(describe_keyboard(d.get("alias"), answer))
+    if answer is None:
+        return 4
+    return 0 if answer.get("detail") in ("paired", "forgotten", "typed_test") else 1
 
 
 if __name__ == "__main__":

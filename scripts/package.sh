@@ -5,6 +5,8 @@
 # - Signs with a Developer ID Application identity if one is installed (hardened
 #   runtime + camera entitlement, nested go-ios signed too); otherwise falls back
 #   to ad-hoc signing (works locally, will warn under Gatekeeper elsewhere).
+#   IMIRROR_SIGN_IDENTITY overrides both: a development identity, so this
+#   Mac's Bluetooth and Documents grants survive a rebuild. Not notarizable.
 # - Builds a DMG via hdiutil.
 # - Notarizes + staples if a notarytool keychain profile is provided via
 #   NOTARY_PROFILE; otherwise prints the exact commands to run.
@@ -15,6 +17,7 @@
 #   WITH_WDA=build/WebDriverAgent.ipa ./scripts/package.sh
 #   ./scripts/package.sh --restart       # build/iMirror.app is running: quit it,
 #                                        # rebuild, relaunch it (see run.sh)
+#   IMIRROR_SIGN_IDENTITY="Apple Development: …" ./scripts/package.sh
 #
 # One-time notary profile setup (per machine):
 #   xcrun notarytool store-credentials imirror \
@@ -123,7 +126,13 @@ IDENTITY="$(security find-identity -v -p codesigning 2>/dev/null \
 IDENTITY_NAME="$(security find-identity -v -p codesigning 2>/dev/null \
             | grep "Developer ID Application" | head -1 | grep -oE '"[^"]+"' | tr -d '"' || true)"
 
-if [[ -n "$IDENTITY" ]]; then
+if [[ -n "${IMIRROR_SIGN_IDENTITY:-}" ]]; then
+    echo "==> signing with: $IMIRROR_SIGN_IDENTITY (development, this Mac only)"
+    [[ -f "$APP/Contents/Resources/ios" ]] && \
+        codesign --force --sign "$IMIRROR_SIGN_IDENTITY" --timestamp=none "$APP/Contents/Resources/ios"
+    codesign --force --sign "$IMIRROR_SIGN_IDENTITY" --timestamp=none --entitlements "$ENT" "$APP"
+    SIGNED=dev
+elif [[ -n "$IDENTITY" ]]; then
     echo "==> signing with: $IDENTITY_NAME [$IDENTITY] (hardened runtime)"
     # Sign nested helper first, then the app (deep is discouraged; sign inside-out).
     [[ -f "$APP/Contents/Resources/ios" ]] && \
@@ -170,6 +179,8 @@ if [[ "$SIGNED" == 1 ]]; then
 (see header of this script for one-time store-credentials setup)
 EOF
     fi
+elif [[ "$SIGNED" == dev ]]; then
+    echo "==> development-signed DMG built (for this Mac; not notarizable)."
 else
     echo "==> ad-hoc DMG built (opens locally; other Macs will see a Gatekeeper warning)."
     echo "    For distribution, install a 'Developer ID Application' cert and re-run."

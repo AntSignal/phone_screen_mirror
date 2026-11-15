@@ -1,8 +1,9 @@
 // Runs the shell suites under scripts/tests, so `swift test` also gates the
 // go-ios loopback patch, the pinned go-ios revision, WDA signing and the WDA
-// typed-text redaction in the build scripts, plus the running-bundle guard in
-// run.sh / package.sh and diagnose.sh's audits. Each suite stubs every tool
-// that could touch a real keychain, build, Simulator or iMirror (see its header).
+// typed-text redaction in the build scripts, the running-bundle guard in
+// run.sh / package.sh, how they sign the app, and diagnose.sh's audits.
+// Each suite stubs every tool that could touch a real keychain, build,
+// Simulator or iMirror (see its header).
 
 import Foundation
 import XCTest
@@ -20,4 +21,6 @@ final class ScriptTests: XCTestCase {
     func testBuildScriptsSuite() { runSuite("test-build-scripts.sh") }
 
     func testAppScriptsSuite() { runSuite("test-app-scripts.sh") }
+
+    func testSignScriptsSuite() { runSuite("test-sign-scripts.sh") }
 }

@@ -45,6 +45,31 @@ final class RestartRequestWatcherTests: XCTestCase {
         XCTAssertFalse(exists("restart-\(udid).json"), "old junk is cleared")
     }
 
+    func testScanDeliversKeyboardRequestsAndRefusalsApart() {
+        let w = RestartRequestWatcher(dir: dir)
+        var restarts = 0
+        var got: [KeyboardRequestFile.Read] = []
+        w.onRequest = { _ in restarts += 1 }
+        w.onKeyboard = { got.append($0) }
+        let at = ISO8601DateFormatter().string(from: Date())
+        put("keyboard-\(udid).json", #"{"udid":"\#(udid)","requested_at":"\#(at)","action":"pair"}"#)
+        put("keyboard-A-1.json", #"{"udid":"A-1","requested_at":"\#(at)","action":"passcode"}"#)
+        put("keyboard-B-2.json", #"{"udid":"B-2"#)
+        w.scan()
+        XCTAssertEqual(restarts, 0)
+        XCTAssertEqual(got.count, 2)
+        guard case .request(let r)? = got.first(where: { if case .request = $0 { return true }; return false }) else {
+            return XCTFail("pair not delivered")
+        }
+        XCTAssertEqual(r.action, .pair)
+        XCTAssertTrue(got.contains(.refused(udid: "A-1", .unknownAction)))
+        XCTAssertFalse(exists("keyboard-\(udid).json"))
+        XCTAssertFalse(exists("keyboard-A-1.json"), "a refused request is gone too")
+        XCTAssertTrue(exists("keyboard-B-2.json"), "may still be mid-write")
+        w.scan(now: Date().addingTimeInterval(11))
+        XCTAssertFalse(exists("keyboard-B-2.json"))
+    }
+
     func testTheFolderSourceHearsANewFile() {
         let w = RestartRequestWatcher(dir: dir)
         let heard = expectation(description: "request")
