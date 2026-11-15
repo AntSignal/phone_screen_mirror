@@ -186,6 +186,7 @@ def test_tool_names_and_required_params_are_unchanged(reg):
         "ios_finish_run": [], "ios_assert_visible": ["text"],
         "ios_assert_not_visible": ["text"], "ios_run_sequence": ["steps"],
         "ios_alert": [], "ios_recover": [],
+        "ios_reserve_device": [], "ios_release_device": [], "ios_device_leases": [],
     }
     got = {n: sorted(s.get("required", [])) for n, s in tool_schemas(reg.m).items()}
     assert got == {n: sorted(r) for n, r in expected.items()}
@@ -746,5 +747,5 @@ def test_only_tools_that_never_change_the_device_are_marked_read_only(reg):
     assert read_only == {
         "ios_status", "ios_devices", "ios_window_size", "ios_screenshot", "ios_source",
         "ios_await_idle", "ios_wait_for", "ios_assert_visible", "ios_assert_not_visible",
-        "ios_app_state", "ios_clipboard_get", "sim_list",
+        "ios_app_state", "ios_clipboard_get", "sim_list", "ios_device_leases",
     }

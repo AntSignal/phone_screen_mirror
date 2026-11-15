@@ -16,6 +16,9 @@ its self-managed transport (userspace tunnel + runwda + forward + relay).
 |------|--------------|
 | `ios_status` | WDA ready? + iOS version / device name, which server answered (`server_version`, `script_path`) and which endpoint (`target`, `wda_endpoint`, `selected_udid`); with iMirror's device file, also the app's view (`app_state`, `reason`, `state_since`, `chain_epoch`, `next_retry_at`, `last_error`) and the phone's last 5 events |
 | `ios_devices` | every device this server can drive (alias, UDID, port, ready?, the app's view as above, how its WDA sessions were got) and which one is the default |
+| `ios_reserve_device(device, agent, wait_s, hold_s)` | reserve a device for yourself, waiting in line (≤ 85 s per call) if another agent has it: `held` or `queued` (see [Sharing a device between agents](#sharing-a-device-between-agents)) |
+| `ios_release_device(device, agent)` | release it; the next agent in line gets it at once |
+| `ios_device_leases(device)` | who holds each device, since when, how long idle, and who waits |
 | `ios_recover` | ask iMirror to restart a phone's WDA chain, then wait ≤30 s: `accepted`, `cooldown` (one ran in the last minute) or `timeout` |
 | `ios_window_size` | logical screen size (points) for the current orientation |
 | `ios_screenshot` | full-res device screenshot (PNG, or JPEG on a device via `IMIRROR_SCREENSHOT_QUALITY`) — no macOS Screen Recording perm needed |
@@ -43,7 +46,42 @@ its self-managed transport (userspace tunnel + runwda + forward + relay).
 
 Every device tool also takes an optional **`device`** argument — see
 [Several devices](#several-devices). The run-report tools, `ios_devices` and
-`sim_list` / `sim_enable` / `sim_disable` don't.
+`sim_list` / `sim_enable` / `sim_disable` don't. Every tool that changes or
+inspects a device also takes an optional **`agent`** name (see below).
+
+## Sharing a device between agents
+
+Several agents (sessions, their subagents, `Testing/run.sh`) share the same
+phones and Simulators. To use a device:
+
+```
+ios_reserve_device(device="phone1", agent="<your name>")   # repeat while "queued"
+... drive it, passing agent="<your name>" on every call ...
+ios_release_device(device="phone1", agent="<your name>")
+```
+
+- **`held`** returns `lease_id` and `expires_at`. The hold lasts `hold_s`
+  (default 900, 60–3600) even while you are idle, but ends anyway after 20
+  minutes unused. Calling again while you hold it renews it.
+- **`queued`** returns your `position`, the `holder` (`agent`, `session`,
+  `since`, `idle_s`) and a `ticket`. One call waits at most `wait_s` (default
+  60, at most 85: Claude Code moves a tool call to the background at 120 s).
+  Call again with the same `agent` within 30 s to keep your place. When the
+  holder releases, the first in line gets the device at once.
+- **Without a reservation**, your first tap, type or launch on a free device
+  takes it for you; it frees after 5 idle minutes or when your session ends.
+- **`DEVICE_BUSY`** means another agent holds the device and nothing was sent.
+  Wait in line with `ios_reserve_device` or use another device; don't retry the
+  call in a loop. `ios_screenshot`, `ios_status` and `ios_device_leases` work on
+  any device.
+- **`agent`**: subagents of one session share one MCP server, so pass your own
+  name on every call. Two names are two holders. `ios_release_device` frees
+  only that name's hold. `"phone1,phone2"` reserves both or neither, and a
+  wait that would deadlock fails with `DEVICE_DEADLOCK`.
+- `ios_devices` and `ios_status` show each device's `lease`. `ios_devices`
+  lists `servers_ignoring_leases`: MCP servers on this Mac (an older install)
+  that drive devices without asking.
+- Scripts use the `imirror-lease` CLI (below), which shares the same state.
 
 ## Several devices
 
@@ -121,12 +159,75 @@ mirror, every agent's MCP server), so this server avoids creating one:
   showing; otherwise check `ios_devices` rather than retrying in a loop. Its
   per-device `session` counts (`created`, `adopted`, `lost`) show the history.
 
-Nothing here orders two servers' calls to one phone: calls are serialised per
-phone only within one server process.
+Calls are serialised per phone within one server process; across servers,
+device leases order them (next section).
 
 A server exits as soon as its client is gone: when its stdin closes, or when
 its parent process changes (it was orphaned). It does not wait for a tool
 call still blocked on WDA.
+
+## Device leases: `imirror-lease`
+
+`devicelease.py` records which agent may drive each phone (`device:<UDID>`)
+or Simulator (`sim:<UDID>`), so agents can wait in line for a device instead of
+trampling each other's WDA session. A hold belongs to a process and covers its
+children: `--anchor-pid`, else the nearest `claude` process, else the terminal
+tab's shell. It ends on release, after it sits idle, when its time is up, or
+when that process exits. State lives in
+`~/Library/Application Support/iMirror/leases/`.
+
+The app's MCP Install writes the CLI launcher
+`~/Library/Application Support/iMirror/bin/imirror-lease`:
+
+```bash
+imirror-lease whoami                       # which process my holds belong to
+imirror-lease status                       # every device: holder, queue
+imirror-lease acquire device:<UDID> --wait-s 600 --anchor-pid $$
+imirror-lease release device:<UDID> --anchor-pid $$
+```
+
+Exit codes: 0 ok, 2 usage, 3 busy, 4 deadlock, 5 not held or lost, 6 the lease
+system itself failed. Leases are cooperative: they order only the callers that
+ask, and this server asks before every device call.
+
+### How the server's tools use leases
+
+Each device tool has an access class:
+
+| Class | Tools | On a device someone else holds |
+|-------|-------|--------------------------------|
+| observe | `ios_status`, `ios_devices`, `ios_screenshot`, `ios_window_size`, `ios_app_state`, `ios_start_run` | runs; never checked |
+| inspect | `ios_source`, `ios_wait_for`, `ios_await_idle`, `ios_assert_*`, `ios_clipboard_get`, `ios_orientation` and `ios_alert` reads | `DEVICE_BUSY` |
+| drive | everything else, `ios_recover` included | `DEVICE_BUSY` |
+
+- **A drive call on a free device takes it** for the caller: an automatic
+  hold that ends after 5 idle minutes, or when the caller's Claude session
+  exits. An inspect call on a free device runs without taking it.
+- **`DEVICE_BUSY` fails at once and sends nothing.** It names the holder and
+  says how to wait in line (`ios_reserve_device`). Don't retry the call in a loop.
+- **`agent`**: every drive and inspect tool takes an optional `agent` name.
+  Subagents of one session share one MCP server, so the name is the only
+  thing that tells them apart: two names in one session are two holders, and
+  once a named agent holds a device, an unnamed call from that session is
+  refused too. A named agent does not share an unnamed hold from its own
+  session either (the parent's tap): it gets `DEVICE_BUSY` until that hold
+  has been idle 30 s, then the hold passes to that one agent. An unnamed
+  hold taken by antsignalctl (`imirror-lease`) is still shared, because it
+  cannot carry a name.
+- **A hold can end mid-call** (it lapsed, the user freed the device, or a run
+  you started took it). The server re-checks before every WDA request,
+  devicectl/simctl run and `ios_run_sequence` step, and stops with
+  `DEVICE_RESERVATION_LOST`; the rest of the call is not sent. The next call
+  that finds its hold gone gets `DEVICE_RESERVATION_LOST` once: take a
+  screenshot before acting again.
+- **Waiting is use.** While a call is in flight (riding out a WDA restart,
+  `ios_recover`, or an install waiting for `devicectl.lock`) a heartbeat
+  renews the hold every few seconds, so the wait never counts as idle time.
+  Order is lease, then the per-device call lock, then `devicectl.lock`, so
+  they cannot deadlock.
+- Keys are UDIDs, never aliases. A server pinned by `IMIRROR_WDA` finds its
+  UDID through `IMIRROR_UDID` or the device file's `wda_url`; with neither it
+  locks `wda:127.0.0.1:<port>`, which excludes only other pinned servers.
 
 ## When a phone's WDA restarts
 
@@ -299,6 +400,14 @@ or hand the phone's session to another client:
 mcp-server/.venv/bin/pip install pytest
 mcp-server/.venv/bin/python -m pytest mcp-server
 ```
+
+`conftest.py` gives every test its own lease directory, so no test touches the
+leases live sessions use. `test_devicelease.py` covers the pure rules;
+`test_devicelease_store.py` runs the CLI and the store against real child
+processes, also under the Mac's own `/usr/bin/python3` (3.9).
+`test_lease_hook.py` drives the tools against another agent's hold (a real
+child process) and checks nothing reaches WDA, including mid-call losses
+over real HTTP; `test_lease_tools.py` covers reserving, queueing and releasing.
 
 ## Security
 

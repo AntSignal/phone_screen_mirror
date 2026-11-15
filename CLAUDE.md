@@ -23,8 +23,10 @@ swift build && swift test                          # Swift, and scripts/*.sh
 tool stubbed), so a change to a script is covered there too.
 
 (`mcp-server` runs every suite: `test_imirror_mcp.py`, `test_multi_device.py`,
-`test_sim_control.py`, `test_wda_bringup.py` and `test_imirror_ctl.py`, which
-covers `scripts/imirror-ctl`; the live ones skip themselves.)
+`test_sim_control.py`, `test_wda_bringup.py`, `test_imirror_ctl.py`, which
+covers `scripts/imirror-ctl`, and the device-lease ones, `test_devicelease*.py`
+and `test_lease_*.py`; the live ones skip themselves. `conftest.py` points every
+test at its own lease directory, never the live one.)
 
 First-time setup (creates the venv the command above expects):
 
@@ -71,8 +73,8 @@ Claude Code and Claude Desktop are registered at
 path reads as "update available". So once a client is re-registered there, editing,
 pulling or checking out a git tree changes nothing a session runs until a rebuilt
 app's **Update**. (A registration made before this, or by hand, still runs
-whatever tree it names.) When `devicelease.py` ships, the install also writes the
-`~/Library/Application Support/iMirror/bin/imirror-lease` launcher.
+whatever tree it names.) Because the server ships `devicelease.py`, the install
+also writes the `~/Library/Application Support/iMirror/bin/imirror-lease` launcher.
 
 `scripts/run.sh` and `scripts/package.sh` refuse to replace a `build/iMirror.app`
 that is running; `--restart` quits exactly that pid (every phone drops for about
