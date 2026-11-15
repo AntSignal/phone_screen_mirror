@@ -948,7 +948,14 @@ mcp = FastMCP("imirror", instructions=(
     "shows them, sim_enable turns one on (it is then a device by its alias). "
     "A failure with kind=outcome_unknown means the action may already have "
     "happened: look at the screen before repeating it. If ios_source and the "
-    "screenshot disagree, ios_alert reads a system alert covering the app."))
+    "screenshot disagree, ios_alert reads a system alert covering the app. "
+    "Devices are shared by several agents. To use a device: "
+    "ios_reserve_device(device, agent=<your name>) — repeat while queued; "
+    "release with ios_release_device when done. A tap on a free device also "
+    "takes it for you until 5 idle minutes pass. DEVICE_BUSY means another "
+    "agent holds it and nothing was sent: wait in line with ios_reserve_device "
+    "or use another device. Subagents: pass your own name as `agent` on every "
+    "call. Screenshots and ios_status work on any device."))
 
 # Optional per-run recording. Off until ios_start_run; every action/screenshot is
 # appended to _run["steps"], and ios_finish_run renders them into a report.
@@ -2238,8 +2245,8 @@ def ios_status() -> str:
     iMirror app isn't running or its health dot isn't green yet. With
     iMirror's device file it also gives the app's view: app_state, reason
     (why it is not ready), state_since, chain_epoch, next_retry_at,
-    last_error and the phone's last 5 events. While WDA is down this call
-    fails too; ios_devices still shows that view.
+    last_error, the phone's last 5 events and its `lease` holder. While
+    WDA is down this call fails too; ios_devices still shows that view.
     """
     _, j = _req("GET", "/status")
     v = j.get("value", {})
@@ -2256,6 +2263,7 @@ def ios_status() -> str:
     if t is not _LEGACY:                 # list mode: say which phone answered
         out.update(alias=t.alias, udid=t.udid, kind=t.kind, **_chain_fields(t),
                    events=_recent_events({t.udid} if t.udid else set()).get(t.udid, []))
+    out.update(_leases_state(), lease=_lease_view(_lease_views([t]).get(t.alias)))
     return json.dumps(out)
 
 
@@ -2293,7 +2301,8 @@ def ios_devices() -> str:
     Returns JSON {"mode", "default", "server_version", "script_path",
     "devices": [{"alias", "udid", "kind", "product_type", "ios", "wda",
     "app_state", "reason", "state_since", "chain_epoch", "next_retry_at",
-    "last_error", "events", "wda_ready", "is_default", "session"}]}. `reason`
+    "last_error", "events", "wda_ready", "is_default", "session", "lease"}]}.
+    `lease`: who holds it (see ios_device_leases). `reason`
     says why the app's chain is not ready; `events` are its last 5 for that
     device. `session` counts
     how this server got its WDA sessions (created, adopted from another
@@ -2312,6 +2321,7 @@ def ios_devices() -> str:
     with concurrent.futures.ThreadPoolExecutor(max_workers=max(1, len(targets))) as ex:
         probes = list(ex.map(_probe_status, targets))
     events = _recent_events({t.udid for t in targets if t.udid and t is not _LEGACY})
+    leases = _lease_views(targets)
     devices = []
     for t, p in zip(targets, probes):
         devices.append({
@@ -2322,13 +2332,196 @@ def ios_devices() -> str:
             "is_default": t.alias == default,
             # Many adoptions or losses mean another client shares the phone.
             "session": {"cached": bool(t.session["id"]), **t.session_stats},
+            "lease": _lease_view(leases.get(t.alias)),
             **({"error": p["error"]} if "error" in p else {}),
         })
     out: dict[str, Any] = {"mode": mode, "default": default, **_server_identity(),
-                           "devices": devices}
+                           **_leases_state(), "devices": devices}
+    if _leases().enabled:
+        ignoring = _leases().unlocked_servers()
+        if ignoring:
+            out["servers_ignoring_leases"] = [
+                {k: x.get(k) for k in ("pid", "kind", "reason")} for x in ignoring]
     if mode == "fallback":
         out["note"] = f"not using an iMirror device file: {_REGISTRY.problem}"
     return json.dumps(out)
+
+
+# ---- Reserving a device ----------------------------------------------------------
+
+_RESERVE_WAIT_MAX_S = 85.0        # Claude Code backgrounds a call at 120 s
+_RESERVE_HOLD_S = (60.0, 3600.0)
+_QUEUED_HINT = "call ios_reserve_device again with the same agent to keep your place"
+
+_RESERVE_DEVICE_DOC = ("The device(s) to reserve: an alias or UDID from ios_devices, or "
+                       "several as \"phone1,phone2\" (all or nothing). Omit it when only "
+                       "one phone is attached.")
+
+
+def _lease_targets(device: str) -> list[_Target]:
+    """The targets `device` names: one, or a comma-separated list."""
+    names = [d.strip() for d in (device or "").split(",") if d.strip()]
+    found: list[_Target] = []
+    for t in ([_resolve(n) for n in names] if names else [_resolve("")]):
+        if all(t is not x for x in found):
+            found.append(t)
+    return found
+
+
+def _holder_view(h: dict[str, Any] | None) -> dict[str, Any] | None:
+    """A lease holder as agents see it: which agent, which session, since
+    when, and how long it has been idle."""
+    if not h:
+        return None
+    where = f" in {devicelease._short_path(h['cwd'])}" if h.get("cwd") else ""
+    out = {"agent": h.get("label") or None,
+           "session": f"{h.get('kind') or 'process'} pid {h.get('pid')}{where}",
+           "purpose": h.get("purpose") or h.get("via") or "",
+           "since": h.get("since") or None, "idle_s": h.get("idle_s"),
+           "until": h.get("until")}
+    if h.get("waiting"):
+        out["waiting_in_line"] = True
+    return out
+
+
+def _lease_view(v: dict[str, Any] | None) -> dict[str, Any]:
+    """One device's lease, for ios_devices, ios_status and ios_device_leases."""
+    if not v:
+        return {"state": "free", "holder": None, "queue": 0, "your_position": None}
+    return {"state": v["state"], "holder": _holder_view(v.get("holder")),
+            "queue": v.get("queue", 0), "your_position": v.get("your_position")}
+
+
+def _lease_views(targets: list[_Target], agent: str = "") -> dict[str, Any]:
+    """Each target's full lease view by alias, or {} when leases are off."""
+    lk = _leases()
+    if not lk.enabled:
+        return {}
+    keys = {t.alias: _lease_key(t) for t in targets}
+    try:
+        views = lk.view(keys.values(), label=agent)
+    except (devicelease.StateError, devicelease.UsageError):
+        return {}
+    return {alias: views.get(k) for alias, k in keys.items()}
+
+
+def _leases_state() -> dict[str, Any]:
+    lk = _leases()
+    out: dict[str, Any] = {"leases": "on" if lk.enabled else "off"}
+    if lk.problem:
+        out["lease_problem"] = lk.problem
+    return out
+
+
+async def ios_reserve_device(
+        device: Annotated[str, Field(description=_RESERVE_DEVICE_DOC)] = "",
+        agent: Annotated[str, Field(description=_AGENT_DOC)] = "",
+        wait_s: float = 60, hold_s: float = 900, purpose: str = "") -> str:
+    """Reserve a device so no other agent can drive it, waiting in line if
+    another agent has it.
+
+    To use a device: ios_reserve_device(device, agent=<your name>), repeat
+    while it answers "queued", then call ios_release_device when done.
+    `wait_s` (0-85): how long this call waits in line. A queued place is kept
+    while you call again within 30 s. `hold_s` (60-3600): how long it stays
+    yours while idle; 20 unused minutes end it anyway. Calling again renews.
+    Returns JSON {"status": "held", "lease_id", "expires_at"} or {"status":
+    "queued", "position", "holder": {"agent", "session", "since", "idle_s"},
+    "ticket", "hint"}."""
+    targets = await anyio.to_thread.run_sync(_lease_targets, device)
+    names = [_lease_name(t) for t in targets]
+    lk = _leases()
+    if not lk.enabled:
+        return json.dumps({"status": "held", "devices": names, "leases": "off",
+                           "note": "device leases are off on this server"})
+    keys = [_lease_key(t) for t in targets]
+    wait = max(0.0, min(float(wait_s), _RESERVE_WAIT_MAX_S))
+    hold = max(_RESERVE_HOLD_S[0], min(float(hold_s), _RESERVE_HOLD_S[1]))
+    label = devicelease.norm_label(agent)
+    why = purpose or (f"agent {label!r} reserved it" if label else "reserved by an agent")
+    started = time.monotonic()
+    try:
+        for _ in range(2):                  # a lost belief is retried once
+            if wait > 0:
+                out = await lk.acquire_async(keys, wait_s=wait, hold_s=hold, purpose=why,
+                                             label=label, run_sync=anyio.to_thread.run_sync,
+                                             sleep=anyio.sleep)
+            else:
+                out = await anyio.to_thread.run_sync(functools.partial(
+                    lk.acquire, keys, hold_s=hold, wait=True, purpose=why, label=label))
+            if out.status != "lost":
+                break
+    except (devicelease.LeaseError, devicelease.StateError) as e:
+        raise _lease_error(e, targets[0], keys[0]) from None
+    j = out.to_json()
+    if out.status in ("held", "covered"):
+        res = {"status": "held", "devices": names, "agent": label or None,
+               "lease_id": out.lease_id, "expires_at": j.get("until"),
+               "expires_in_s": j.get("expires_in_s"), "hold_s": int(hold)}
+        if out.status == "covered":
+            res["note"] = "a run you started holds it, and its hold covers you"
+        return json.dumps(res)
+    if out.status == "queued":
+        first = out.blocked_on[0] if out.blocked_on else {}
+        return json.dumps({
+            "status": "queued", "devices": names, "agent": label or None,
+            "position": out.position, "holder": _holder_view(first.get("holder")),
+            "ticket": out.ticket, "waited_s": round(time.monotonic() - started, 1),
+            "hint": _QUEUED_HINT})
+    t = targets[keys.index(out.blocked_on[0]["key"])] if out.blocked_on else targets[0]
+    raise _lease_error(devicelease.LeaseError(out), t, _lease_key(t))
+
+
+mcp.add_tool(ios_reserve_device, name="ios_reserve_device")
+
+
+@_tool(per_device=False)
+def ios_release_device(
+        device: Annotated[str, Field(description=_RESERVE_DEVICE_DOC)] = "",
+        agent: Annotated[str, Field(description=_AGENT_DOC)] = "") -> str:
+    """Release a device you reserved or took automatically, so the next agent
+    in line gets it at once. It also gives up your place in line. Releasing
+    a device you do not hold does nothing; it never frees another agent's
+    hold, even one in this session. Returns JSON {"released": [...],
+    "not_held": [...]}."""
+    targets = _lease_targets(device)
+    names = [_lease_name(t) for t in targets]
+    lk = _leases()
+    if not lk.enabled:
+        return json.dumps({"released": [], "not_held": names, "leases": "off"})
+    keys = [_lease_key(t) for t in targets]
+    try:
+        out = lk.attempt(devicelease.Request(op="release", keys=tuple(keys),
+                                             exact_label=True),
+                         devicelease.norm_label(agent))
+    except devicelease.StateError as e:
+        raise _lease_error(e, targets[0], keys[0]) from None
+    done = set(out.released)
+    return json.dumps({"released": [n for n, k in zip(names, keys) if k in done],
+                       "not_held": [n for n, k in zip(names, keys) if k not in done]})
+
+
+@_tool(per_device=False, read_only=True)
+def ios_device_leases(
+        device: Annotated[str, Field(description=_RESERVE_DEVICE_DOC)] = "",
+        agent: Annotated[str, Field(description=_AGENT_DOC)] = "") -> str:
+    """Show who holds each device and who waits for it. Never blocked.
+
+    `device` limits it to one device (or "phone1,phone2"); omit it for all.
+    Returns JSON {"leases": "on"|"off", "devices": [{"alias", "key",
+    "state": "free"|"yours"|"covered"|"busy", "holder": {"agent", "session",
+    "since", "idle_s", "until"}, "queue", "your_position", "waiting"}]}.
+    "yours" is judged for `agent`."""
+    targets = _lease_targets(device) if device else _targets()[1]
+    views = _lease_views(targets, agent)
+    devices = []
+    for t in targets:
+        v = views.get(t.alias)
+        row = {"alias": t.alias, "key": _lease_key(t), **_lease_view(v)}
+        row["waiting"] = [_holder_view(w) for w in (v or {}).get("waiting", [])]
+        row["suspended"] = [_holder_view(s) for s in (v or {}).get("suspended", [])]
+        devices.append(row)
+    return json.dumps({**_leases_state(), "devices": devices})
 
 
 _RECOVER_WAIT_S = 30.0
@@ -4452,9 +4645,19 @@ def _autowda_bring_up() -> None:
         raise SystemExit(1)
 
 
+def _register_lease_server() -> None:
+    """Tell other tools this server asks for leases, so it is not listed as
+    one that ignores them. Best effort."""
+    lk = _leases()
+    if lk.enabled:
+        with contextlib.suppress(OSError, devicelease.StateError):
+            lk.register_server(__version__, os.path.realpath(__file__))
+
+
 if __name__ == "__main__":
     _start_client_watch()
     _autowda_bring_up()
+    _register_lease_server()
     mcp.run()
     # Don't wait on a tool thread still blocked on WDA.
     _exit_now("stdin closed")
