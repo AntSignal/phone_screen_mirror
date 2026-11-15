@@ -20,6 +20,8 @@
 	<string>20260915</string>
 	<key>LSMinimumSystemVersion</key>
 	<string>14.0</string>
+	<key>NSBluetoothAlwaysUsageDescription</key>
+	<string>iMirror acts as a Bluetooth keyboard to type into a test iPhone when you ask it to.</string>
 	<key>NSHighResolutionCapable</key>
 	<true/>
 	<key>NSPrincipalClass</key>
