@@ -151,7 +151,7 @@ final class DongleLink: @unchecked Sendable {
         for path in Self.calloutPaths() where (skipUntil[path] ?? .distantPast) <= now {
             let port = DongleSerialPort(path: path)
             defer { port.close() }
-            guard (try? port.open()) != nil, let reply = try? port.exchange(.hello) else {
+            guard (try? port.open()) != nil, let reply = Self.hello(on: port) else {
                 skipUntil[path] = now.addingTimeInterval(Self.skipSec)
                 continue
             }
@@ -165,6 +165,16 @@ final class DongleLink: @unchecked Sendable {
             return try body(port, hello)
         }
         throw DongleError.notFound
+    }
+
+    /// USB comes up before the firmware, so a dongle plugged in a moment
+    /// ago can miss the first HELLO while it boots. A silent port gets one
+    /// more try; without it the dongle reads as absent for `skipSec`.
+    static func hello(on port: DongleSerialPort) -> DongleReply? {
+        for _ in 0..<2 {
+            do { return try port.exchange(.hello) } catch DongleError.noReply { continue } catch { return nil }
+        }
+        return nil
     }
 }
 

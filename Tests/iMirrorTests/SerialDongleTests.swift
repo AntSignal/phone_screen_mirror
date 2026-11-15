@@ -88,6 +88,24 @@ final class SerialDongleTests: XCTestCase {
         XCTAssertEqual(r.final, .err(code: "UNKNOWN_SLOT"))
     }
 
+    func testASilentFirstHelloGetsOneMoreTry() throws {
+        let port = DongleSerialPort(path: path)
+        try port.open()
+        defer { port.close() }
+        var seen: [String] = []
+        let done = expectation(description: "dongle saw two lines")
+        DispatchQueue.global().async {
+            seen.append(self.readLine())   // still booting: no answer
+            seen.append(self.readLine())
+            self.reply("OK HELLO imirror-kbd 1 a0:f2:62:f3:6b:e2\n")
+            done.fulfill()
+        }
+        let r = DongleLink.hello(on: port)
+        wait(for: [done], timeout: 6)
+        XCTAssertEqual(seen, ["HELLO", "HELLO"])
+        XCTAssertEqual(r.flatMap(DongleProtocol.hello)?.address, "a0:f2:62:f3:6b:e2")
+    }
+
     func testSilenceIsNoReply() throws {
         let port = DongleSerialPort(path: path)
         try port.open()
