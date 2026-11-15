@@ -132,13 +132,14 @@ final class KeyboardControl {
             return "Pair the keyboard first: scripts/imirror-ctl keyboard pair <device>."
         }
         let secret: SecretBytes
-        switch PasscodeLookup.load(udid: udid, file: file) {
+        let alias = aliasOf(udid)
+        switch PasscodeLookup.load(udid: udid, alias: alias, file: file) {
         case .noFile:
             log(udid, .failed, .noFile)
             return "Can't read \(file.path)."
         case .noPasscode:
             log(udid, .failed, .noPasscode)
-            return "\(file.lastPathComponent) has no \(PasscodeLookup.key(udid: udid))."
+            return "\(file.lastPathComponent) has no \(PasscodeLookup.suggestedKey(udid: udid, alias: alias))."
         case .found(let s):
             secret = s
         }

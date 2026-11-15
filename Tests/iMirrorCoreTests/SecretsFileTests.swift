@@ -109,6 +109,30 @@ final class PasscodeLookupTests: XCTestCase {
         XCTAssertEqual(load(udid, url), "222222")
     }
 
+    func testTheAliasKeyIsShortAndComesFirst() {
+        XCTAssertEqual(PasscodeLookup.key(alias: "phone2"), "PHONE2_PASSCODE")
+        XCTAssertEqual(PasscodeLookup.key(alias: "test-16e"), "TEST_16E_PASSCODE")
+        XCTAssertNil(PasscodeLookup.key(alias: ""))
+        let url = file("""
+        IMIRROR_PASSCODE_000081400006423002D3401C=222222
+        PHONE2_PASSCODE=333333
+        PHONE1_PASSCODE=999999
+        """)
+        if case .found(let s) = PasscodeLookup.load(udid: udid, alias: "phone2", file: url) {
+            XCTAssertEqual(String(decoding: s.bytes, as: UTF8.self), "333333")
+        } else { XCTFail("PHONE2_PASSCODE not used") }
+        XCTAssertEqual(load(udid, url), "222222", "no alias still finds the UDID key")
+    }
+
+    func testAnotherPhonesAliasKeyIsNeverUsed() {
+        let url = file("PHONE1_PASSCODE=999999\n")
+        guard case .noPasscode = PasscodeLookup.load(udid: udid, alias: "phone2", file: url) else {
+            return XCTFail("phone2 must not get phone1's passcode")
+        }
+        XCTAssertEqual(PasscodeLookup.suggestedKey(udid: udid, alias: "phone2"), "PHONE2_PASSCODE")
+        XCTAssertEqual(PasscodeLookup.suggestedKey(udid: udid, alias: nil), "IMIRROR_PASSCODE_000081400006423002D3401C")
+    }
+
     func testTheSharedKeyOnlyForItsOwnPhone() {
         let url = file("export ANTSIGNAL_DEVICE_UDID=\"\(udid.lowercased())\"\nANTSIGNAL_TEST_DEVICE_PASSCODE=111111\n")
         XCTAssertEqual(load(udid, url), "111111")
