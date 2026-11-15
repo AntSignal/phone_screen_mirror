@@ -6,6 +6,7 @@ clock moves time. Each test names the rule it pins down.
 """
 from __future__ import annotations
 
+import dataclasses
 import itertools
 import os
 import subprocess
@@ -472,11 +473,50 @@ def test_label_rules(s, w, procs):
     assert s.ensure(who([procs.S_mcp, procs.S, procs.term], label="EXPLORER"), P1).status == "held"
 
 
-def test_labelled_call_on_an_unlabelled_hold_does_not_relabel(s, procs):
+def test_named_agents_never_share_an_unnamed_hold(s, procs):
+    """Riding the parent's unnamed hold let two named subagents drive one
+    phone at once. A named agent waits until that hold is idle, then it
+    passes to that one agent only."""
+    s.ensure(procs.s_mcp, P1)
+    first = s.top(P1)["lease_id"]
+    x = who([procs.S_mcp, procs.S, procs.term], label="x")
+    y = who([procs.S_mcp, procs.S, procs.term], label="y")
+    out = s.ensure(x, P1)
+    assert out.status == "busy" and out.reasons[P1] == "unnamed"
+    assert "agent name" in out.message and out.retry_after_s == 30
+    assert s.do(x, "inspect", [P1], mode="auto").status == "busy"
+    s.now += 29
+    assert s.ensure(x, P1).status == "busy"
+    s.now += 1
+    assert s.do(x, "inspect", [P1], mode="auto").status == "not_held", "reads run free"
+    out = s.ensure(x, P1)
+    assert out.status == "held" and s.top(P1)["label"] == "x"
+    assert out.lease_id != first and len(s.holders(P1)) == 1
+    assert s.state["keys"][P1]["last_release"]["reason"] == "handoff"
+    assert s.ensure(y, P1).reasons[P1] == "subagent"
+    assert s.ensure(procs.s_mcp, P1).reasons[P1] == "label"
+    view = dl.view(s.state, x, s.now, s.w.alive, s.cfg)[P1]
+    assert view["state"] == "yours"
+
+
+def test_a_named_agent_still_rides_an_antsignalctl_hold(s, w, procs):
+    cli = dataclasses.replace(who([w.proc(230), procs.S_bash, procs.S, procs.term],
+                                  anchor=procs.S, client="cli"), via="imirror-lease ensure")
+    assert s.ensure(cli, P1).status == "held"
+    x = who([procs.S_mcp, procs.S, procs.term], label="x")
+    assert s.ensure(x, P1).status == "held", "antsignalctl cannot carry a name"
+    assert s.top(P1)["label"] == ""
+
+
+def test_a_named_queued_agent_gets_the_idle_unnamed_hold(s, procs):
     s.ensure(procs.s_mcp, P1)
     x = who([procs.S_mcp, procs.S, procs.term], label="x")
-    assert s.ensure(x, P1).status == "held"
-    assert s.top(P1)["label"] == ""
+    out = s.do(x, "acquire", [P1], mode="explicit", wait=True)
+    assert out.status == "queued"
+    s.now += 31
+    out = s.do(x, "acquire", [P1], mode="explicit", wait=True)
+    assert out.status == "held" and s.top(P1)["label"] == "x"
+    assert not s.state["tickets"], "its ticket is spent"
 
 
 # ---- tickets, claim windows and FIFO --------------------------------------------

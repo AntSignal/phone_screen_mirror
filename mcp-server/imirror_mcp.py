@@ -1111,7 +1111,7 @@ _AGENT_DOC = ("Your agent name, if you are a subagent or one of several agents i
               "ios_reserve_device, so other agents in the session cannot drive "
               "a device you hold. Omit it if you are the only agent.")
 
-_BUSY_HINT_REASONS = ("foreign", "ticket-ahead", "subagent", "label")
+_BUSY_HINT_REASONS = ("foreign", "ticket-ahead", "subagent", "label", "unnamed")
 
 
 def _leases() -> devicelease.Locker:
