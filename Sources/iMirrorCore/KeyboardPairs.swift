@@ -74,7 +74,7 @@ public struct KeyboardPairs: Equatable, Sendable {
 /// What a pairing window ended with.
 public enum PairingOutcome: Equatable, Sendable {
     case paired(central: String)
-    /// More than one new central: nobody can tell which is the phone.
+    /// Two or more new centrals: no way to tell which.
     case ambiguous(count: Int)
     case none
 }
@@ -84,7 +84,7 @@ public struct PairingWindow: Equatable, Sendable {
     public var udid: String
     public var opensAt: Date
     public var closesAt: Date
-    /// Centrals already subscribed when it opened; they are not the new phone.
+    /// Centrals subscribed before it opened; never the new phone.
     public var subscribedBefore: Set<String>
 
     public init(udid: String, opensAt: Date, closesAt: Date, subscribedBefore: Set<String>) {

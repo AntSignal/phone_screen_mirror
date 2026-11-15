@@ -1404,7 +1404,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSToolbarDelegate {
             type.controlSize = .small
             type.identifier = NSUserInterfaceItemIdentifier(udid)
             type.isEnabled = !keyboardControl.busy
-            type.toolTip = "Wakes the phone and types its passcode over the paired Bluetooth keyboard."
+            type.toolTip = "Wakes the phone and types its passcode over the paired Bluetooth keyboard. "
+                + "Use only while the phone shows a passcode prompt: otherwise the keys go to the focused field."
             let row = NSStackView(views: [smallLabel("Keyboard: paired"), type])
             row.orientation = .horizontal
             row.spacing = 6

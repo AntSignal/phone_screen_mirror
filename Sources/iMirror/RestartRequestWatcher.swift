@@ -15,7 +15,7 @@ final class RestartRequestWatcher {
     let dir: URL
     /// Each readable request, once; its file is already gone.
     var onRequest: ((RestartRequest) -> Void)?
-    /// Each keyboard request, or refusal, once; its file is already gone.
+    /// Each keyboard request or refusal, once; file already gone.
     var onKeyboard: ((KeyboardRequestFile.Read) -> Void)?
 
     private var source: DispatchSourceFileSystemObject?

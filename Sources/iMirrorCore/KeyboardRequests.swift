@@ -18,10 +18,10 @@ public enum KeyboardAction: String, Sendable, CaseIterable {
 public struct KeyboardRequest: Equatable, Sendable {
     public var udid: String
     public var requestedAt: Date
-    /// Who asked, for the log only. Clipped like a restart request's.
+    /// Who asked, for the log only; clipped.
     public var requestedBy: String
     public var action: KeyboardAction
-    /// Set for `test` only, and always passes `KeyboardRequestFile.isAllowedTestText`.
+    /// `test` only; always passes `isAllowedTestText`.
     public var text: String?
 
     public init(udid: String, requestedAt: Date, requestedBy: String, action: KeyboardAction, text: String? = nil) {
@@ -55,10 +55,10 @@ public enum KeyboardFailure: String, Sendable {
 public enum KeyboardRequestFile {
     public enum Read: Equatable, Sendable {
         case request(KeyboardRequest)
-        /// Ours and complete, but not allowed. Its file can go at once.
+        /// Ours and complete, but not allowed; delete at once.
         case refused(udid: String, KeyboardFailure)
         case notOurs
-        /// Named like a request but not one; may still be half-written.
+        /// Named like a request; may still be half-written.
         case unreadable
     }
 
@@ -73,10 +73,17 @@ public enum KeyboardRequestFile {
         return ExpectedReset.fileName(udid: udid) != nil ? udid : nil
     }
 
-    /// The test text rule: HIDKeyboard's validator plus at least one letter.
-    /// Digits alone could be a passcode, and this path must never carry one.
+    /// Test text digit cap; every passcode is longer.
+    public static let maxTestDigits = 3
+
+    /// The test text rule: HIDKeyboard's validator, at least one letter, and
+    /// at most three digits. This path must never carry a passcode. A numeric
+    /// passcode field may skip letters and spaces, so "a 1234" would still be
+    /// four digits typed into a lock screen: a wrong attempt.
     public static func isAllowedTestText(_ s: String) -> Bool {
-        HIDKeyboard.isValidTestText(s) && s.contains { ("a"..."z").contains($0) }
+        let bytes = s.utf8
+        return HIDKeyboard.isValidTestText(s) && bytes.contains { (0x61...0x7A).contains($0) }
+            && bytes.filter { (0x30...0x39).contains($0) }.count <= maxTestDigits
     }
 
     /// Parse one file. The body's udid must match the file name, so one
@@ -107,9 +114,9 @@ public enum KeyboardRequestFile {
 }
 
 public enum KeyboardRequestGate {
-    /// How long a pairing window stays open. imirror-ctl waits 130 s.
+    /// Pairing window length. imirror-ctl waits 130 s.
     public static let pairWindowSec: TimeInterval = 120
-    /// imirror-ctl gives up by then, so an older request has no one waiting.
+    /// imirror-ctl gives up by then; nobody awaits older requests.
     public static let maxAgeSec: TimeInterval = 120
 
     /// Whether to act on `r` now; nil means go. Pairing needs the phone on

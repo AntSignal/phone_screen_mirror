@@ -208,11 +208,18 @@ def test_keyboard_request_names_the_action_and_carries_no_passcode(tmp_path):
     assert pair["action"] == "pair" and "text" not in pair
 
 
-@pytest.mark.parametrize("text", ["123456", "0000", "Hello", "hi!", "", "a" * 33, None])
+@pytest.mark.parametrize("text", ["123456", "0000", "Hello", "hi!", "", "a" * 33, None,
+                                  "a 1234", "x123456", "1a2b3c4d", "pin 12 34"])
 def test_keyboard_test_text_refuses_digits_only_and_odd_text(tmp_path, text):
     with pytest.raises(ctl.CtlError):
         ctl.write_keyboard_request(str(tmp_path), PHONE_16E, NOW, "test", text)
     assert not (tmp_path / "requests").exists() or os.listdir(tmp_path / "requests") == []
+
+
+@pytest.mark.parametrize("text", ["a", "hello 123", "1 a 2 b 3", "z" * 32])
+def test_keyboard_test_text_allows_words_with_up_to_three_digits(tmp_path, text):
+    path = ctl.write_keyboard_request(str(tmp_path), PHONE_16E, NOW, "test", text)
+    assert json.loads(open(path).read())["text"] == text
 
 
 def test_keyboard_pair_and_forget_take_no_text(tmp_path):
