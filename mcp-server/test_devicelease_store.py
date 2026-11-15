@@ -725,8 +725,9 @@ def test_an_async_wait_gets_the_device_when_the_holder_lets_go(holders):
     assert top(K1)["claim_until_mono"] is None
 
 
-def test_mcp_waits_are_capped_at_90_s():
-    assert dl.Locker(client="mcp").cfg.mcp_wait_cap_s == 90
+def test_mcp_waits_are_capped_at_85_s():
+    # Claude Code backgrounds a call at 120 s.
+    assert dl.Locker(client="mcp").cfg.mcp_wait_cap_s == 85
 
 
 def test_cli_wait_queues_then_gets_the_device(holders):
@@ -912,3 +913,36 @@ def test_golden_has_every_shape_the_app_must_decode():
         ["device:00008140-0006423002D3401C", "device:00008150-001928E01404401C"]]
     assert doc["ended"] and doc["ended"][0]["covered"]
     assert doc["keys"]["wda:127.0.0.1:8100"]["last_release"]["reason"] == "anchor-gone"
+
+
+# ---- Agreement with the MCP server's devices.json owner check ------------------
+
+def test_proc_alive_agrees_with_the_servers_device_file_check(monkeypatch, tmp_path):
+    """The app will stamp devices.json with owner_uniqueid, and both the MCP
+    server and the lease CLI judge that owner. Two answers for one process
+    would let one trust a crashed app's ports while the other refuses them."""
+    import importlib
+    monkeypatch.setenv("IMIRROR_WDA", "http://127.0.0.1:8100")
+    monkeypatch.setenv("IMIRROR_DEVICES_FILE", str(tmp_path / "devices.json"))
+    monkeypatch.delenv("IMIRROR_TARGET", raising=False)
+    sys.modules.pop("imirror_mcp", None)
+    m = importlib.import_module("imirror_mcp")
+
+    me = os.getpid()
+    uniq = dl.proc_unique(me)[0]
+    zombie = subprocess.Popen(["/usr/bin/true"])
+    deadline = time.time() + 10
+    while dl.proc_info(zombie.pid) is not None and time.time() < deadline:
+        time.sleep(0.02)                    # exited, not yet reaped
+    dead = subprocess.Popen(["/usr/bin/true"])
+    dead.wait()
+    cases = [(me, None), (me, uniq), (me, uniq + 1), (zombie.pid, None), (dead.pid, None),
+             (0, None), (-1, None), (True, None), ("5", None),
+             (2 ** 31, None), (2 ** 32 + me, None), (2 ** 64, None)]
+    try:
+        for pid, u in cases:
+            assert dl.proc_alive(pid, u) == m._pid_alive(pid, u), (pid, u)
+        assert dl.proc_alive(me, uniq) and not dl.proc_alive(zombie.pid)
+        assert not dl.proc_alive(2 ** 32 + me), "a cut pid must not alias this one"
+    finally:
+        zombie.wait()

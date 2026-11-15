@@ -26,7 +26,7 @@ Runtime API for imirror_mcp.py
         h.warning                       # inspect after LOST: prefix the result
     locker.enter(...) / locker.exit(h)  # the same, without `with`
     locker.acquire(keys, mode="explicit", hold_s=0, wait=False, purpose, label)
-    await locker.acquire_async(keys, wait_s=90, run_sync=anyio.to_thread.run_sync,
+    await locker.acquire_async(keys, wait_s=85, run_sync=anyio.to_thread.run_sync,
                                sleep=anyio.sleep, ...)   # cancel-safe wait loop
     locker.release(keys, label)         # own entries and tickets only
     locker.view(keys, label)            # {key: {state, holder, queue, ...}}
@@ -216,7 +216,8 @@ def _libs() -> Tuple[Any, Any]:
 def proc_unique(pid: int) -> Optional[Tuple[int, int]]:
     """(p_uniqueid, p_puniqueid), or None. This flavor works for any uid, and
     the kernel refuses it (ESRCH) for a zombie, so a zombie reads as dead."""
-    if not isinstance(pid, int) or isinstance(pid, bool) or pid <= 0:
+    # ctypes cuts big pids to 32 bits; refuse them.
+    if not isinstance(pid, int) or isinstance(pid, bool) or not 0 < pid < 2 ** 31:
         return None
     proc, _ = _libs()
     info = _UniqInfo()
@@ -467,7 +468,7 @@ class Config:
     touch_s: float = 0.0                    # renew last_used at most this often
     ended_keep_s: float = 86400.0
     covered_cap: int = 16
-    mcp_wait_cap_s: float = 90.0            # Claude Code backgrounds at 120 s
+    mcp_wait_cap_s: float = 85.0            # Claude Code backgrounds at 120 s
     boot: Optional[str] = None
     wall_offset: float = 0.0                # wall = mono + wall_offset
 
@@ -952,7 +953,7 @@ def _eval_key(st: Dict[str, Any], key: str, req: Request, me: Caller, now: float
             return "busy", lv, top
         return "renew", "", top
 
-    # 4. A run I started holds it (mine may be suspended).
+    # 4. My own run holds it; mine may be suspended.
     if top is not None and (any(_anchor(e) == me.anchor for e in holders[:-1])
                             or me.anchor in _ancestors(top)):
         return "busy", "descendant", top
@@ -2134,7 +2135,7 @@ class Locker:
                             sleep: Optional[Callable[[float], Any]] = None,
                             poll_s: float = 0.5) -> Outcome:
         """The MCP wait: each attempt runs in a worker thread, with an async
-        sleep between, so a cancel lands between attempts. Capped at 90 s for
+        sleep between, so a cancel lands between attempts. Capped at 85 s for
         MCP clients (Claude Code backgrounds a call at 120 s). If cancelled,
         the ticket is withdrawn and any late grant released."""
         if run_sync is None or sleep is None:
