@@ -1232,7 +1232,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSToolbarDelegate {
         stack.addArrangedSubview(tunnelButton)
 
         // Where "Type passcode now" reads each phone's passcode.
-        stack.addArrangedSubview(smallLabel("Passcode file (IMIRROR_PASSCODE_<UDID>, read only on a click):"))
+        stack.addArrangedSubview(smallLabel("Passcode file (e.g. PHONE2_PASSCODE=…, read only on a click):"))
         let fileField = NSTextField(string: UserDefaults.standard.string(forKey: PasscodeFile.defaultsKey) ?? "")
         fileField.placeholderString = PasscodeFile.defaultPath
         fileField.font = .systemFont(ofSize: 11)

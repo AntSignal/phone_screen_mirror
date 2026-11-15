@@ -452,8 +452,11 @@ Code: `Sources/iMirrorCore/DongleProtocol.swift`.
 click reads that phone's passcode from the passcode file (the field under the
 phone list; default `~/Documents/Github/Purpose/Purpose-iOS/Testing/.env.local`,
 stored as `defaults` key `imirror.passcodeFile`). The file is dotenv style
-(`KEY=VALUE`, optional `export`, quotes, `#` comments). The key is
-`IMIRROR_PASSCODE_<UDID without dashes, upper case>`; failing that,
+(`KEY=VALUE`, optional `export`, quotes, `#` comments). The key is the
+phone's alias in capitals plus `_PASSCODE`, such as `PHONE2_PASSCODE=...`
+(a `-` in the alias becomes `_`). An alias belongs to one phone at a time, so
+the key cannot reach another phone. Failing that, it tries
+`IMIRROR_PASSCODE_<UDID without dashes, upper case>`, then
 `ANTSIGNAL_TEST_DEVICE_PASSCODE`, but only when the file's
 `ANTSIGNAL_DEVICE_UDID` is this phone. iMirror then presses Shift to wake the
 phone, waits 600 ms, types the passcode to that phone only (Return

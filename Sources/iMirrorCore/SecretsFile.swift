@@ -117,10 +117,24 @@ public enum PasscodeLookup {
         "IMIRROR_PASSCODE_" + udid.replacingOccurrences(of: "-", with: "").uppercased()
     }
 
-    /// This phone's own key first. The shared Ant Signal key only counts when
+    /// The short key people write: phone2 -> PHONE2_PASSCODE. Safe because
+    /// an alias belongs to one UDID at a time (validateAlias).
+    public static func key(alias: String) -> String? {
+        let name = alias.uppercased().replacingOccurrences(of: "-", with: "_")
+        guard name.range(of: "^[A-Z][A-Z0-9_]*$", options: .regularExpression) != nil else { return nil }
+        return name + "_PASSCODE"
+    }
+
+    /// The key to tell people to add.
+    public static func suggestedKey(udid: String, alias: String?) -> String {
+        alias.flatMap { key(alias: $0) } ?? key(udid: udid)
+    }
+
+    /// This phone's alias key (PHONE2_PASSCODE), then its UDID key. The shared Ant Signal key only counts when
     /// the file says it belongs to this phone, so it is never typed into
     /// another phone (a wrong passcode there is a wrong attempt).
-    public static func value(udid: String, in text: [UInt8]) -> SecretBytes? {
+    public static func value(udid: String, alias: String? = nil, in text: [UInt8]) -> SecretBytes? {
+        if let k = alias.flatMap({ key(alias: $0) }), let v = SecretsFile.value(forKey: k, in: text) { return v }
         if let v = SecretsFile.value(forKey: key(udid: udid), in: text) { return v }
         guard let owner = SecretsFile.value(forKey: fallbackUDIDKey, in: text) else { return nil }
         let ownerUDID = String(decoding: owner.bytes, as: UTF8.self)
@@ -130,12 +144,12 @@ public enum PasscodeLookup {
 
     /// Reads `file` and returns the passcode for `udid`. The file's bytes are
     /// zeroed before returning.
-    public static func load(udid: String, file: URL) -> Result {
+    public static func load(udid: String, alias: String? = nil, file: URL) -> Result {
         guard var data = try? Data(contentsOf: file) else { return .noFile }
         var text = [UInt8](data)
         data.resetBytes(in: 0..<data.count)
         defer { SecretsFile.zero(&text) }
-        return value(udid: udid, in: text).map(Result.found) ?? .noPasscode
+        return value(udid: udid, alias: alias, in: text).map(Result.found) ?? .noPasscode
     }
 }
 
