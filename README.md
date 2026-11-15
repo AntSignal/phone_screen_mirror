@@ -376,7 +376,16 @@ scripts/imirror-ctl status                 # every phone: state, reason, since, 
 scripts/imirror-ctl status phone2 -n 20    # one phone, with its last 20 events
 scripts/imirror-ctl restart phone2         # exit 0 accepted, 3 cooldown, 4 timeout
 scripts/imirror-ctl events --device phone2 --since 1h
+scripts/imirror-ctl keyboard pair phone2           # waits up to 130 s: paired, ambiguous, timeout
+scripts/imirror-ctl keyboard test phone2 "hello 123"
+scripts/imirror-ctl keyboard status phone2         # the tie and the last keyboard events
+scripts/imirror-ctl keyboard forget phone2
 ```
+
+`keyboard` exits 0 on `paired`, `typed_test` or `forgotten`, 1 on anything
+else the app answered, and 4 when it got no answer. `test`, `forget` and
+`status` also take a UDID from `keyboard-pairs.json` for a phone no longer on
+USB.
 
 ### Sleep and wake
 
