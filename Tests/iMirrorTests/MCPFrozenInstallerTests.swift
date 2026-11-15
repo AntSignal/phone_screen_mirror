@@ -201,6 +201,39 @@ final class MCPFrozenInstallerTests: XCTestCase {
         XCTAssertFalse(fm.fileExists(atPath: layout.leaseLauncher.path))
     }
 
+    /// The real devicelease.py, not a stand-in: it passes the smoke test, and
+    /// the launcher Install writes takes and frees a lease with it. Leases go
+    /// to a temp dir, never the live one other sessions use.
+    func testTheRealLeaseModuleInstallsAndItsLauncherTakesALease() throws {
+        let repo = URL(fileURLWithPath: #filePath)   // Tests/iMirrorTests/<this file>
+            .deletingLastPathComponent().deletingLastPathComponent().deletingLastPathComponent()
+        let real = repo.appendingPathComponent("mcp-server/devicelease.py")
+        try fm.copyItem(at: real, to: src.appendingPathComponent("devicelease.py"))
+        let outcome = installer().install(from: src)
+        XCTAssertTrue(outcome.ok, outcome.message)
+
+        let leases = tmp.appendingPathComponent("leases").path
+        let key = "device:00008140-0006423002D3401C"
+        let me = String(ProcessInfo.processInfo.processIdentifier)   // in the CLI's chain
+        func lease(_ args: [String]) -> (code: Int32, out: String) {
+            ProcessRunner.spawn("/usr/bin/env", ["IMIRROR_LEASE_TESTING=1", "IMIRROR_LEASE_DIR=\(leases)",
+                                                 layout.leaseLauncher.path] + args + ["--json"],
+                                timeout: 30)
+        }
+        let version = lease(["--version"])
+        XCTAssertEqual(version.code, 0, version.out)
+        XCTAssertEqual(MCPFrozenInstall.leaseProtocol(fromVersionOutput: version.out), 1)
+
+        let held = lease(["acquire", key, "--anchor-pid", me])
+        XCTAssertEqual(held.code, 0, held.out)
+        XCTAssertTrue(held.out.contains("\"status\": \"held\""), held.out)
+        let status = lease(["status", key])
+        XCTAssertTrue(status.out.contains("\"state\": \"covered\""), status.out)
+        let released = lease(["release", key, "--anchor-pid", me])
+        XCTAssertEqual(released.code, 0, released.out)
+        XCTAssertTrue(fm.fileExists(atPath: leases + "/state.json"), "it used the temp dir")
+    }
+
     // MARK: pip
 
     func testPipRunsOnlyWhenRequirementsChange() throws {

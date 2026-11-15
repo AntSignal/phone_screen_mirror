@@ -128,6 +128,30 @@ A server exits as soon as its client is gone: when its stdin closes, or when
 its parent process changes (it was orphaned). It does not wait for a tool
 call still blocked on WDA.
 
+## Device leases: `imirror-lease`
+
+`devicelease.py` records which agent may drive each phone (`device:<UDID>`)
+or Simulator (`sim:<UDID>`), so agents can wait in line for a device instead of
+trampling each other's WDA session. A hold belongs to a process and covers its
+children: `--anchor-pid`, else the nearest `claude` process, else the terminal
+tab's shell. It ends on release, after it sits idle, when its time is up, or
+when that process exits. State lives in
+`~/Library/Application Support/iMirror/leases/`.
+
+The app's MCP Install writes the CLI launcher
+`~/Library/Application Support/iMirror/bin/imirror-lease`:
+
+```bash
+imirror-lease whoami                       # which process my holds belong to
+imirror-lease status                       # every device: holder, queue
+imirror-lease acquire device:<UDID> --wait-s 600 --anchor-pid $$
+imirror-lease release device:<UDID> --anchor-pid $$
+```
+
+Exit codes: 0 ok, 2 usage, 3 busy, 4 deadlock, 5 not held or lost, 6 the lease
+system itself failed. Leases are cooperative, and **this server does not check
+them yet**: until its tools do, a lease only orders the callers that ask.
+
 ## When a phone's WDA restarts
 
 The iMirror app restarts a phone's chain by itself after a USB reset or a
@@ -299,6 +323,11 @@ or hand the phone's session to another client:
 mcp-server/.venv/bin/pip install pytest
 mcp-server/.venv/bin/python -m pytest mcp-server
 ```
+
+`conftest.py` gives every test its own lease directory, so no test touches the
+leases live sessions use. `test_devicelease.py` covers the pure rules;
+`test_devicelease_store.py` runs the CLI and the store against real child
+processes, also under the Mac's own `/usr/bin/python3` (3.9).
 
 ## Security
 
