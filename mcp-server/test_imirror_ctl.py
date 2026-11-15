@@ -299,8 +299,29 @@ def test_keyboard_status_prints_the_tie_and_keyboard_events_only(app_dir, capsys
     ]) + "\n")
     assert ctl.main(["keyboard", "status", "phone1"]) == 0
     out = capsys.readouterr().out
-    assert "paired with central 4F2C0D3A" in out
+    assert "paired via this Mac, central 4F2C0D3A" in out
     assert "typed_test chars=5" in out and "wake" not in out
+
+
+def test_keyboard_status_shows_the_dongle_transport_and_peer(app_dir, capsys):
+    (app_dir / "keyboard-pairs.json").write_text(json.dumps(
+        {PHONE_16E: {"transport": "dongle", "slot": "00008101aaaa", "peer": "4a:3b:2c:1d:0e:ff",
+                     "paired_at": "2026-11-15T09:00:00.000Z"}}))
+    (app_dir / "events.jsonl").write_text(
+        ev("2026-11-15T09:00:00.000Z", PHONE_16E, "keyboard", detail="paired", transport="dongle") + "\n")
+    assert ctl.main(["keyboard", "status", "phone1"]) == 0
+    out = capsys.readouterr().out
+    assert "paired via dongle, slot 00008101aaaa, peer 4a:3b:2c:1d:0e:ff" in out
+    assert "detail=paired transport=dongle" in out
+    assert ctl.main(["status", "phone1"]) == 0
+    assert "keyboard      paired via dongle" in capsys.readouterr().out
+    assert ctl.main(["status", "phone1", "--json"]) == 0
+    assert json.loads(capsys.readouterr().out)["keyboard"]["peer"] == "4a:3b:2c:1d:0e:ff"
+
+
+def test_describe_keyboard_hints_for_the_dongle():
+    assert "plug it in" in ctl.describe_keyboard("phone1", {"detail": "failed", "reason": "dongle_unavailable",
+                                                            "transport": "dongle"})
 
 
 def test_keyboard_status_of_an_unpaired_phone(app_dir, capsys):

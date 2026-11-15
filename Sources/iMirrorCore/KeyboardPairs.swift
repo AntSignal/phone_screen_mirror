@@ -1,18 +1,40 @@
 import Foundation
 
-// KeyboardPairs — which phone is which Bluetooth central. iMirror's keyboard
-// must type into one phone only, and CoreBluetooth names a phone by a central
-// UUID, not by its UDID. This map ties them together, and the pairing rule
-// decides when a new link may be trusted. The file is
+// KeyboardPairs — which phone is which keyboard link. iMirror's keyboard
+// must type into one phone only, and neither link names a phone by its
+// UDID: CoreBluetooth gives a central UUID, the USB dongle a slot and the
+// phone's Bluetooth identity address. This map ties them together, and the
+// pairing rule decides when a new link may be trusted. The file is
 // ~/Library/Application Support/iMirror/keyboard-pairs.json:
-//   {"<udid>": {"central": "<UUID>", "paired_at": "<ISO-8601>"}}
+//   {"<udid>": {"transport": "corebluetooth", "central": "<UUID>", "paired_at": "<ISO-8601>"}}
+//   {"<udid>": {"transport": "dongle", "slot": "<slot>", "peer": "<addr>", "paired_at": "<ISO-8601>"}}
+// An entry with no "transport" is from before the dongle: CoreBluetooth.
+
+/// Which keyboard a phone is paired with. The raw values are the file's.
+public enum KeyboardTransportKind: String, Sendable, CaseIterable {
+    /// The ESP32-S3 on USB (DongleProtocol.swift).
+    case dongle
+    /// This Mac as a CoreBluetooth peripheral (BLEKeyboard.swift).
+    case corebluetooth
+}
 
 public struct KeyboardPair: Equatable, Sendable {
-    /// CoreBluetooth's central identifier, upper-case UUID string.
-    public var central: String
+    public var transport: KeyboardTransportKind
+    /// CoreBluetooth only: the central identifier, upper-case UUID string.
+    public var central: String?
+    /// Dongle only: the dongle's slot for this phone.
+    public var slot: String?
+    /// Dongle only: the phone's identity address, lower-case.
+    public var peer: String?
     public var pairedAt: Date
 
-    public init(central: String, pairedAt: Date) { self.central = central; self.pairedAt = pairedAt }
+    public init(central: String, pairedAt: Date) {
+        transport = .corebluetooth; self.central = central; self.pairedAt = pairedAt
+    }
+
+    public init(slot: String, peer: String, pairedAt: Date) {
+        transport = .dongle; self.slot = slot; self.peer = peer; self.pairedAt = pairedAt
+    }
 }
 
 public struct KeyboardPairs: Equatable, Sendable {
@@ -27,10 +49,18 @@ public struct KeyboardPairs: Equatable, Sendable {
         guard let data, let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else { return out }
         for (udid, raw) in obj {
             guard let entry = raw as? [String: Any],
-                  let central = entry["central"] as? String,
                   let rawAt = entry["paired_at"] as? String,
                   let at = ExpectedReset.parseISO(rawAt) else { continue }
-            out.record(udid: udid, central: central, at: at)
+            switch (entry["transport"] as? String).map(KeyboardTransportKind.init(rawValue:)) {
+            case nil, .some(.corebluetooth?):
+                guard let central = entry["central"] as? String else { continue }
+                out.record(udid: udid, central: central, at: at)
+            case .some(.dongle?):
+                guard let slot = entry["slot"] as? String, let peer = entry["peer"] as? String else { continue }
+                out.record(udid: udid, slot: slot, peer: peer, at: at)
+            case .some(nil):
+                continue   // a transport this build does not know
+            }
         }
         return out
     }
@@ -39,12 +69,19 @@ public struct KeyboardPairs: Equatable, Sendable {
     public func encode() -> Data {
         var obj: [String: [String: String]] = [:]
         for (udid, p) in byUDID {
-            obj[udid] = ["central": p.central, "paired_at": DeviceEventCodec.timestamp(p.pairedAt)]
+            var e = ["transport": p.transport.rawValue, "paired_at": DeviceEventCodec.timestamp(p.pairedAt)]
+            e["central"] = p.central
+            e["slot"] = p.slot
+            e["peer"] = p.peer
+            obj[udid] = e
         }
         let data = try? JSONSerialization.data(withJSONObject: obj, options: [.sortedKeys, .prettyPrinted])
         return data ?? Data("{}".utf8)
     }
 
+    public func pair(for udid: String) -> KeyboardPair? { byUDID[udid] }
+
+    /// The CoreBluetooth central for `udid`; nil for a dongle pairing.
     public func central(for udid: String) -> String? { byUDID[udid]?.central }
 
     public func udid(forCentral central: String) -> String? {
@@ -60,6 +97,17 @@ public struct KeyboardPairs: Equatable, Sendable {
         guard ExpectedReset.fileName(udid: udid) != nil, let c = Self.normalized(central) else { return false }
         for (other, p) in byUDID where p.central == c { byUDID[other] = nil }
         byUDID[udid] = KeyboardPair(central: c, pairedAt: at)
+        return true
+    }
+
+    /// Ties a dongle slot and peer to `udid`. Like a central, a slot or a
+    /// peer belongs to one phone only. False for a bad UDID, slot or address.
+    @discardableResult
+    public mutating func record(udid: String, slot: String, peer: String, at: Date) -> Bool {
+        guard ExpectedReset.fileName(udid: udid) != nil, DongleProtocol.isValidSlot(slot),
+              let addr = DongleProtocol.address(peer) else { return false }
+        for (other, p) in byUDID where p.slot == slot || p.peer == addr { byUDID[other] = nil }
+        byUDID[udid] = KeyboardPair(slot: slot, peer: addr, pairedAt: at)
         return true
     }
 

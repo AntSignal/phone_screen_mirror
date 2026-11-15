@@ -50,6 +50,10 @@ public enum KeyboardFailure: String, Sendable {
     case noPasscode = "no_passcode"
     /// Click-to-type: a character in the passcode has no key.
     case untypeable
+    /// The phone is paired with the dongle, and no dongle answers on USB.
+    case dongleUnavailable = "dongle_unavailable"
+    /// The dongle gave no answer in time, or one iMirror cannot read.
+    case dongleError = "dongle_error"
 }
 
 public enum KeyboardRequestFile {
@@ -151,8 +155,9 @@ public enum KeyboardEventDetail: String, Sendable, CaseIterable {
 extension DeviceEvent {
     /// One keyboard event. `chars` is a count only; text never goes in.
     public static func keyboard(at date: Date, udid: String, alias: String, _ detail: KeyboardEventDetail,
-                                reason: KeyboardFailure? = nil, chars: Int? = nil) -> DeviceEvent {
+                                reason: KeyboardFailure? = nil, chars: Int? = nil,
+                                transport: KeyboardTransportKind? = nil) -> DeviceEvent {
         DeviceEvent(at: date, udid: udid, alias: alias, event: .keyboard, reason: reason?.rawValue,
-                    detail: detail.rawValue, chars: chars)
+                    detail: detail.rawValue, chars: chars, transport: transport?.rawValue)
     }
 }
