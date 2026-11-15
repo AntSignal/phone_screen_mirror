@@ -209,7 +209,11 @@ Each device tool has an access class:
   Subagents of one session share one MCP server, so the name is the only
   thing that tells them apart: two names in one session are two holders, and
   once a named agent holds a device, an unnamed call from that session is
-  refused too.
+  refused too. A named agent does not share an unnamed hold from its own
+  session either (the parent's tap): it gets `DEVICE_BUSY` until that hold
+  has been idle 30 s, then the hold passes to that one agent. An unnamed
+  hold taken by antsignalctl (`imirror-lease`) is still shared, because it
+  cannot carry a name.
 - **A hold can end mid-call** (it lapsed, the user freed the device, or a run
   you started took it). The server re-checks before every WDA request,
   devicectl/simctl run and `ios_run_sequence` step, and stops with

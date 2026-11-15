@@ -159,6 +159,26 @@ def test_two_agents_in_one_session_are_two_holders(reg, wda):
     assert wda.aliases_for("/actions") == ["phone1", "phone1"]
 
 
+def test_named_subagents_never_both_drive_the_parents_phone(reg, wda):
+    """The parent taps unnamed, then two named subagents start. Neither may
+    drive while the parent's hold is fresh; once it is idle, exactly one
+    takes it."""
+    m = reg.m
+    m.ios_tap(1, 2, device="phone1")
+    for name in ("a", "b"):
+        with pytest.raises(m.MCPToolError) as e:
+            m.ios_tap(1, 2, device="phone1", agent=name)
+        assert e.value.error_code == "DEVICE_BUSY" and "no agent name" in str(e.value)
+        assert "ios_reserve_device(device='phone1'" in str(e.value)
+    write_state(lambda st, now: (st["keys"][K16E]["holders"][-1].update(
+        last_used_mono=now - 31), st)[1])
+    m.ios_tap(1, 2, device="phone1", agent="a")
+    with pytest.raises(m.MCPToolError) as e:
+        m.ios_tap(1, 2, device="phone1", agent="b")
+    assert 'subagent "a"' in str(e.value)
+    assert wda.aliases_for("/actions") == ["phone1", "phone1"]
+
+
 def test_an_inspect_call_after_its_hold_was_lost_runs_once_with_a_warning(reg, wda, sleeper):
     m = reg.m
     m.ios_tap(1, 2, device="phone1")
