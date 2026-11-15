@@ -1393,12 +1393,25 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSToolbarDelegate {
         for (udid, why) in manager.problems.sorted(by: { $0.key < $1.key }) {
             devicesStack.addArrangedSubview(smallLabel("\(shortUDID(udid)): not started — \(why)."))
         }
+        devicesStack.addArrangedSubview(smallLabel(dongleLine()))
+    }
+
+    /// Whether the USB keyboard dongle answers. Without it, pairing falls
+    /// back to this Mac's Bluetooth, which phones on its iCloud hide.
+    private func dongleLine() -> String {
+        MainActor.assumeIsolated {
+            switch keyboardControl.dongle.state {
+            case .connected: return "Keyboard: dongle connected"
+            case .notFound: return "Keyboard: dongle not found"
+            case .unknown: return "Keyboard: looking for the dongle…"
+            }
+        }
     }
 
     /// "Keyboard: paired" and the passcode button, for a paired phone only.
     private func keyboardRow(_ udid: String) -> NSView? {
         MainActor.assumeIsolated {
-            guard keyboardControl.pairs().central(for: udid) != nil else { return nil }
+            guard let pair = keyboardControl.pairs().pair(for: udid) else { return nil }
             let type = NSButton(title: "Type passcode now", target: self, action: #selector(typePasscodeClicked(_:)))
             type.bezelStyle = .rounded
             type.controlSize = .small
@@ -1406,7 +1419,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSToolbarDelegate {
             type.isEnabled = !keyboardControl.busy
             type.toolTip = "Wakes the phone and types its passcode over the paired Bluetooth keyboard. "
                 + "Use only while the phone shows a passcode prompt: otherwise the keys go to the focused field."
-            let row = NSStackView(views: [smallLabel("Keyboard: paired"), type])
+            let via = pair.transport == .dongle ? "dongle" : "this Mac"
+            let row = NSStackView(views: [smallLabel("Keyboard: paired (\(via))"), type])
             row.orientation = .horizontal
             row.spacing = 6
             return row

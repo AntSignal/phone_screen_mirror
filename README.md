@@ -369,11 +369,16 @@ Bluetooth keyboard for one phone: `{"udid", "requested_at", "requested_by",
 "action": "pair"|"forget"|"test", "text"}`. Write it like a restart request.
 - `pair` opens a 120 s pairing window: iMirror advertises as "iMirror Keyboard",
   and the one phone that connects while it is open is tied to this UDID. The
-  phone must be attached by USB.
-- `test` types `text` into that phone only: 1–32 of `a-z`, `0-9` and space,
+  phone must be attached by USB. When the keyboard dongle (below) answers
+  `HELLO`, it does the advertising; otherwise this Mac does, over
+  CoreBluetooth. A phone signed in to this Mac's iCloud account never lists
+  the Mac's own keyboard (iOS shows it as "my Mac"), so those phones need the
+  dongle.
+- `test` types `text` into that phone only, over the transport it was paired with: 1–32 of `a-z`, `0-9` and space,
   with at least one letter and at most three digits, so it can never be a
   passcode attempt. `text` is refused on any other action.
-- `forget` removes the tie.
+- `forget` removes the tie at once, and the dongle's bond for it when the
+  dongle answers.
 
 Any other action, or any other key in the file, is refused (event `keyboard`,
 `detail` `failed`). No request can type a passcode; only a click in Settings
@@ -387,6 +392,11 @@ on-screen keyboard back.
 "<phone's Bluetooth identity address>", "paired_at": ISO-8601}`. An entry with
 no `transport` was written before the dongle and is `corebluetooth`. Accept
 transports you don't know.
+
+Settings → iPhones ends with "Keyboard: dongle connected" or "Keyboard:
+dongle not found". iMirror checks USB every 5 s and says `HELLO` only when an
+Espressif port (vendor `0x303A`) comes or goes. It opens the port for each
+job and closes it after, so the firmware can be flashed between jobs.
 
 **Keyboard dongle serial protocol, v1.** An ESP32-S3 on the Mac's USB acting
 as a BLE keyboard with its own Bluetooth address (a phone on the Mac's iCloud
@@ -433,7 +443,7 @@ stored as `defaults` key `imirror.passcodeFile`). The file is dotenv style
 `IMIRROR_PASSCODE_<UDID without dashes, upper case>`; failing that,
 `ANTSIGNAL_TEST_DEVICE_PASSCODE`, but only when the file's
 `ANTSIGNAL_DEVICE_UDID` is this phone. iMirror then presses Shift to wake the
-phone, waits 600 ms, types the passcode to that phone's central only (Return
+phone, waits 600 ms, types the passcode to that phone only (Return
 too, unless it is a 4- or 6-digit code), zeroes its copy and logs `keyboard`
 `typed_passcode` with `chars`. Nothing but that click starts it; a test
 (`PasscodeCallSiteTests`) fails if any other code calls it. A file under
@@ -460,7 +470,7 @@ scripts/imirror-ctl restart phone2         # exit 0 accepted, 3 cooldown, 4 time
 scripts/imirror-ctl events --device phone2 --since 1h
 scripts/imirror-ctl keyboard pair phone2           # waits up to 130 s: paired, ambiguous, timeout
 scripts/imirror-ctl keyboard test phone2 "hello 123"
-scripts/imirror-ctl keyboard status phone2         # the tie and the last keyboard events
+scripts/imirror-ctl keyboard status phone2         # transport, slot/peer or central, last keyboard events
 scripts/imirror-ctl keyboard forget phone2
 ```
 
