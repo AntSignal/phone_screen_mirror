@@ -315,8 +315,18 @@ with a different uniqueid knows the file is stale), `app_version`, `updated_at`,
 `usb_reset_ignored` (its own start/stop did it, or WDA was not up), `request`,
 `wake`, `sleep`, `passcode`, `runner_upgrade` (the phone's WebDriverAgent
 runner is older than the bundled one and is reinstalled; `from`/`to` are
-versions; the new runner may raise the passcode sheet once). The same lines go to the unified log, subsystem
+versions; the new runner may raise the passcode sheet once), `keyboard` (see
+below). The same lines go to the unified log, subsystem
 `com.local.imirror`, category `events`, in the clear.
+
+A `keyboard` event is about iMirror's Bluetooth keyboard. `detail` is one of
+`paired`, `ambiguous` (more than one new Bluetooth central subscribed, so none
+was trusted), `timeout` (the 120 s pairing window closed with no new phone),
+`connected`, `disconnected`, `typed_test`, `typed_passcode`, `failed` or
+`forgotten`. A typing line has `chars`: how many characters were typed, never
+what they were. A `failed` line has a `reason`: `bad_request`,
+`unknown_action`, `bad_text`, `stale`, `not_attached`, `not_paired`, `busy`,
+`bluetooth_unavailable`, `setup_failed`, `not_connected` or `send_failed`.
 
 **`expected-resets/<udid>.json`** — written by a client, not the app. Before
 `devicectl device install|launch`, write `{"until": <now + 90 s, ISO-8601>,
@@ -334,6 +344,27 @@ request for this phone was honoured in the last 60 s, so nothing happens),
 like Settings → Restart: this phone's chain only, never the shared tunnel. It
 never types a passcode. While the phone shows `needs_passcode`, don't send one:
 a new runner raises the sheet again.
+
+**`requests/keyboard-<udid>.json`** — written by a client to drive iMirror's
+Bluetooth keyboard for one phone: `{"udid", "requested_at", "requested_by",
+"action": "pair"|"forget"|"test", "text"}`. Write it like a restart request.
+- `pair` opens a 120 s pairing window: iMirror advertises as "iMirror Keyboard",
+  and the one phone that connects while it is open is tied to this UDID. The
+  phone must be attached by USB.
+- `test` types `text` into that phone only: 1–32 of `a-z`, `0-9` and space,
+  with at least one letter. `text` is refused on any other action.
+- `forget` removes the tie.
+
+Any other action, or any other key in the file, is refused (event `keyboard`,
+`detail` `failed`). No request can type a passcode. After each run iMirror
+stops advertising and drops its Bluetooth services, so the phone gets its
+on-screen keyboard back.
+
+**`keyboard-pairs.json`** — written by the app, mode 0600: `{"<udid>":
+{"central": "<CoreBluetooth central UUID>", "paired_at": ISO-8601}}`.
+
+The first pair or type asks for Bluetooth access (System Settings › Privacy &
+Security › Bluetooth). An ad hoc signed build may ask again after each rebuild.
 
 **`scripts/imirror-ctl`** reads and writes these files (system `python3`, no
 dependencies). `device` is an alias, a UDID, or a unique UDID prefix/suffix of

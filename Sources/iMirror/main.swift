@@ -290,6 +290,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSToolbarDelegate {
     // it's on screen, so an agent driving phone2 doesn't depend on this window.
     // The window renders the selected phone; `wda`/`health` below are its.
     private let manager = ChainManager()
+    /// The Bluetooth keyboard: request files and Settings drive it.
+    /// AppKit calls this class on the main thread only, hence assumeIsolated.
+    private lazy var keyboardControl: KeyboardControl = MainActor.assumeIsolated {
+        KeyboardControl(dir: EventLog.shared.url.deletingLastPathComponent())
+    }
     private var selectedUDID: String? = UserDefaults.standard.string(forKey: "imirror.selectedDevice")
     private var selected: DeviceController? { manager.controller(selectedUDID) }
     private var wda: WDAClient? { selected?.wda }
@@ -313,6 +318,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSToolbarDelegate {
         // The phones' controllers report here; only the selected phone drives
         // the window, but any phone's change refreshes the picker and Settings.
         manager.onDevicesChanged = { [weak self] in self?.devicesChanged() }
+        MainActor.assumeIsolated {
+            keyboardControl.aliasOf = { [weak self] udid in self?.manager.controller(udid)?.alias }
+            keyboardControl.onChange = { [weak self] in self?.rebuildDeviceRows() }
+        }
+        manager.onKeyboardRequest = { [weak self] r in
+            MainActor.assumeIsolated { self?.keyboardControl.handle(r) }
+        }
         manager.onControllerChange = { [weak self] c in
             guard let self else { return }
             self.refreshDevicePicker()

@@ -1,6 +1,7 @@
-// RestartRequestWatcher — picks up requests/restart-<udid>.json files and
-// hands each to ChainManager. Parsing and the cooldown live in
-// iMirrorCore/RestartRequests.swift; this file only watches, reads and deletes.
+// RestartRequestWatcher — picks up requests/restart-<udid>.json and
+// requests/keyboard-<udid>.json files and hands each to ChainManager. Parsing
+// and the rules live in iMirrorCore (RestartRequests.swift,
+// KeyboardRequests.swift); this file only watches, reads and deletes.
 //
 // A DispatchSource on the folder hears new files at once. A 5 s scan backs it
 // up: the source goes deaf if someone deletes and recreates the folder.
@@ -14,6 +15,8 @@ final class RestartRequestWatcher {
     let dir: URL
     /// Each readable request, once; its file is already gone.
     var onRequest: ((RestartRequest) -> Void)?
+    /// Each keyboard request, or refusal, once; its file is already gone.
+    var onKeyboard: ((KeyboardRequestFile.Read) -> Void)?
 
     private var source: DispatchSourceFileSystemObject?
     private var timer: Timer?
@@ -55,19 +58,39 @@ final class RestartRequestWatcher {
         guard let names = try? fm.contentsOfDirectory(atPath: dir.path) else { return }
         for name in names.sorted() {
             let url = dir.appendingPathComponent(name)
+            if KeyboardRequestFile.udid(fromFileName: name) != nil {
+                scanKeyboard(name, url, now: now)
+                continue
+            }
             switch RestartRequestFile.read(fileName: name, data: try? Data(contentsOf: url)) {
             case .notOurs:
                 continue
             case .unreadable:
-                let mtime = (try? fm.attributesOfItem(atPath: url.path)[.modificationDate] as? Date) ?? .distantPast
-                if now.timeIntervalSince(mtime) > RestartRequestFile.unreadableGraceSec {
-                    try? fm.removeItem(at: url)
-                }
+                removeIfOld(url, now: now)
             case .request(let r):
                 // Delete first: a request is acted on once, whatever follows.
                 try? fm.removeItem(at: url)
                 onRequest?(r)
             }
+        }
+    }
+
+    private func scanKeyboard(_ name: String, _ url: URL, now: Date) {
+        let read = KeyboardRequestFile.read(fileName: name, data: try? Data(contentsOf: url))
+        switch read {
+        case .notOurs: return
+        case .unreadable: removeIfOld(url, now: now)
+        case .request, .refused:
+            try? FileManager.default.removeItem(at: url)
+            onKeyboard?(read)
+        }
+    }
+
+    private func removeIfOld(_ url: URL, now: Date) {
+        let fm = FileManager.default
+        let mtime = (try? fm.attributesOfItem(atPath: url.path)[.modificationDate] as? Date) ?? .distantPast
+        if now.timeIntervalSince(mtime) > RestartRequestFile.unreadableGraceSec {
+            try? fm.removeItem(at: url)
         }
     }
 }
