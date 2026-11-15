@@ -496,13 +496,13 @@ def test_a_second_wait_joins_the_same_ticket(s, procs):
     s.now += 20
     b = s.do(procs.b_mcp, "acquire", [P1], wait=True)
     assert a.ticket == b.ticket and len(s.state["tickets"]) == 1
-    assert s.state["tickets"][0]["seen_mono"] == s.now, "refreshed after 15 s"
+    assert s.state["tickets"][0]["seen_mono"] == s.now, "refreshed after 5 s"
 
 
-def test_seen_is_refreshed_at_most_every_15_s(s, procs):
+def test_seen_is_refreshed_at_most_every_5_s(s, procs):
     s.ensure(procs.s_mcp, P1)
     s.do(procs.b_mcp, "acquire", [P1], wait=True)
-    s.now += 5
+    s.now += 4
     out = s.do(procs.b_mcp, "acquire", [P1], wait=True)
     assert not out.changed, "a waiter's poll costs no write"
 
@@ -525,10 +525,11 @@ def test_grant_to_an_absent_waiter_has_10_s_and_then_the_next_ticket_goes(s, pro
     s.do(procs.b_mcp, "acquire", [P1], wait=True)
     s.now += 1
     s.do(procs.c_mcp, "acquire", [P1], wait=True)
-    s.now += 60                                      # nobody refreshes for 60 s
+    s.now += 31                                      # nobody refreshes for 31 s
     s.do(procs.s_mcp, "release", [P1])
     assert s.top(P1)["anchor"]["pid"] == procs.B.pid
     assert s.top(P1)["claim_until_mono"] == s.now + 10
+    s.do(procs.c_mcp, "acquire", [P1], wait=True)   # C is still in line
     s.now += 11
     s.norm()
     assert s.top(P1)["anchor"]["pid"] == procs.C.pid, "B's grant lapsed; C is next"
@@ -538,7 +539,10 @@ def test_grant_to_an_absent_waiter_has_10_s_and_then_the_next_ticket_goes(s, pro
 def test_tickets_expire_when_not_seen(s, procs):
     s.ensure(procs.s_mcp, P1)
     s.do(procs.b_mcp, "acquire", [P1], wait=True)
-    s.now += 181
+    s.now += 35
+    s.ensure(procs.s_mcp, P1)
+    assert s.state["tickets"], "a re-call within 30 s, plus 5 s of slack, keeps it"
+    s.now += 1
     s.ensure(procs.s_mcp, P1)
     assert not s.state["tickets"]
 

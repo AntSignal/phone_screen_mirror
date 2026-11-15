@@ -460,8 +460,8 @@ class Config:
     claim_live_s: float = 90.0              # grant to a waiter seen recently
     claim_absent_s: float = 10.0            # grant to a waiter not seen lately
     claim_seen_s: float = 30.0
-    ticket_s: float = 180.0                 # a ticket nobody refreshes dies
-    seen_refresh_s: float = 15.0
+    ticket_s: float = 35.0                  # re-call within 30 s to stay queued
+    seen_refresh_s: float = 5.0             # so a ticket is never 5 s+ stale
     autowait_s: float = 20.0                # auto calls wait only this long
     tombstone_s: float = 600.0              # after a break by the user
     push_depth: int = 4
@@ -1969,11 +1969,13 @@ class Locker:
                 return out
             sleep(0.5)
 
-    def enter(self, key: str, label: str = "", purpose: str = "", access: str = "drive") -> Hold:
+    def enter(self, key: str, label: str = "", purpose: str = "", access: str = "drive",
+              autowait: bool = True) -> Hold:
         """Before a tool call. observe: never checked (a holder's observe call
         renews, best effort). inspect: BUSY if someone else holds; runs free
         on a free device; after LOST it runs with a warning. drive: needs the
-        hold, taken automatically if free. Raises LeaseError or StateError."""
+        hold, taken automatically if free. autowait=False answers BUSY at once
+        (the MCP server's rule). Raises LeaseError or StateError."""
         key = normalize_key(key)
         label = norm_label(label)
         if not self.enabled:
@@ -1997,7 +1999,7 @@ class Locker:
             if out.status not in ("held", "covered"):
                 raise LeaseError(out)
         else:
-            out = self.ensure((key,), label=label, purpose=purpose)
+            out = self.ensure((key,), label=label, purpose=purpose, autowait=autowait)
             if out.status not in ("held", "covered"):
                 raise LeaseError(out)
         with self._mutex:
