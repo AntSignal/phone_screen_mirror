@@ -380,6 +380,12 @@ too, unless it is a 4- or 6-digit code), zeroes its copy and logs `keyboard`
 (`PasscodeCallSiteTests`) fails if any other code calls it. A file under
 `~/Documents` makes macOS ask once for access to Documents.
 
+Click it only while the phone shows a passcode prompt (check the mirror or a
+screenshot first). iMirror cannot tell what the phone shows: on an unlocked
+phone the keys go to whatever has focus, and the Return after a non-numeric
+code may send them. A click posted by another program (cliclick, an agent's
+computer use) also counts as a click.
+
 The first pair or type asks for Bluetooth access (System Settings › Privacy &
 Security › Bluetooth). An ad hoc signed build may ask again after each rebuild.
 
