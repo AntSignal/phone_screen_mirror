@@ -52,6 +52,62 @@ final class KeyboardPairsTests: XCTestCase {
         XCTAssertEqual(p.udid(forCentral: cA), phone2)
     }
 
+    // MARK: - Transports
+
+    private let slot1 = "00008150001928e01404401c"
+    private let peerA = "4a:3b:2c:1d:0e:ff"
+
+    func testAnEntryWithNoTransportIsCoreBluetooth() {
+        let body: [String: Any] = [phone1: ["central": cA, "paired_at": "2026-11-13T10:00:00Z"]]
+        let p = KeyboardPairs.decode(try! JSONSerialization.data(withJSONObject: body))
+        XCTAssertEqual(p.pair(for: phone1)?.transport, .corebluetooth)
+        XCTAssertEqual(p.central(for: phone1), cA)
+        let obj = try! JSONSerialization.jsonObject(with: p.encode()) as! [String: [String: String]]
+        XCTAssertEqual(obj[phone1]?["transport"], "corebluetooth")
+    }
+
+    func testDongleEntryRoundTrips() {
+        var p = KeyboardPairs()
+        XCTAssertTrue(p.record(udid: phone1, slot: slot1, peer: peerA.uppercased(), at: t0))
+        let obj = try! JSONSerialization.jsonObject(with: p.encode()) as! [String: [String: String]]
+        XCTAssertEqual(obj[phone1], ["transport": "dongle", "slot": slot1, "peer": peerA,
+                                     "paired_at": "2026-11-13T10:00:00.000Z"])
+        let back = KeyboardPairs.decode(p.encode())
+        XCTAssertEqual(back, p)
+        XCTAssertEqual(back.pair(for: phone1), KeyboardPair(slot: slot1, peer: peerA, pairedAt: t0))
+        XCTAssertNil(back.central(for: phone1))
+    }
+
+    func testBadDongleEntriesAndUnknownTransportsAreDropped() {
+        let at = "2026-11-13T10:00:00Z"
+        let body: [String: Any] = [
+            phone1: ["transport": "dongle", "slot": "BAD SLOT", "peer": peerA, "paired_at": at],
+            phone2: ["transport": "dongle", "slot": slot1, "paired_at": at],
+            "00008101-AAAA": ["transport": "usb-hid", "central": cA, "paired_at": at],
+            "00008101-BBBB": ["transport": "dongle", "slot": slot1, "peer": peerA, "paired_at": at],
+        ]
+        let p = KeyboardPairs.decode(try! JSONSerialization.data(withJSONObject: body))
+        XCTAssertEqual(Array(p.byUDID.keys), ["00008101-BBBB"])
+    }
+
+    func testASlotOrPeerBelongsToOnePhoneOnly() {
+        var p = KeyboardPairs()
+        p.record(udid: phone1, slot: slot1, peer: peerA, at: t0)
+        p.record(udid: phone2, slot: "other", peer: peerA, at: t0)
+        XCTAssertNil(p.pair(for: phone1))
+        p.record(udid: phone1, slot: "other", peer: "01:02:03:04:05:06", at: t0)
+        XCTAssertNil(p.pair(for: phone2))
+        XCTAssertFalse(p.record(udid: phone2, slot: slot1, peer: "nope", at: t0))
+    }
+
+    func testRepairingSwitchesTransport() {
+        var p = KeyboardPairs()
+        p.record(udid: phone1, central: cA, at: t0)
+        p.record(udid: phone1, slot: slot1, peer: peerA, at: t0)
+        XCTAssertEqual(p.pair(for: phone1)?.transport, .dongle)
+        XCTAssertNil(p.udid(forCentral: cA))
+    }
+
     // MARK: - Pairing rule
 
     private func window(before: Set<String> = []) -> PairingWindow {

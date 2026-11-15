@@ -334,15 +334,18 @@ versions; the new runner may raise the passcode sheet once), `keyboard` (see
 below). The same lines go to the unified log, subsystem
 `com.local.imirror`, category `events`, in the clear.
 
-A `keyboard` event is about iMirror's Bluetooth keyboard. `detail` is one of
+A `keyboard` event is about iMirror's Bluetooth keyboard. It has `transport`
+(`dongle` or `corebluetooth`, below) when the app knows which. `detail` is one of
 `paired`, `ambiguous` (more than one new Bluetooth central subscribed, so none
 was trusted), `timeout` (the 120 s pairing window closed with no new phone),
 `connected`, `disconnected`, `typed_test`, `typed_passcode`, `failed` or
 `forgotten`. A typing line has `chars`: how many characters were typed, never
 what they were. A `failed` line has a `reason`: `bad_request`,
 `unknown_action`, `bad_text`, `stale`, `not_attached`, `not_paired`, `busy`,
-`bluetooth_unavailable`, `setup_failed`, `not_connected`, `send_failed`, and
-for "Type passcode now" `no_file`, `no_passcode` or `untypeable`.
+`bluetooth_unavailable`, `setup_failed`, `not_connected`, `send_failed`,
+`dongle_unavailable` (the phone is paired with the dongle and none answers on
+USB), `dongle_error` (the dongle gave no answer in time, or one iMirror cannot
+read), and for "Type passcode now" `no_file`, `no_passcode` or `untypeable`.
 
 **`expected-resets/<udid>.json`** — written by a client, not the app. Before
 `devicectl device install|launch`, write `{"until": <now + 90 s, ISO-8601>,
@@ -378,8 +381,49 @@ does that (below). After each run iMirror
 stops advertising and drops its Bluetooth services, so the phone gets its
 on-screen keyboard back.
 
-**`keyboard-pairs.json`** — written by the app, mode 0600: `{"<udid>":
-{"central": "<CoreBluetooth central UUID>", "paired_at": ISO-8601}}`.
+**`keyboard-pairs.json`** — written by the app, mode 0600. Each phone is
+`{"transport": "corebluetooth", "central": "<CoreBluetooth central UUID>",
+"paired_at": ISO-8601}` or `{"transport": "dongle", "slot": "<slot>", "peer":
+"<phone's Bluetooth identity address>", "paired_at": ISO-8601}`. An entry with
+no `transport` was written before the dongle and is `corebluetooth`. Accept
+transports you don't know.
+
+**Keyboard dongle serial protocol, v1.** An ESP32-S3 on the Mac's USB acting
+as a BLE keyboard with its own Bluetooth address (a phone on the Mac's iCloud
+account hides the Mac's own keyboard as "my Mac"). Firmware and the same
+contract: `esp32-s3/BLE_KEYBOARD_DONGLE.md` in AntSignal/device-firmware.
+Code: `Sources/iMirrorCore/DongleProtocol.swift`.
+- Link: the S3's built-in USB-Serial/JTAG (USB vendor `0x303A`), any baud.
+  ASCII lines ending `\n`. The host sends commands; the dongle replies. Lines
+  starting `#` are logs and never hold report bytes, slot payloads or anything
+  typed. Every command gets exactly one final line, `OK …` or `ERR <code>`.
+- Slots: `[a-z0-9-]{1,32}`. iMirror uses the phone's UDID lower-cased without
+  dashes (`000081400006423002d3401c`); a 40-character UDID keeps its first 32.
+- `HELLO` → `OK HELLO imirror-kbd 1 <dongle-bt-addr>`
+- `STATUS` → `OK STATUS bonds=<n> conns=<n> adv=<0|1>`
+- `BONDS` → zero or more `BOND <slot> <peer-identity-addr>`, then `OK BONDS <n>`
+- `PAIR <slot> <seconds 10..600>` advertises as "iMirror Keyboard" (16-bit
+  `0x1812`, appearance `0x03C1`), Just Works bonding. Exactly one new peer that
+  bonds and subscribes to the keyboard input report → stored, disconnected,
+  `OK PAIRED <slot> <peer-identity-addr>`. A second new peer → `ERR AMBIGUOUS`
+  (both new bonds deleted). Nobody → `ERR TIMEOUT`. Re-pairing a slot replaces
+  its old bond.
+- `FORGET <slot>` → `OK FORGOT <slot>` or `ERR UNKNOWN_SLOT`.
+- `SEND <slot> <hex>`: 1–128 steps of 10 bytes, each an 8-byte boot-keyboard
+  input report then a 2-byte big-endian delay (0–2000 ms) to wait after it.
+  The dongle lets only that slot's peer connect, waits up to 15 s for it to
+  connect, encrypt and subscribe, waits 1 s, sends a key-up report, the
+  steps, another key-up, then disconnects and stops advertising →
+  `OK SENT <steps>`, or `ERR UNKNOWN_SLOT`, `ERR NOT_CONNECTED`, `ERR BADARG`.
+  Neither side ever logs the hex. iMirror splits longer text into several
+  SENDs, each ending after a key-up.
+- `DISCONNECT` → drops every connection, stops advertising → `OK DISCONNECTED`.
+- Between commands the dongle neither advertises nor holds a connection, so
+  bonded phones keep their on-screen keyboards. One command at a time: another
+  arriving meanwhile gets `ERR BUSY`. A phone other than the target never gets
+  a report.
+- iMirror's timeouts, write to final line: `HELLO` 2 s, `PAIR` its window +
+  10 s, `SEND` 30 s plus its steps' delays, others 5 s.
 
 **Settings → iPhones → "Type passcode now"** shows on each paired phone. A
 click reads that phone's passcode from the passcode file (the field under the

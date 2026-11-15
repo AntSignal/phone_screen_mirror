@@ -122,16 +122,20 @@ public struct DeviceEvent: Encodable, Equatable, Sendable {
     public var expected: Bool?
     /// How many characters the keyboard typed. Never what they were.
     public var chars: Int?
+    /// Keyboard events: "dongle" or "corebluetooth".
+    public var transport: String?
 
     public init(at date: Date, udid: String, alias: String, event: DeviceEventKind,
                 from: String? = nil, to: String? = nil, reason: String? = nil,
-                detail: String? = nil, expected: Bool? = nil, chars: Int? = nil) {
+                detail: String? = nil, expected: Bool? = nil, chars: Int? = nil,
+                transport: String? = nil) {
         ts = DeviceEventCodec.timestamp(date)
         self.udid = udid; self.alias = alias; self.event = event.rawValue
         self.from = from; self.to = to; self.reason = reason
         self.detail = detail.map(DeviceEventCodec.clip)
         self.expected = expected
         self.chars = chars
+        self.transport = transport
     }
 }
 
