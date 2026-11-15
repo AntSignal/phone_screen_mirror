@@ -326,7 +326,8 @@ was trusted), `timeout` (the 120 s pairing window closed with no new phone),
 `forgotten`. A typing line has `chars`: how many characters were typed, never
 what they were. A `failed` line has a `reason`: `bad_request`,
 `unknown_action`, `bad_text`, `stale`, `not_attached`, `not_paired`, `busy`,
-`bluetooth_unavailable`, `setup_failed`, `not_connected` or `send_failed`.
+`bluetooth_unavailable`, `setup_failed`, `not_connected`, `send_failed`, and
+for "Type passcode now" `no_file`, `no_passcode` or `untypeable`.
 
 **`expected-resets/<udid>.json`** — written by a client, not the app. Before
 `devicectl device install|launch`, write `{"until": <now + 90 s, ISO-8601>,
@@ -356,12 +357,27 @@ Bluetooth keyboard for one phone: `{"udid", "requested_at", "requested_by",
 - `forget` removes the tie.
 
 Any other action, or any other key in the file, is refused (event `keyboard`,
-`detail` `failed`). No request can type a passcode. After each run iMirror
+`detail` `failed`). No request can type a passcode; only a click in Settings
+does that (below). After each run iMirror
 stops advertising and drops its Bluetooth services, so the phone gets its
 on-screen keyboard back.
 
 **`keyboard-pairs.json`** — written by the app, mode 0600: `{"<udid>":
 {"central": "<CoreBluetooth central UUID>", "paired_at": ISO-8601}}`.
+
+**Settings → iPhones → "Type passcode now"** shows on each paired phone. A
+click reads that phone's passcode from the passcode file (the field under the
+phone list; default `~/Documents/Github/Purpose/Purpose-iOS/Testing/.env.local`,
+stored as `defaults` key `imirror.passcodeFile`). The file is dotenv style
+(`KEY=VALUE`, optional `export`, quotes, `#` comments). The key is
+`IMIRROR_PASSCODE_<UDID without dashes, upper case>`; failing that,
+`ANTSIGNAL_TEST_DEVICE_PASSCODE`, but only when the file's
+`ANTSIGNAL_DEVICE_UDID` is this phone. iMirror then presses Shift to wake the
+phone, waits 600 ms, types the passcode to that phone's central only (Return
+too, unless it is a 4- or 6-digit code), zeroes its copy and logs `keyboard`
+`typed_passcode` with `chars`. Nothing but that click starts it; a test
+(`PasscodeCallSiteTests`) fails if any other code calls it. A file under
+`~/Documents` makes macOS ask once for access to Documents.
 
 The first pair or type asks for Bluetooth access (System Settings › Privacy &
 Security › Bluetooth). An ad hoc signed build may ask again after each rebuild.

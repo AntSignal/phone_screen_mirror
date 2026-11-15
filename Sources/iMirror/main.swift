@@ -1230,6 +1230,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSToolbarDelegate {
         tunnelButton.controlSize = .small
         tunnelButton.toolTip = "Every phone rides one go-ios tunnel; this restarts it and every phone's WebDriverAgent."
         stack.addArrangedSubview(tunnelButton)
+
+        // Where "Type passcode now" reads each phone's passcode.
+        stack.addArrangedSubview(smallLabel("Passcode file (IMIRROR_PASSCODE_<UDID>, read only on a click):"))
+        let fileField = NSTextField(string: UserDefaults.standard.string(forKey: PasscodeFile.defaultsKey) ?? "")
+        fileField.placeholderString = PasscodeFile.defaultPath
+        fileField.font = .systemFont(ofSize: 11)
+        fileField.target = self
+        fileField.action = #selector(passcodeFileEdited(_:))
+        fileField.widthAnchor.constraint(equalToConstant: 268).isActive = true
+        stack.addArrangedSubview(fileField)
         rebuildDeviceRows()
 
         // MCP server section — one-click register with Claude Code / Claude Desktop.
@@ -1377,10 +1387,48 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSToolbarDelegate {
             row.orientation = .vertical
             row.alignment = .leading
             row.spacing = 2
+            if let kb = keyboardRow(c.udid) { row.addArrangedSubview(kb) }
             devicesStack.addArrangedSubview(row)
         }
         for (udid, why) in manager.problems.sorted(by: { $0.key < $1.key }) {
             devicesStack.addArrangedSubview(smallLabel("\(shortUDID(udid)): not started — \(why)."))
+        }
+    }
+
+    /// "Keyboard: paired" and the passcode button, for a paired phone only.
+    private func keyboardRow(_ udid: String) -> NSView? {
+        MainActor.assumeIsolated {
+            guard keyboardControl.pairs().central(for: udid) != nil else { return nil }
+            let type = NSButton(title: "Type passcode now", target: self, action: #selector(typePasscodeClicked(_:)))
+            type.bezelStyle = .rounded
+            type.controlSize = .small
+            type.identifier = NSUserInterfaceItemIdentifier(udid)
+            type.isEnabled = !keyboardControl.busy
+            type.toolTip = "Wakes the phone and types its passcode over the paired Bluetooth keyboard."
+            let row = NSStackView(views: [smallLabel("Keyboard: paired"), type])
+            row.orientation = .horizontal
+            row.spacing = 6
+            return row
+        }
+    }
+
+    /// The only caller of typePasscodeFromClick: a button's action.
+    @objc private func typePasscodeClicked(_ sender: NSButton) {
+        guard let udid = sender.identifier?.rawValue else { return }
+        let file = PasscodeFile.url(stored: UserDefaults.standard.string(forKey: PasscodeFile.defaultsKey))
+        let line = MainActor.assumeIsolated {
+            keyboardControl.typePasscodeFromClick(udid: udid, event: NSApp.currentEvent, file: file)
+        }
+        setStatus(line)
+        rebuildDeviceRows()
+    }
+
+    @objc private func passcodeFileEdited(_ sender: NSTextField) {
+        let path = sender.stringValue.trimmingCharacters(in: .whitespaces)
+        if path.isEmpty {
+            UserDefaults.standard.removeObject(forKey: PasscodeFile.defaultsKey)
+        } else {
+            UserDefaults.standard.set(path, forKey: PasscodeFile.defaultsKey)
         }
     }
 
