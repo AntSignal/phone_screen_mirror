@@ -446,7 +446,10 @@ the key cannot reach another phone. Failing that, it tries
 `IMIRROR_PASSCODE_<UDID without dashes, upper case>`, then
 `ANTSIGNAL_TEST_DEVICE_PASSCODE`, but only when the file's
 `ANTSIGNAL_DEVICE_UDID` is this phone. iMirror then presses Shift to wake the
-phone, waits 600 ms, types the passcode to that phone only (Return
+phone, waits 600 ms, presses Backspace to open the keypad (on the lock
+screen the first real key only opens it, so a digit there was lost), waits
+800 ms, presses Backspace 8 more times to clear a half-typed code, and types
+the passcode to that phone only (Return
 too, unless it is a 4- or 6-digit code), zeroes its copy and logs `keyboard`
 `typed_passcode` with `chars`. Nothing but that click starts it; a test
 (`PasscodeCallSiteTests`) fails if any other code calls it. A file under

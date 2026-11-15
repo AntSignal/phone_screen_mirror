@@ -172,13 +172,33 @@ final class PasscodeTypingTests: XCTestCase {
         XCTAssertNil(HIDKeyboard.passcodeReports(ascii: [0x0A]), "no key for a newline")
     }
 
-    func testWakeThenAPauseThenTheCode() throws {
+    func testWakeThenBackspacesThenTheCode() throws {
         let steps = try XCTUnwrap(HIDKeyboard.wakeThenPasscode(ascii: Array("123456".utf8)))
         XCTAssertEqual(steps[0].report, [HIDKeyboard.leftShift, 0, 0, 0, 0, 0, 0, 0])
         XCTAssertEqual(steps[1].report, HIDKeyboard.releaseReport)
         XCTAssertEqual(steps[1].delayAfterMs, 600)
-        XCTAssertEqual(Array(steps.dropFirst(2)), HIDKeyboard.passcodeReports("123456"))
+        // One Backspace opens the keypad, then a pause for it to slide up.
+        XCTAssertEqual(steps[2].report, [0, 0, 0x2A, 0, 0, 0, 0, 0])
+        XCTAssertEqual(steps[3].report, HIDKeyboard.releaseReport)
+        XCTAssertEqual(steps[3].delayAfterMs, 800)
+        // Eight more clear a half-typed code; each is pressed and released.
+        let clear = Array(steps[4..<20])
+        XCTAssertEqual(clear.count, 16)
+        for (i, s) in clear.enumerated() {
+            XCTAssertEqual(s.report, i % 2 == 0 ? [0, 0, 0x2A, 0, 0, 0, 0, 0] : HIDKeyboard.releaseReport)
+        }
+        XCTAssertEqual(Array(steps.dropFirst(20)), HIDKeyboard.passcodeReports("123456"))
         XCTAssertNil(HIDKeyboard.wakeThenPasscode(ascii: []))
+    }
+
+    func testNothingBeforeTheCodeTypesACharacter() throws {
+        // Only Shift and Backspace come before the code, so no stray digit
+        // can join a half-typed code and submit a wrong one.
+        let steps = try XCTUnwrap(HIDKeyboard.wakeThenPasscode(ascii: Array("1234".utf8)))
+        for s in steps.dropLast(8) {
+            XCTAssertTrue(s.report == HIDKeyboard.releaseReport || s.report[2] == 0x2A
+                          || s.report == [HIDKeyboard.leftShift, 0, 0, 0, 0, 0, 0, 0], "\(s.report)")
+        }
     }
 
     func testWipeZeroesEveryReport() throws {
