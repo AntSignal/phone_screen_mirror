@@ -13,7 +13,7 @@ import iMirrorCore
 @MainActor
 final class KeyboardControl {
     let keyboard: BLEKeyboard
-    /// An attached phone's alias, or nil when it is not attached.
+    /// An attached phone's alias; nil when not attached.
     var aliasOf: (String) -> String? = { _ in nil }
     /// A pairing changed or a run ended; Settings redraws.
     var onChange: (() -> Void)?
@@ -59,7 +59,7 @@ final class KeyboardControl {
                 return (KeyboardEventDetail(outcome), nil)
             }
         case .test:
-            // The request parser only lets through [a-z0-9 ] with a letter.
+            // The parser allows [a-z0-9 ], a letter, few digits.
             guard let text = r.text, let reports = HIDKeyboard.textReports(text),
                   let id = central.flatMap(UUID.init(uuidString:)) else { return log(r.udid, .failed, .badText) }
             run(r.udid, chars: text.count) { kb in

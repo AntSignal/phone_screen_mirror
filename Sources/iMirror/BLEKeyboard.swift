@@ -75,7 +75,7 @@ final class BLEKeyboard: NSObject {
     // Centrals subscribed at the last link report.
     private var linked: Set<UUID> = []
 
-    /// A phone's keyboard link came up (true) or went down (false).
+    /// A phone's keyboard link came up (true) or down.
     var onLinkChange: ((UUID, Bool) -> Void)?
 
     init(pairsURL: URL = BLEKeyboard.defaultPairsURL) {

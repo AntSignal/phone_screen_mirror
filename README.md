@@ -352,7 +352,8 @@ Bluetooth keyboard for one phone: `{"udid", "requested_at", "requested_by",
   and the one phone that connects while it is open is tied to this UDID. The
   phone must be attached by USB.
 - `test` types `text` into that phone only: 1–32 of `a-z`, `0-9` and space,
-  with at least one letter. `text` is refused on any other action.
+  with at least one letter and at most three digits, so it can never be a
+  passcode attempt. `text` is refused on any other action.
 - `forget` removes the tie.
 
 Any other action, or any other key in the file, is refused (event `keyboard`,

@@ -56,8 +56,15 @@ final class KeyboardRequestFileTests: XCTestCase {
         }
         XCTAssertEqual(read(base("test")), .refused(udid: udid, .badText), "test needs text")
         XCTAssertEqual(read(base("test", ["text": 42])), .refused(udid: udid, .badText))
-        for good in ["a", "hello 123", "x1", String(repeating: "z", count: 32)] {
+        for good in ["a", "hello 123", "x1", "1 a 2 b 3", String(repeating: "z", count: 32)] {
             XCTAssertTrue(KeyboardRequestFile.isAllowedTestText(good), good)
+        }
+    }
+
+    func testTestTextCantHoldFourDigitsAnywhere() {
+        // A numeric passcode field may skip the letters and spaces.
+        for bad in ["a 1234", "x123456", "1a2b3c4d", "pin 12 34", "a\u{0332}1"] {
+            XCTAssertEqual(read(base("test", ["text": bad])), .refused(udid: udid, .badText), bad)
         }
     }
 
