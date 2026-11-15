@@ -3055,7 +3055,7 @@ def test_importing_the_server_writes_no_bytecode_next_to_it(tmp_path):
     import shutil
     import subprocess
     here = os.path.dirname(os.path.abspath(__file__))
-    for name in ("imirror_mcp.py", "sim_control.py", "wda_bringup.py"):
+    for name in ("imirror_mcp.py", "sim_control.py", "wda_bringup.py", "devicelease.py"):
         shutil.copy(os.path.join(here, name), tmp_path / name)
     env = {k: v for k, v in os.environ.items() if k != "PYTHONDONTWRITEBYTECODE"}
     env.update(IMIRROR_WDA="http://127.0.0.1:8100")

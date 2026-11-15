@@ -9,6 +9,7 @@ the real directory and take real leases.
 from __future__ import annotations
 
 import os
+import sys
 
 import pytest
 
@@ -46,3 +47,7 @@ def _private_lease_dir(tmp_path, monkeypatch):
     if devicelease is not None:
         monkeypatch.setattr(devicelease, "default_lease_dir", _real_dir_forbidden)
     yield
+    # Stop the server's lease heartbeat thread; each test makes one.
+    server = sys.modules.get("imirror_mcp")
+    if server is not None and hasattr(server, "_leases_close"):
+        server._leases_close()

@@ -24,8 +24,8 @@ tool stubbed), so a change to a script is covered there too.
 
 (`mcp-server` runs every suite: `test_imirror_mcp.py`, `test_multi_device.py`,
 `test_sim_control.py`, `test_wda_bringup.py` and the device-lease ones,
-`test_devicelease*.py`; the live ones skip themselves. `conftest.py` points
-every test at its own lease directory, never the live one.)
+`test_devicelease*.py` and `test_lease_hook.py`; the live ones skip themselves.
+`conftest.py` points every test at its own lease directory, never the live one.)
 
 First-time setup (creates the venv the command above expects):
 
