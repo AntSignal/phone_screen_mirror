@@ -1,6 +1,11 @@
 #!/usr/bin/env bash
 # Build iMirror, wrap the executable into a proper .app bundle (so TCC camera
-# permission works), ad-hoc sign it, and launch it.
+# permission works), sign it, and launch it.
+#
+# Signs with $IMIRROR_SIGN_IDENTITY (e.g. an "Apple Development: …" name from
+# `security find-identity -v -p codesigning`) when set, else ad hoc. An ad hoc
+# signature changes with every build, so macOS forgets the Bluetooth and
+# Documents grants and asks again; a real identity keeps them.
 #
 # Pure Apple toolchain (swift, codec/codesign, /bin). No third-party tools.
 set -euo pipefail
@@ -44,8 +49,13 @@ done
 [[ -f "$ROOT/mcp-server/requirements.txt" ]] && \
     cp "$ROOT/mcp-server/requirements.txt" "$APP/Contents/Resources/mcp-server/" || true
 
-echo "==> ad-hoc signing (local dev)"
-codesign --force --sign - --timestamp=none "$APP"
+if [[ -n "${IMIRROR_SIGN_IDENTITY:-}" ]]; then
+    echo "==> signing with $IMIRROR_SIGN_IDENTITY (local dev)"
+    codesign --force --sign "$IMIRROR_SIGN_IDENTITY" --timestamp=none "$APP"
+else
+    echo "==> ad-hoc signing (local dev; set IMIRROR_SIGN_IDENTITY to keep permission grants)"
+    codesign --force --sign - --timestamp=none "$APP"
+fi
 
 echo "==> launching"
 open "$APP"

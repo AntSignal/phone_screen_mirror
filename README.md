@@ -185,6 +185,21 @@ Then install WebDriverAgent on the device once (Xcode):
 ./scripts/run.sh release    # optimized build
 ```
 
+#### Signing for development
+
+`run.sh` signs ad hoc unless `IMIRROR_SIGN_IDENTITY` is set. An ad hoc
+signature changes with every build, so macOS forgets iMirror's Bluetooth and
+Documents permissions and asks again. With a stable identity they stay:
+
+```bash
+security find-identity -v -p codesigning     # pick an "Apple Development: …" name
+export IMIRROR_SIGN_IDENTITY="Apple Development: Your Name (TEAMID)"
+./scripts/run.sh
+```
+
+`package.sh` uses it too, ahead of any Developer ID (no hardened runtime, no
+timestamp, not notarizable: for this Mac only).
+
 On launch the app connects to the iPhone and brings up WebDriverAgent
 automatically (health dot green within ~30 s) — the phone stays unlocked and
 keeps its own audio, though iOS shows the "Automation Running" overlay while
@@ -387,7 +402,8 @@ code may send them. A click posted by another program (cliclick, an agent's
 computer use) also counts as a click.
 
 The first pair or type asks for Bluetooth access (System Settings › Privacy &
-Security › Bluetooth). An ad hoc signed build may ask again after each rebuild.
+Security › Bluetooth). An ad hoc signed build may ask again after each rebuild;
+see "Signing for development".
 
 **`scripts/imirror-ctl`** reads and writes these files (system `python3`, no
 dependencies). `device` is an alias, a UDID, or a unique UDID prefix/suffix of
