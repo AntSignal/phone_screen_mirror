@@ -2442,8 +2442,10 @@ async def ios_reserve_device(
     started = time.monotonic()
     try:
         for _ in range(2):                  # a lost belief is retried once
-            if wait > 0:
-                out = await lk.acquire_async(keys, wait_s=wait, hold_s=hold, purpose=why,
+            # One budget for both tries: two full waits passed 120 s.
+            left = max(0.0, wait - (time.monotonic() - started))
+            if left > 0:
+                out = await lk.acquire_async(keys, wait_s=left, hold_s=hold, purpose=why,
                                              label=label, run_sync=anyio.to_thread.run_sync,
                                              sleep=anyio.sleep)
             else:

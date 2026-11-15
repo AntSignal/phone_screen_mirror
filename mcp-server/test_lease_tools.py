@@ -60,7 +60,23 @@ def test_reserve_clamps_wait_to_85_s_and_hold_to_an_hour(reg, monkeypatch):
         return dl.Outcome(status="held", keys=tuple(keys), lease_id="L")
     monkeypatch.setattr(dl.Locker, "acquire_async", fake)
     reserve(reg.m, device="phone1", wait_s=500, hold_s=99999)
-    assert seen["wait_s"] == 85 and seen["hold_s"] == 3600
+    assert 84 < seen["wait_s"] <= 85 and seen["hold_s"] == 3600
+
+
+def test_a_retried_reserve_waits_only_what_is_left(reg, monkeypatch):
+    """A lost belief is retried once. Each try used to get the full wait,
+    so one call could block 170 s, past Claude Code's 120 s."""
+    waits = []
+
+    async def fake(self, keys, *, wait_s, **kw):
+        waits.append(wait_s)
+        await anyio.sleep(0.3)
+        status = "lost" if len(waits) == 1 else "queued"
+        return dl.Outcome(status=status, keys=tuple(keys), ticket="t", position=1)
+    monkeypatch.setattr(dl.Locker, "acquire_async", fake)
+    out = reserve(reg.m, device="phone1", wait_s=0.5)
+    assert out["status"] == "queued" and len(waits) == 2
+    assert waits[0] == pytest.approx(0.5, abs=0.05) and waits[1] < 0.25
 
 
 def test_a_busy_phone_queues_the_caller_and_names_the_holder(reg, sleeper):
@@ -159,6 +175,7 @@ def test_device_leases_shows_holder_queue_and_ages(reg, sleeper):
     assert rows["phone1"]["queue"] == 1 and rows["phone1"]["your_position"] == 1
     assert rows["phone1"]["holder"]["purpose"] == "other work"
     assert rows["phone1"]["waiting"][0]["purpose"] == "agent 'b' reserved it"
+    assert rows["phone1"]["waiting"][0]["agent"] == "b"
     assert rows["phone2"]["state"] == "yours" and rows["phone2"]["holder"]["agent"] == "b"
     one = json.loads(reg.m.ios_device_leases(device="phone2"))
     assert [d["alias"] for d in one["devices"]] == ["phone2"]
