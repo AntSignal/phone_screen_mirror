@@ -194,3 +194,115 @@ def test_restart_refuses_a_dead_app(app_dir, capsys):
 def test_restart_refuses_a_simulator(app_dir, capsys):
     assert ctl.main(["restart", "sim-17"]) == 1
     assert "Simulator" in capsys.readouterr().err
+
+
+# ---- keyboard ----
+
+def test_keyboard_request_names_the_action_and_carries_no_passcode(tmp_path):
+    path = ctl.write_keyboard_request(str(tmp_path), PHONE_16E, NOW, "test", "hello 123")
+    assert os.path.basename(path) == f"keyboard-{PHONE_16E}.json"
+    assert json.loads(open(path).read()) == {"udid": PHONE_16E, "requested_at": "2026-11-13T10:00:00.000Z",
+                                             "requested_by": "imirror-ctl", "action": "test",
+                                             "text": "hello 123"}
+    pair = json.loads(open(ctl.write_keyboard_request(str(tmp_path), PHONE_16E, NOW, "pair")).read())
+    assert pair["action"] == "pair" and "text" not in pair
+
+
+@pytest.mark.parametrize("text", ["123456", "0000", "Hello", "hi!", "", "a" * 33, None])
+def test_keyboard_test_text_refuses_digits_only_and_odd_text(tmp_path, text):
+    with pytest.raises(ctl.CtlError):
+        ctl.write_keyboard_request(str(tmp_path), PHONE_16E, NOW, "test", text)
+    assert not (tmp_path / "requests").exists() or os.listdir(tmp_path / "requests") == []
+
+
+def test_keyboard_pair_and_forget_take_no_text(tmp_path):
+    with pytest.raises(ctl.CtlError, match="takes no text"):
+        ctl.write_keyboard_request(str(tmp_path), PHONE_16E, NOW, "pair", "hello")
+    with pytest.raises(ctl.CtlError, match="unknown"):
+        ctl.write_keyboard_request(str(tmp_path), PHONE_16E, NOW, "passcode")
+
+
+def test_keyboard_outcome_skips_links_other_phones_and_older_answers():
+    events = [json.loads(ev("2026-11-13T09:59:00.000Z", PHONE_16E, "keyboard", detail="paired")),
+              json.loads(ev("2026-11-13T10:00:01.000Z", PHONE_16E, "keyboard", detail="connected")),
+              json.loads(ev("2026-11-13T10:00:01.000Z", PHONE_17, "keyboard", detail="paired")),
+              json.loads(ev("2026-11-13T10:00:02.000Z", PHONE_16E, "request", detail="accepted"))]
+    assert ctl.keyboard_outcome(events, PHONE_16E, NOW, "pair") is None
+    events.append(json.loads(ev("2026-11-13T10:00:03.000Z", PHONE_16E, "keyboard", detail="timeout")))
+    assert ctl.keyboard_outcome(events, PHONE_16E, NOW, "pair")["detail"] == "timeout"
+    assert ctl.keyboard_outcome(events, PHONE_16E, NOW, "test") is None
+
+
+class FakeKeyboardApp:
+    """Plays the app: on the first wait it answers with `detail`."""
+
+    def __init__(self, folder, **answer):
+        self.folder, self.answer, self.t, self.calls = folder, answer, 0.0, 0
+
+    def clock(self):
+        return self.t
+
+    def sleep(self, s):
+        self.t += s
+        self.calls += 1
+        if self.calls != 1 or not self.answer:
+            return
+        (self.folder / "requests" / f"keyboard-{PHONE_16E}.json").unlink()
+        with open(self.folder / "events.jsonl", "a") as f:
+            f.write(ev(ctl.iso(NOW + timedelta(seconds=1)), PHONE_16E, "keyboard", detail="connected") + "\n")
+            f.write(ev(ctl.iso(NOW + timedelta(seconds=2)), PHONE_16E, "keyboard", **self.answer) + "\n")
+
+
+def test_keyboard_waits_for_the_answer(tmp_path):
+    fake = FakeKeyboardApp(tmp_path, detail="typed_test", chars=9)
+    answer = ctl.keyboard(PHONE_16E, str(tmp_path), "test", "hello 123", clock=fake.clock, sleep=fake.sleep,
+                          now=NOW)
+    assert answer["detail"] == "typed_test" and answer["chars"] == 9
+
+
+def test_keyboard_pair_waits_past_the_apps_window_then_withdraws(tmp_path):
+    fake = FakeKeyboardApp(tmp_path)
+    assert ctl.keyboard(PHONE_16E, str(tmp_path), "pair", clock=fake.clock, sleep=fake.sleep, now=NOW) is None
+    assert fake.t >= 130
+    assert os.listdir(tmp_path / "requests") == []
+
+
+def test_describe_keyboard_gives_counts_and_hints_never_text():
+    line = ctl.describe_keyboard("phone1", {"detail": "typed_test", "chars": 9})
+    assert line == "typed_test: phone1, 9 chars"
+    assert "pair it first" in ctl.describe_keyboard("phone1", {"detail": "failed", "reason": "not_paired"})
+    assert "older build" in ctl.describe_keyboard("phone1", None)
+
+
+def test_keyboard_device_falls_back_to_a_paired_udid_off_usb():
+    pairs = {"00008101-AAAA": {"central": "C", "paired_at": "t"}}
+    assert ctl.keyboard_device("phone1", DEVICES, pairs)["udid"] == PHONE_16E
+    assert ctl.keyboard_device("00008101-aaaa", DEVICES, pairs)["udid"] == "00008101-AAAA"
+    with pytest.raises(ctl.CtlError):
+        ctl.keyboard_device("phone9", DEVICES, pairs)
+
+
+def test_keyboard_status_prints_the_tie_and_keyboard_events_only(app_dir, capsys):
+    (app_dir / "keyboard-pairs.json").write_text(json.dumps(
+        {PHONE_16E: {"central": "4F2C0D3A-0000-4000-8000-000000000001", "paired_at": "2026-11-13T09:00:00.000Z"}}))
+    (app_dir / "events.jsonl").write_text("\n".join([
+        ev("2026-11-13T09:00:00.000Z", PHONE_16E, "keyboard", detail="paired"),
+        ev("2026-11-13T09:01:00.000Z", PHONE_16E, "wake"),
+        ev("2026-11-13T09:02:00.000Z", PHONE_16E, "keyboard", detail="typed_test", chars=5),
+    ]) + "\n")
+    assert ctl.main(["keyboard", "status", "phone1"]) == 0
+    out = capsys.readouterr().out
+    assert "paired with central 4F2C0D3A" in out
+    assert "typed_test chars=5" in out and "wake" not in out
+
+
+def test_keyboard_status_of_an_unpaired_phone(app_dir, capsys):
+    assert ctl.main(["keyboard", "status", "phone2"]) == 0
+    assert "not paired" in capsys.readouterr().out
+
+
+def test_keyboard_refuses_a_simulator_and_a_dead_app(app_dir, capsys):
+    assert ctl.main(["keyboard", "pair", "sim-17"]) == 1
+    write_devices(app_dir / "devices.json", DEVICES, pid=999_999)
+    assert ctl.main(["keyboard", "test", "phone1", "hello"]) == 1
+    assert not (app_dir / "requests").exists()
