@@ -446,13 +446,18 @@ the key cannot reach another phone. Failing that, it tries
 `IMIRROR_PASSCODE_<UDID without dashes, upper case>`, then
 `ANTSIGNAL_TEST_DEVICE_PASSCODE`, but only when the file's
 `ANTSIGNAL_DEVICE_UDID` is this phone. iMirror then presses Shift to wake the
-phone, waits 600 ms, types the passcode to that phone only (Return
+phone, waits 600 ms, presses Backspace to open the keypad (on the lock
+screen the first real key only opens it, so a digit there was lost), waits
+800 ms, presses Backspace 8 more times (or the code's length plus one, if
+longer) to clear a half-typed code, and types
+the passcode to that phone only (Return
 too, unless it is a 4- or 6-digit code), zeroes its copy and logs `keyboard`
 `typed_passcode` with `chars`. Nothing but that click starts it; a test
 (`PasscodeCallSiteTests`) fails if any other code calls it. A file under
 `~/Documents` makes macOS ask once for access to Documents.
 
-Click it only while the phone shows a passcode prompt (check the mirror or a
+If the phone is already unlocked, or Face ID unlocks it as Shift wakes it,
+the Backspaces delete text in whatever field has focus. Click it only while the phone shows a passcode prompt (check the mirror or a
 screenshot first). iMirror cannot tell what the phone shows: on an unlocked
 phone the keys go to whatever has focus, and the Return after a non-numeric
 code may send them. A click posted by another program (cliclick, an agent's
