@@ -168,6 +168,10 @@ public enum DeviceRecoveryAction: Equatable, Sendable {
     case giveUp
     /// A give-up's wait is over: restart this phone's chain and try again.
     case autoRetry
+    /// The phone is locked: stop this phone's children (the relay stays)
+    /// and wait. Restarts can't help, and each tunnel restart costs every
+    /// other phone its WDA.
+    case holdForLock
 }
 
 /// The per-phone ladder. `stage` is 0 before any restart for this outage, 1
@@ -214,6 +218,13 @@ public struct ChainLadderState: Equatable, Sendable {
     /// short grace, and its clock starts when health drops (a hung runwda
     /// never respawns, so nothing else would start it).
     public private(set) var hadSuccessfulConnection = false
+    /// The ladder holds for a lock and has stopped the children.
+    public private(set) var lockHeld = false
+    /// When the phone was seen unlocked; the next tick restarts it.
+    public private(set) var unlockedAt: TimeInterval?
+    /// Ask for a refused post-unlock tunnel restart again then.
+    public private(set) var unlockTunnelRetryAt: TimeInterval?
+    private var unlockTunnelRefusals = 0
 
     /// How long each give-up lasts: 2 min, 5 min, then 10 min for good. Most
     /// outages (a USB reset, a crashed runner, a passcode sheet the user
@@ -250,6 +261,26 @@ public struct ChainLadderState: Equatable, Sendable {
         hardStoppedAt = nil
         giveUps = 0
         hadSuccessfulConnection = true
+        lockHeld = false
+        clearUnlock()
+    }
+
+    private mutating func clearUnlock() {
+        unlockedAt = nil
+        unlockTunnelRetryAt = nil
+        unlockTunnelRefusals = 0
+    }
+
+    /// The lock probe saw the phone unlock (by auto-unlock, a click or a
+    /// person). The next tick brings the chain back at once instead of
+    /// waiting out a give-up's backoff.
+    public mutating func noteUnlocked(now: TimeInterval) {
+        clearUnlock()
+        unlockedAt = now
+        giveUps = 0
+        hardStopped = false
+        hardStoppedAt = nil
+        lockHeld = false
     }
 
     /// Health went red. Only a mid-session outage starts the clock here —
@@ -270,6 +301,19 @@ public struct ChainLadderState: Equatable, Sendable {
         hardStopped = false
         hardStoppedAt = nil
         giveUps = 0
+        lockHeld = false
+        clearUnlock()
+    }
+
+    /// After an unlock the tunnel restart was refused (its cooldown), so
+    /// only this phone's chain restarted, which can't reach a phone the
+    /// tunnel doesn't list. Ask again soon instead of climbing to a
+    /// give-up and a 2-10 min backoff. Bounded by unlockTunnelRetries.
+    public mutating func tunnelRestartRefusedAfterUnlock(now: TimeInterval) {
+        guard unlockTunnelRefusals < AutoUnlockTiming.unlockTunnelRetries else { return }
+        unlockTunnelRefusals += 1
+        unlockedAt = now
+        unlockTunnelRetryAt = now + AutoUnlockTiming.unlockTunnelRetrySec
     }
 
     /// A retry (the user's or the ladder's own) is restarting the chain now.
@@ -280,6 +324,7 @@ public struct ChainLadderState: Equatable, Sendable {
         hardStoppedAt = nil
         stage = 1
         wedgeSince = now
+        lockHeld = false   // a still-locked phone is held again
     }
 
     /// Something outside the ladder (a USB-reset restart) restarted the
@@ -287,6 +332,7 @@ public struct ChainLadderState: Equatable, Sendable {
     /// would restart it again mid-boot. Its clock starts now (beginRestart).
     public mutating func noteOutsideRestart(now: TimeInterval) {
         stage = max(stage, 1)
+        lockHeld = false   // a still-locked phone is held again
         beginRestart(now: now)
     }
 
@@ -314,8 +360,28 @@ public struct ChainLadderState: Equatable, Sendable {
     /// Decide what to do now. Call only while this phone's health is down.
     /// `held`: runwda waits on the passcode sheet (PasscodeHold); a restart
     /// would only raise the sheet again, so the climb pauses.
+    /// `locked`: a recent lock probe says locked. The ladder holds once,
+    /// then waits, with no give-up and no backoff, until an unlock. While
+    /// the tunnel still lists the phone, the stage's grace runs first: a
+    /// health blip there may heal by itself.
     public mutating func tick(now: TimeInterval, othersHealthy: Bool,
-                              tunnelHasDevice: Bool, held: Bool = false) -> DeviceRecoveryAction {
+                              tunnelHasDevice: Bool, held: Bool = false, locked: Bool = false) -> DeviceRecoveryAction {
+        if locked {
+            clearUnlock()
+            hardStopped = false
+            hardStoppedAt = nil
+            // The sheet means runwda is up and waiting: keep it.
+            if held || lockHeld { return .wait }
+            if tunnelHasDevice, let since = wedgeSince,
+               now - since < chainRecoveryGraceSec(stage: stage, postConnectionOutage: hadSuccessfulConnection) {
+                return .wait
+            }
+            lockHeld = true
+            return .holdForLock
+        }
+        lockHeld = false
+        if let at = unlockedAt { return afterUnlock(at: at, now: now, othersHealthy: othersHealthy,
+                                                    tunnelHasDevice: tunnelHasDevice) }
         if held, !hardStopped { return .wait }
         if hardStopped {
             guard let at = nextAutoRetryAt, now >= at else { return .wait }
@@ -336,8 +402,32 @@ public struct ChainLadderState: Equatable, Sendable {
         case .restartDeviceChain: stage = 1; beginRestart(now: now)
         case .restartTunnelAndChains: stage = 2; beginRestart(now: now)
         case .giveUp: hardStop(now: now)
-        case .autoRetry: break
+        case .autoRetry, .holdForLock: break
         }
+        return action
+    }
+
+    /// The first ticks after an unlock. Its own chain when the tunnel
+    /// lists the phone; the tunnel at once when no other phone would
+    /// lose WDA; else give go-ios a short while to retry by itself, since
+    /// it backs a locked phone off for up to 5 min.
+    private mutating func afterUnlock(at: TimeInterval, now: TimeInterval, othersHealthy: Bool,
+                                      tunnelHasDevice: Bool) -> DeviceRecoveryAction {
+        let action: DeviceRecoveryAction
+        if tunnelHasDevice {
+            action = .restartDeviceChain
+        } else if let retry = unlockTunnelRetryAt {
+            guard now >= retry else { return .wait }
+            action = .restartTunnelAndChains
+        } else if !othersHealthy || now - at >= AutoUnlockTiming.unlockTunnelWaitSec {
+            action = .restartTunnelAndChains
+        } else {
+            return .wait
+        }
+        unlockedAt = nil
+        unlockTunnelRetryAt = nil
+        stage = action == .restartDeviceChain ? 1 : 2
+        beginRestart(now: now)
         return action
     }
 }

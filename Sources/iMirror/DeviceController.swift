@@ -360,8 +360,8 @@ final class DeviceController {
                                  othersHealthy: othersHealthy(), tunnelHasDevice: tunnelHasDevice(),
                                  held: chain?.passcodeHeld ?? false)
         switch action {
-        case .wait:
-            break
+        case .wait, .holdForLock:
+            break   // nothing passes `locked` yet
         case .autoRetry:
             log(.autoRetry, detail: "after give-up \(ladder.giveUps)")
             // The new runwda reports its own cause. A stale needs_passcode
