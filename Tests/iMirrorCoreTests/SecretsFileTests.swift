@@ -191,6 +191,14 @@ final class PasscodeTypingTests: XCTestCase {
         XCTAssertNil(HIDKeyboard.wakeThenPasscode(ascii: []))
     }
 
+    func testALongCodeGetsMoreClearingBackspacesThanItsLength() throws {
+        let code = Array("abcdefghijkl".utf8)   // 12 characters, plus Return
+        let steps = try XCTUnwrap(HIDKeyboard.wakeThenPasscode(ascii: code))
+        let beforeCode = steps.dropLast(2 * (code.count + 1)).dropFirst(4)
+        XCTAssertEqual(beforeCode.filter { $0.report[2] == 0x2A }.count, code.count + 1)
+        XCTAssertEqual(DongleProtocol.sendChunks(steps)?.count, 1)
+    }
+
     func testNothingBeforeTheCodeTypesACharacter() throws {
         // Only Shift and Backspace come before the code, so no stray digit
         // can join a half-typed code and submit a wrong one.

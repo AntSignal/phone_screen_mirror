@@ -11,7 +11,8 @@ extension HIDKeyboard {
     /// Time for the keypad to slide up after the first Backspace.
     public static let keypadSettleMs = 800
 
-    /// Backspaces after the keypad is up: clears a half-typed code.
+    /// Backspaces after the keypad is up: clears a half-typed code. A long
+    /// custom code gets one more than its length, so no leftover survives.
     public static let clearCount = 8
 
     /// HID usage for Backspace ("Delete" on a Mac keyboard).
@@ -50,7 +51,7 @@ extension HIDKeyboard {
         let backspace = KeyStroke(modifiers: 0, usage: backspaceUsage)
         var open = sequence([backspace])
         open[open.count - 1].delayAfterMs = keypadSettleMs
-        let clear = sequence(Array(repeating: backspace, count: clearCount))
+        let clear = sequence(Array(repeating: backspace, count: max(clearCount, ascii.count + 1)))
         return steps + open + clear + code
     }
 
