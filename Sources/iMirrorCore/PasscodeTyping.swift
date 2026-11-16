@@ -45,14 +45,25 @@ extension HIDKeyboard {
     /// only opened the keypad, so 3 of 4 digits arrived. Backspace opens
     /// it instead, and deletes nothing when it is already empty.
     public static func wakeThenPasscode(ascii: [UInt8]) -> [KeyStep]? {
-        guard let code = passcodeReports(ascii: ascii) else { return nil }
-        var steps = wakeReports()
+        guard let rest = passcodeAfterWake(ascii: ascii) else { return nil }
+        var steps = wakeOnly()
         steps[steps.count - 1].delayAfterMs = wakeSettleMs
+        return steps + rest
+    }
+
+    /// Shift only. Harmless on any screen, so auto-unlock sends it alone
+    /// and probes the lock again before any digit goes out.
+    public static func wakeOnly() -> [KeyStep] { wakeReports() }
+
+    /// Backspace to open the keypad, a wait, Backspaces to clear, then the
+    /// code. Nil when the code is empty or has a character with no key.
+    public static func passcodeAfterWake(ascii: [UInt8]) -> [KeyStep]? {
+        guard let code = passcodeReports(ascii: ascii) else { return nil }
         let backspace = KeyStroke(modifiers: 0, usage: backspaceUsage)
         var open = sequence([backspace])
         open[open.count - 1].delayAfterMs = keypadSettleMs
         let clear = sequence(Array(repeating: backspace, count: max(clearCount, ascii.count + 1)))
-        return steps + open + clear + code
+        return open + clear + code
     }
 
     /// Zero every report in place once sent: they spell the passcode.

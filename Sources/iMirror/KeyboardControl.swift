@@ -78,6 +78,9 @@ final class KeyboardControl {
                 try await t.type(reports, to: pair)
                 return (.typedTest, text.count)
             }
+        case .autoOn, .autoOff:
+            // Auto-unlock is not wired up yet: refuse rather than pretend.
+            log(r.udid, .failed, .unknownAction, transport: pair?.transport)
         }
     }
 

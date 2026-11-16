@@ -144,3 +144,86 @@ final class KeyboardEventTests: XCTestCase {
         XCTAssertFalse(line.contains("chars"))
     }
 }
+
+/// Auto-unlock on and off through a request file. A file may switch it,
+/// never carry the passcode.
+final class AutoUnlockRequestTests: XCTestCase {
+    private let udid = "00008140-0006423002D3401C"
+    private let at = "2026-11-14T10:00:00.000Z"
+    private let now = Date(timeIntervalSince1970: 1_794_650_400)
+
+    private func read(_ obj: [String: Any]) -> KeyboardRequestFile.Read {
+        KeyboardRequestFile.read(fileName: "keyboard-\(udid).json",
+                                 data: try! JSONSerialization.data(withJSONObject: obj))
+    }
+
+    private func base(_ action: String, _ extra: [String: Any] = [:]) -> [String: Any] {
+        ["udid": udid, "requested_at": at, "requested_by": "imirror-ctl", "action": action].merging(extra) { _, b in b }
+    }
+
+    func testAutoOnAndOffParse() {
+        guard case .request(let on) = read(base("auto_on")) else { return XCTFail("auto_on") }
+        XCTAssertEqual(on.action, .autoOn)
+        XCTAssertNil(on.text)
+        guard case .request(let off) = read(base("auto_off")) else { return XCTFail("auto_off") }
+        XCTAssertEqual(off.action, .autoOff)
+    }
+
+    func testTextIsRefused() {
+        XCTAssertEqual(read(base("auto_on", ["text": "hello"])), .refused(udid: udid, .badText))
+        XCTAssertEqual(read(base("auto_off", ["text": "222222"])), .refused(udid: udid, .badText))
+    }
+
+    func testAPasscodeKeyIsRefused() {
+        XCTAssertEqual(read(base("auto_on", ["passcode": "222222"])), .refused(udid: udid, .badRequest))
+    }
+
+    private func req(_ action: KeyboardAction, age: TimeInterval = 1) -> KeyboardRequest {
+        KeyboardRequest(udid: udid, requestedAt: now.addingTimeInterval(-age), requestedBy: "t", action: action)
+    }
+
+    func testAutoOnNeedsThePhoneAttachedAndPaired() {
+        XCTAssertNil(KeyboardRequestGate.refusal(req(.autoOn), attached: true, paired: true, wallNow: now))
+        XCTAssertEqual(KeyboardRequestGate.refusal(req(.autoOn), attached: false, paired: true, wallNow: now),
+                       .notAttached)
+        XCTAssertEqual(KeyboardRequestGate.refusal(req(.autoOn), attached: true, paired: false, wallNow: now),
+                       .notPaired)
+    }
+
+    func testAutoOffAlwaysGoes() {
+        XCTAssertNil(KeyboardRequestGate.refusal(req(.autoOff), attached: false, paired: false, wallNow: now))
+    }
+
+    func testStaleAutoRequestsAreRefused() {
+        for a in [KeyboardAction.autoOn, .autoOff] {
+            XCTAssertEqual(KeyboardRequestGate.refusal(req(a, age: 121), attached: true, paired: true, wallNow: now),
+                           .stale)
+        }
+    }
+
+    func testTheContractNamesAreStable() {
+        XCTAssertEqual(KeyboardAction.autoOn.rawValue, "auto_on")
+        XCTAssertEqual(KeyboardAction.autoOff.rawValue, "auto_off")
+        XCTAssertEqual([KeyboardEventDetail.autoOn, .autoOff, .autoWake, .autoTyped, .autoUnlocked, .autoFailed,
+                        .autoAborted].map(\.rawValue),
+                       ["auto_on", "auto_off", "auto_wake", "auto_typed", "auto_unlocked", "auto_failed",
+                        "auto_aborted"])
+        XCTAssertEqual(AutoUnlockReason.allCases.map(\.rawValue),
+                       ["settings", "request", "still_locked", "unverified", "interrupted",
+                        "unlocked_before_typing", "lock_unknown", "probe_timeout"])
+        XCTAssertEqual(AutoUnlockState.offAfterFailure.rawValue, "off_after_failure")
+    }
+
+    func testTheAutoTypedLineHasACountAndNoText() throws {
+        let e = DeviceEvent.keyboard(at: Date(timeIntervalSince1970: 0), udid: udid, alias: "phone2", .autoTyped,
+                                     reason: nil, chars: 6, probeAgeMs: 900, sendMs: 4200, transport: .dongle)
+        let line = DeviceEventCodec.line(e)
+        let obj = try JSONSerialization.jsonObject(with: line) as! [String: Any]
+        XCTAssertEqual(Set(obj.keys), ["ts", "udid", "alias", "event", "detail", "chars", "probe_age_ms", "send_ms",
+                                       "transport"])
+        XCTAssertEqual(obj["detail"] as? String, "auto_typed")
+        XCTAssertEqual(obj["chars"] as? Int, 6)
+        XCTAssertEqual(obj["probe_age_ms"] as? Int, 900)
+        XCTAssertFalse(String(decoding: line, as: UTF8.self).contains("222222"))
+    }
+}

@@ -143,3 +143,49 @@ final class HIDKeyboardTests: XCTestCase {
         }
     }
 }
+
+/// Auto-unlock sends the wake alone, probes the lock, then the rest.
+final class PasscodeSplitTests: XCTestCase {
+    private let code = Array("222222".utf8)
+    private let backspace: [UInt8] = [0, 0, HIDKeyboard.backspaceUsage, 0, 0, 0, 0, 0]
+
+    func testWakeOnlyIsTheWake() {
+        XCTAssertEqual(HIDKeyboard.wakeOnly(), HIDKeyboard.wakeReports())
+    }
+
+    func testTheTwoHalvesMakeTheClickSequence() throws {
+        var wake = HIDKeyboard.wakeOnly()
+        wake[wake.count - 1].delayAfterMs = HIDKeyboard.wakeSettleMs
+        let rest = try XCTUnwrap(HIDKeyboard.passcodeAfterWake(ascii: code))
+        XCTAssertEqual(wake + rest, HIDKeyboard.wakeThenPasscode(ascii: code))
+        XCTAssertNotEqual(HIDKeyboard.wakeOnly().last?.delayAfterMs, HIDKeyboard.wakeSettleMs,
+                          "only the click path waits 600 ms inside one SEND")
+    }
+
+    func testANumericCodeStartsWithBackspaceAndHasNoReturn() throws {
+        let steps = try XCTUnwrap(HIDKeyboard.passcodeAfterWake(ascii: code))
+        XCTAssertEqual(steps.first?.report, backspace)
+        XCTAssertEqual(steps[1].delayAfterMs, HIDKeyboard.keypadSettleMs)
+        XCTAssertFalse(steps.contains { $0.report[2] == HIDKeyboard.returnUsage })
+    }
+
+    func testACustomCodeEndsWithReturn() throws {
+        let steps = try XCTUnwrap(HIDKeyboard.passcodeAfterWake(ascii: Array("abcd12".utf8)))
+        XCTAssertEqual(steps[steps.count - 2].report[2], HIDKeyboard.returnUsage)
+    }
+
+    func testTheClearCountIsAtLeastEightOrLengthPlusOne() throws {
+        func backspaces(_ s: String) throws -> Int {
+            try XCTUnwrap(HIDKeyboard.passcodeAfterWake(ascii: Array(s.utf8))).filter { $0.report == backspace }.count
+        }
+        XCTAssertEqual(try backspaces("2222"), 1 + 8)
+        XCTAssertEqual(try backspaces("222222"), 1 + 8)
+        XCTAssertEqual(try backspaces("abcdefghij"), 1 + 11)
+    }
+
+    func testEmptyOrNonASCIIGivesNothing() {
+        XCTAssertNil(HIDKeyboard.passcodeAfterWake(ascii: []))
+        XCTAssertNil(HIDKeyboard.passcodeAfterWake(ascii: [0xC3, 0xA9]))
+        XCTAssertNil(HIDKeyboard.passcodeAfterWake(ascii: [0x07]))
+    }
+}

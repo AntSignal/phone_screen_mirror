@@ -46,18 +46,22 @@ public struct RegisteredDevice: Codable, Equatable, Sendable {
     public var lastError: String?
     /// When a given-up phone retries by itself (UTC ISO-8601).
     public var nextRetryAt: String?
+    /// `AutoUnlockState` raw value, only for a phone with a keyboard
+    /// pairing. A String so an unknown value never fails a reader.
+    public var autoUnlock: String?
 
     public init(udid: String, alias: String, kind: Kind, productType: String? = nil,
                 iosVersion: String? = nil, connection: String? = nil, slot: Int? = nil,
                 wdaURL: String, mjpegPort: Int? = nil, state: State, detail: String? = nil,
                 reason: String? = nil, stateSince: String? = nil, chainEpoch: Int? = nil,
-                lastError: String? = nil, nextRetryAt: String? = nil) {
+                lastError: String? = nil, nextRetryAt: String? = nil, autoUnlock: String? = nil) {
         self.udid = udid; self.alias = alias; self.kind = kind
         self.productType = productType; self.iosVersion = iosVersion
         self.connection = connection; self.slot = slot; self.wdaURL = wdaURL
         self.mjpegPort = mjpegPort; self.state = state; self.detail = detail
         self.reason = reason; self.stateSince = stateSince; self.chainEpoch = chainEpoch
         self.lastError = lastError; self.nextRetryAt = nextRetryAt
+        self.autoUnlock = autoUnlock
     }
 
     enum CodingKeys: String, CodingKey {
@@ -70,6 +74,7 @@ public struct RegisteredDevice: Codable, Equatable, Sendable {
         case chainEpoch = "chain_epoch"
         case lastError = "last_error"
         case nextRetryAt = "next_retry_at"
+        case autoUnlock = "auto_unlock"
     }
 }
 

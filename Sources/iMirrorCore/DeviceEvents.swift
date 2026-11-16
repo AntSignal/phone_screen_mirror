@@ -43,12 +43,16 @@ public struct DeviceReasonInputs: Equatable, Sendable {
     /// The ladder has restarted something for this outage.
     public var restarting: Bool
     public var everConnected: Bool
+    /// A recent lock probe said the phone is locked (LockProbe.swift).
+    public var locked: Bool
 
     public init(ready: Bool, runwda: RunwdaLogClass? = nil, gaveUp: Bool = false, macAsleep: Bool = false, usbReset: Bool = false,
-                tunnelHasDevice: Bool = true, restarting: Bool = false, everConnected: Bool = false) {
+                tunnelHasDevice: Bool = true, restarting: Bool = false, everConnected: Bool = false,
+                locked: Bool = false) {
         self.ready = ready; self.runwda = runwda; self.gaveUp = gaveUp; self.macAsleep = macAsleep
         self.usbReset = usbReset; self.tunnelHasDevice = tunnelHasDevice
         self.restarting = restarting; self.everConnected = everConnected
+        self.locked = locked
     }
 }
 
@@ -57,6 +61,8 @@ public struct DeviceReasonInputs: Equatable, Sendable {
 public func deviceReason(_ i: DeviceReasonInputs) -> DeviceReason? {
     if i.ready { return nil }
     if let r = i.runwda { return r.reason }   // a person can fix it now
+    // A locked phone explains every other symptom below.
+    if i.locked { return .locked }
     if i.gaveUp { return .gaveUp }
     if i.macAsleep { return .macAsleep }
     if i.usbReset { return .usbReset }
@@ -105,6 +111,8 @@ public enum DeviceEventKind: String, Sendable {
     case runnerUpgrade = "runner_upgrade"
     /// The Bluetooth keyboard paired, linked or typed (KeyboardRequests.swift).
     case keyboard
+    /// The lock probe saw the phone lock or unlock (detail locked|unlocked).
+    case lock
 }
 
 /// One line of events.jsonl.
@@ -124,6 +132,16 @@ public struct DeviceEvent: Encodable, Equatable, Sendable {
     public var chars: Int?
     /// Keyboard events: "dongle" or "corebluetooth".
     public var transport: String?
+    /// auto_typed: how old the lock reading was when typing began (ms).
+    public var probeAgeMs: Int?
+    /// auto_typed: how long the passcode SEND took (ms).
+    public var sendMs: Int?
+
+    enum CodingKeys: String, CodingKey {
+        case ts, udid, alias, event, from, to, reason, detail, expected, chars, transport
+        case probeAgeMs = "probe_age_ms"
+        case sendMs = "send_ms"
+    }
 
     public init(at date: Date, udid: String, alias: String, event: DeviceEventKind,
                 from: String? = nil, to: String? = nil, reason: String? = nil,

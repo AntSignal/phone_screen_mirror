@@ -4,7 +4,7 @@ import Foundation
 // requests/keyboard-<udid>.json, and the app pairs, tests or forgets the
 // Bluetooth keyboard for that phone. The README's "Files other tools read"
 // is the contract. A file can be written by anyone who can write the folder,
-// so nothing here can type a passcode: only a click in Settings does that.
+// so a file can turn auto-unlock on or off, never carry or type a passcode.
 
 public enum KeyboardAction: String, Sendable, CaseIterable {
     /// Open a pairing window for this phone.
@@ -13,6 +13,10 @@ public enum KeyboardAction: String, Sendable, CaseIterable {
     case forget
     /// Type harmless test text into this phone.
     case test
+    /// Let iMirror type this phone's passcode when it finds it locked.
+    case autoOn = "auto_on"
+    /// Stop that. Always allowed.
+    case autoOff = "auto_off"
 }
 
 public struct KeyboardRequest: Equatable, Sendable {
@@ -108,7 +112,7 @@ public enum KeyboardRequestFile {
         case .test:
             guard let t = obj["text"] as? String, isAllowedTestText(t) else { return .refused(udid: udid, .badText) }
             text = t
-        case .pair, .forget:
+        case .pair, .forget, .autoOn, .autoOff:
             guard obj["text"] == nil else { return .refused(udid: udid, .badText) }
         }
         let by = (obj["requested_by"] as? String) ?? "?"
@@ -125,13 +129,15 @@ public enum KeyboardRequestGate {
 
     /// Whether to act on `r` now; nil means go. Pairing needs the phone on
     /// USB, so a typo can't tie a central to a phone that isn't here. A test
-    /// needs a pairing. Forget always goes, even for a phone long gone.
+    /// needs a pairing, and so does turning auto-unlock on. Forget and
+    /// auto off always go, even for a phone long gone.
     public static func refusal(_ r: KeyboardRequest, attached: Bool, paired: Bool, wallNow: Date) -> KeyboardFailure? {
         if abs(wallNow.timeIntervalSince(r.requestedAt)) > maxAgeSec { return .stale }
         switch r.action {
         case .pair: return attached ? nil : .notAttached
         case .test: return paired ? nil : .notPaired
-        case .forget: return nil
+        case .autoOn: return !attached ? .notAttached : (paired ? nil : .notPaired)
+        case .forget, .autoOff: return nil
         }
     }
 }
@@ -141,6 +147,19 @@ public enum KeyboardEventDetail: String, Sendable, CaseIterable {
     case paired, ambiguous, timeout, connected, disconnected, failed, forgotten
     case typedTest = "typed_test"
     case typedPasscode = "typed_passcode"
+    /// Auto-unlock was turned on or off (reason: who or why).
+    case autoOn = "auto_on"
+    case autoOff = "auto_off"
+    /// Auto-unlock sent the wake (Shift) to a locked phone.
+    case autoWake = "auto_wake"
+    /// Auto-unlock typed the passcode; `chars` is its length.
+    case autoTyped = "auto_typed"
+    /// A reading after typing showed the phone unlocked.
+    case autoUnlocked = "auto_unlocked"
+    /// The attempt failed and turned auto-unlock off.
+    case autoFailed = "auto_failed"
+    /// The attempt stopped before any digit went out.
+    case autoAborted = "auto_aborted"
 
     /// What a pairing window's outcome is logged as.
     public init(_ outcome: PairingOutcome) {
@@ -159,5 +178,17 @@ extension DeviceEvent {
                                 transport: KeyboardTransportKind? = nil) -> DeviceEvent {
         DeviceEvent(at: date, udid: udid, alias: alias, event: .keyboard, reason: reason?.rawValue,
                     detail: detail.rawValue, chars: chars, transport: transport?.rawValue)
+    }
+
+    /// The same, with a raw reason: auto-unlock reasons are not
+    /// KeyboardFailures. The timings are milliseconds, numbers only.
+    public static func keyboard(at date: Date, udid: String, alias: String, _ detail: KeyboardEventDetail,
+                                reason: String?, chars: Int? = nil, probeAgeMs: Int? = nil, sendMs: Int? = nil,
+                                transport: KeyboardTransportKind? = nil) -> DeviceEvent {
+        var e = DeviceEvent(at: date, udid: udid, alias: alias, event: .keyboard, reason: reason,
+                            detail: detail.rawValue, chars: chars, transport: transport?.rawValue)
+        e.probeAgeMs = probeAgeMs
+        e.sendMs = sendMs
+        return e
     }
 }
