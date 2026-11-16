@@ -229,8 +229,9 @@ def test_still_recovering_after_the_budget_says_when_to_retry(dead, monkeypatch)
     assert "since 2026-11-13T10:00:00Z" in str(e.value)
 
 
-@pytest.mark.parametrize("reason,where", [("needs_passcode", "Enable UI Automation"),
-                                          ("locked", "Lock Screen")])
+# Only a lock can be auto-unlocked; the sheet is never typed by itself.
+@pytest.mark.parametrize("reason,where", [("needs_passcode", "never types that by itself"),
+                                          ("locked", "turned on auto-unlock")])
 def test_a_phone_waiting_for_its_passcode_fails_at_once(dead, reason, where):
     m, app = dead
     app.write("starting", reason=reason, chain_epoch=2)
@@ -240,7 +241,8 @@ def test_a_phone_waiting_for_its_passcode_fails_at_once(dead, reason, where):
     assert time.monotonic() - t0 < 1            # nothing to wait for
     assert e.value.error_code == "NEEDS_PASSCODE"
     assert where in str(e.value)
-    assert "iMirror types it" in str(e.value) and "a person must enter" in str(e.value)
+    assert "Type passcode now" in str(e.value)
+    assert "never type a passcode yourself" in str(e.value)
 
 
 def test_a_passcode_prompt_during_the_wait_ends_it(dead):
