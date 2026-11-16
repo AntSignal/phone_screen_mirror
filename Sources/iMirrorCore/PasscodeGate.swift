@@ -199,11 +199,16 @@ public struct PasscodeGate: Equatable, Sendable {
         record.disable(reason: .stillLocked, by: .failure, at: wallNow)
     }
 
-    /// A person's clicked passcode went out. It spends this episode's
-    /// try and counts toward the gap and the cap, since it read the same
-    /// file: a wrong click must not be followed by the same wrong value.
-    public mutating func clickTyped(wallNow: Date) {
-        record.episodeAttempted = true
+    /// A person's clicked passcode went out. It read the same file, so a
+    /// wrong click must not be followed by the same wrong value: it
+    /// always counts toward the gap and the cap, and it spends this
+    /// episode's try when the phone was being read as locked. (A click
+    /// on an unlocked phone has no episode to spend; spending one would
+    /// block the next lock's try until an unlocked reading.)
+    public mutating func clickTyped(wallNow: Date, now: TimeInterval) {
+        if let l = watch.latest, l.reading != .unlocked, now - l.startedAt <= AutoUnlockTiming.lockFreshSec {
+            record.episodeAttempted = true
+        }
         record.prune(wallNow: wallNow)
         record.attempts.append(wallNow)
         record.attempts = Array(record.attempts.suffix(AutoUnlockRecord.maxKeptAttempts))
