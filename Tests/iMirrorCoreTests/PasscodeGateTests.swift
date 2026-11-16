@@ -483,7 +483,7 @@ final class PasscodeGateEpisodeTests: XCTestCase {
         var g = PasscodeGate(udid: udid, history: on())
         g.reading(.locked, startedAt: 0)
         g.reading(.locked, startedAt: 8)
-        g.clickTyped(wallNow: w(10))
+        g.clickTyped(wallNow: w(10), now: 10)
         g.reading(.locked, startedAt: 25)
         XCTAssertEqual(g.decide(ok, now: 25.2, wallNow: w(25.2)), .nothing(.triedThisEpisode))
         XCTAssertEqual(g.record.attempts, [w(10)])
@@ -511,8 +511,24 @@ final class PasscodeGateEpisodeTests: XCTestCase {
         var off = PasscodeGate(udid: udid, history: AutoUnlockRecord())
         off.reading(.locked, startedAt: 0)
         XCTAssertFalse(off.mayStillAct(now: 30), "auto-unlock off: a locked phone needs a person")
-        g.clickTyped(wallNow: w(1))
+        g.clickTyped(wallNow: w(1), now: 1)
         XCTAssertFalse(g.mayStillAct(now: 30), "episode spent")
+    }
+
+    /// No lock being read: the click still counts toward the gap, but
+    /// leaves the next lock its try.
+    func testAClickOnAnUnreadPhoneOnlyCountsTowardTheGap() {
+        var g = PasscodeGate(udid: udid, history: on())
+        g.clickTyped(wallNow: w(0), now: 0)
+        XCTAssertFalse(g.record.episodeAttempted)
+        XCTAssertEqual(g.record.attempts, [w(0)])
+        var h = PasscodeGate(udid: udid, history: on())
+        h.reading(.locked, startedAt: 0)
+        h.clickTyped(wallNow: w(16), now: 16)   // that reading is too old
+        XCTAssertFalse(h.record.episodeAttempted)
+        g.reading(.locked, startedAt: 200)
+        g.reading(.locked, startedAt: 230)
+        XCTAssertEqual(g.decide(ok, now: 230.2, wallNow: w(230.2)), .wake)
     }
 
     func testAFailedClickTurnsAutoOff() {
