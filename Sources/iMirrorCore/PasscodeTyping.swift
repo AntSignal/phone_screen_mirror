@@ -5,9 +5,18 @@ import Foundation
 // HIDKeyboard.passcodeReports.
 
 extension HIDKeyboard {
-    /// Time from the Shift wake to the first digit, so the lock screen's
-    /// keypad is up before typing starts.
+    /// Time from the Shift wake to the first Backspace.
     public static let wakeSettleMs = 600
+
+    /// Time for the keypad to slide up after the first Backspace.
+    public static let keypadSettleMs = 800
+
+    /// Backspaces after the keypad is up: clears a half-typed code. A long
+    /// custom code gets one more than its length, so no leftover survives.
+    public static let clearCount = 8
+
+    /// HID usage for Backspace ("Delete" on a Mac keyboard).
+    public static let backspaceUsage: UInt8 = 0x2A
 
     /// The strokes for ASCII bytes, or nil when one byte has no key.
     public static func strokes(ascii: [UInt8]) -> [KeyStroke]? {
@@ -30,13 +39,20 @@ extension HIDKeyboard {
         return sequence(keys, holdMs: holdMs, gapMs: gapMs)
     }
 
-    /// Shift to wake the phone, a pause, then the passcode. Nil when the
-    /// passcode is empty or has a byte with no key.
+    /// Shift to wake the phone, Backspaces to open and empty the keypad,
+    /// then the passcode. Nil when the passcode is empty or untypeable.
+    /// Bug fix (16e, 2026-11-15): Shift lit the screen but the first digit
+    /// only opened the keypad, so 3 of 4 digits arrived. Backspace opens
+    /// it instead, and deletes nothing when it is already empty.
     public static func wakeThenPasscode(ascii: [UInt8]) -> [KeyStep]? {
         guard let code = passcodeReports(ascii: ascii) else { return nil }
         var steps = wakeReports()
         steps[steps.count - 1].delayAfterMs = wakeSettleMs
-        return steps + code
+        let backspace = KeyStroke(modifiers: 0, usage: backspaceUsage)
+        var open = sequence([backspace])
+        open[open.count - 1].delayAfterMs = keypadSettleMs
+        let clear = sequence(Array(repeating: backspace, count: max(clearCount, ascii.count + 1)))
+        return steps + open + clear + code
     }
 
     /// Zero every report in place once sent: they spell the passcode.
