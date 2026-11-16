@@ -242,8 +242,11 @@ final class SerialDongleKeyboard: KeyboardTransport {
     }
 
     /// One SEND per chunk; a long text may reconnect between chunks.
+    /// `beforeFirstKey` is never called: the first key leaves inside a
+    /// SEND, after a reconnect of up to 15 s. Callers bound its age from
+    /// the SEND's timing instead (FirstKeyAge).
     /// Never logs the steps: they may spell a passcode.
-    func type(_ steps: [KeyStep], to pair: KeyboardPair) async throws {
+    func type(_ steps: [KeyStep], to pair: KeyboardPair, beforeFirstKey: FirstKeyCheck?) async throws {
         guard let slot = pair.slot else { throw DongleError.failed(.notPaired) }
         let sends = try await runJob { port, _ in
             // Built here so the only copy is wiped here.

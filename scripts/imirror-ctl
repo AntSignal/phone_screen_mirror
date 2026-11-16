@@ -5,10 +5,12 @@
   imirror-ctl restart <device> [--wait S]
   imirror-ctl events [--device D] [--since 1h] [--json]
   imirror-ctl keyboard pair|forget|test|status <device> [text]
+  imirror-ctl keyboard auto on|off|status <device>
 
 It only reads the files the app publishes (devices.json, events.jsonl,
 keyboard-pairs.json) and writes restart and keyboard requests, as the
-README's "Files other tools read" describes. It never handles a passcode.
+README's "Files other tools read" describes. It never handles a passcode:
+`keyboard auto on` only lets the app type the one in its own passcode file.
 Standard library only, so it runs on the system python3 (3.9).
 
 Exit codes: 0 ok / accepted, 1 error, 2 usage, 3 cooldown, 4 timeout.
@@ -25,7 +27,7 @@ from datetime import datetime, timedelta, timezone
 DEFAULT_DEVICES = "~/Library/Application Support/iMirror/devices.json"
 RESTART_WAIT_S = 30.0
 # App: 120 s pairing window, picked up within 5 s.
-KEYBOARD_WAIT_S = {"pair": 130.0, "forget": 30.0, "test": 30.0}
+KEYBOARD_WAIT_S = {"pair": 130.0, "forget": 30.0, "test": 30.0, "auto_on": 30.0, "auto_off": 30.0}
 # The app's rule: lower-case words and digits, with at least one letter
 # and at most three digits, so test text is never a passcode attempt.
 TEST_TEXT = re.compile(r"(?=.*[a-z])(?!(?:[^0-9]*[0-9]){4})[a-z0-9 ]{1,32}")
@@ -34,7 +36,16 @@ KEYBOARD_ANSWERS = {
     "pair": {"paired", "ambiguous", "timeout", "failed"},
     "forget": {"forgotten", "failed"},
     "test": {"typed_test", "failed"},
+    "auto_on": {"auto_on", "failed"},
+    "auto_off": {"auto_off", "failed"},
 }
+# An auto on/off request is answered only by its own detail with reason
+# "request", or by a failure the request gate or precheck gives. An
+# automatic try's own failures (busy, send_failed) answer nothing.
+AUTO_REQUEST_FAILURES = {"bad_request", "unknown_action", "bad_text", "stale", "not_attached", "not_paired",
+                         "no_file", "no_passcode", "untypeable"}
+# What `keyboard auto status` shows: auto-unlock and lock events.
+AUTO_DETAILS = {"auto_on", "auto_off", "auto_wake", "auto_typed", "auto_unlocked", "auto_failed", "auto_aborted"}
 
 
 class CtlError(Exception):
@@ -169,7 +180,7 @@ def format_device(d, pairs=None):
     rows = [("state", d.get("state")), ("reason", d.get("reason")), ("state_since", d.get("state_since")),
             ("chain_epoch", d.get("chain_epoch")), ("next_retry_at", d.get("next_retry_at")),
             ("last_error", d.get("last_error")), ("detail", d.get("detail")),
-            ("keyboard", describe_pair((pairs or {}).get(d.get("udid"))))]
+            ("keyboard", describe_pair((pairs or {}).get(d.get("udid")))), ("auto_unlock", d.get("auto_unlock"))]
     lines = [f"{d.get('alias')} ({d.get('udid')}, {d.get('kind', 'device')})"]
     lines += [f"  {k:<14}{'-' if v is None else v}" for k, v in rows]
     return "\n".join(lines)
@@ -268,12 +279,24 @@ def read_pairs(folder):
     return {k: v for k, v in data.items() if isinstance(v, dict)} if isinstance(data, dict) else {}
 
 
+def answers(e, action):
+    """Does keyboard event `e` answer an `action` request?"""
+    detail = e.get("detail")
+    if detail not in KEYBOARD_ANSWERS[action]:
+        return False
+    if action in ("auto_on", "auto_off"):
+        if detail == "failed":
+            return e.get("reason") in AUTO_REQUEST_FAILURES
+        return e.get("reason") == "request"
+    return True
+
+
 def keyboard_outcome(events, udid, since, action):
     """The newest keyboard event after `since` that answers `action`, or None."""
     for e in reversed(events):
         ts = parse_iso(e.get("ts"))
         if (e.get("event") == "keyboard" and e.get("udid") == udid and ts is not None and ts >= since
-                and e.get("detail") in KEYBOARD_ANSWERS[action]):
+                and answers(e, action)):
             return e
     return None
 
@@ -307,6 +330,10 @@ KEYBOARD_HINTS = {
     "bluetooth_unavailable": "Bluetooth is off, or iMirror was refused Bluetooth access (System Settings > Privacy).",
     "dongle_unavailable": "this phone is paired with the USB dongle; plug it in (Settings shows 'dongle connected').",
     "dongle_error": "the dongle did not answer in time; unplug it, plug it back in and try again.",
+    "no_file": "iMirror can't read its passcode file (Settings > iPhones, the field under the phone list).",
+    "no_passcode": "the passcode file has no value for this phone; add <ALIAS>_PASSCODE=... there, then try again.",
+    "untypeable": "the passcode in the file has a character the keyboard can't type.",
+    "not_attached": "the phone must be on USB to turn auto-unlock on.",
 }
 
 
@@ -365,8 +392,8 @@ def main(argv=None):
     e.add_argument("--since", help="90s, 30m, 1h, 2d or ISO-8601")
     e.add_argument("--json", action="store_true")
     k = sub.add_parser("keyboard", help="pair, test or forget iMirror's Bluetooth keyboard for a phone")
-    k.add_argument("action", choices=["pair", "forget", "test", "status"])
-    k.add_argument("device")
+    k.add_argument("action", choices=["pair", "forget", "test", "status", "auto"])
+    k.add_argument("device", help="the phone; for auto: on, off or status, then the phone")
     k.add_argument("text", nargs="?", help="test only: a-z, 0-9 and space; a letter, at most 3 digits")
     k.add_argument("--wait", type=float, help="seconds to wait (default 130 for pair, else 30)")
     k.add_argument("-n", type=int, default=10, help="status: keyboard events to show (default 10)")
@@ -385,7 +412,7 @@ def main(argv=None):
         if not owner_alive(reg):
             print(f"warning: iMirror (pid {reg.get('owner_pid')}) is not running; {path} is stale",
                   file=sys.stderr)
-            if a.cmd == "restart" or (a.cmd == "keyboard" and a.action != "status"):
+            if a.cmd == "restart" or (a.cmd == "keyboard" and not is_status(a)):
                 return 1
         devices = reg["devices"]
         if a.cmd == "keyboard":
@@ -420,7 +447,43 @@ def main(argv=None):
         return 1
 
 
+def is_status(a):
+    return a.action == "status" or (a.action == "auto" and a.device == "status")
+
+
+def format_auto_status(dev, events):
+    lines = [f"{dev.get('alias')} ({dev.get('udid')})", f"  auto_unlock   {dev.get('auto_unlock') or '-'}",
+             f"  reason        {dev.get('reason') or '-'}", f"last {len(events)} auto-unlock and lock events:"]
+    lines += ["  " + format_event(e) for e in events] or ["  (none)"]
+    return "\n".join(lines)
+
+
+def auto_main(a, devices, folder):
+    """keyboard auto on|off|status <device>. Takes no passcode: the app
+    types the one in its own passcode file, and only when it finds the
+    phone locked."""
+    if a.device not in ("on", "off", "status") or not a.text:
+        raise CtlError("usage: imirror-ctl keyboard auto on|off|status <device>")
+    pairs = read_pairs(folder)
+    d = keyboard_device(a.text, devices, pairs)
+    if d.get("kind") == "simulator":
+        raise CtlError(f"{d.get('alias')} is a Simulator; auto-unlock is for phones")
+    if a.device == "status":
+        evs = [e for e in read_events(folder, d["udid"])
+               if e.get("event") == "lock" or (e.get("event") == "keyboard" and e.get("detail") in AUTO_DETAILS)]
+        print(format_auto_status(d, evs[-max(a.n, 0):] if a.n > 0 else []))
+        return 0
+    action = "auto_" + a.device
+    answer = keyboard(d["udid"], folder, action, wait_s=a.wait)
+    print(describe_keyboard(d.get("alias"), answer))
+    if answer is None:
+        return 4
+    return 0 if answer.get("detail") == action else 1
+
+
 def keyboard_main(a, devices, folder):
+    if a.action == "auto":
+        return auto_main(a, devices, folder)
     pairs = read_pairs(folder)
     d = keyboard_device(a.device, devices, pairs)
     if d.get("kind") == "simulator":

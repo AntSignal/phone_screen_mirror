@@ -126,5 +126,11 @@ public func validateAlias(_ alias: String, forUDID udid: String, in table: SlotT
     let hex = CharacterSet(charactersIn: "0123456789abcdef-")
     if alias.count >= 4, alias.unicodeScalars.allSatisfy({ hex.contains($0) }) { return .looksLikeUDID }
     if let owner = table.udid(forAlias: alias), owner != udid { return .taken(byUDID: owner) }
+    // phone-2 and phone_2 would read one PHONE_2_PASSCODE.
+    if let key = PasscodeLookup.key(alias: alias), let owner = table.entries.first(where: {
+        $0.key != udid && PasscodeLookup.key(alias: $0.value.alias) == key
+    })?.key {
+        return .taken(byUDID: owner)
+    }
     return nil
 }

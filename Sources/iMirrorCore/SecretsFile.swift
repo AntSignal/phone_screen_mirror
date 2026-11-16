@@ -1,7 +1,7 @@
 import Foundation
 
 // SecretsFile — reads one phone's passcode from a dotenv-style file for
-// Settings → "Type passcode now". The value must never reach a log, an
+// Settings → "Type passcode now" and for auto-unlock. The value must never reach a log, an
 // event, argv or a description, so it is kept as bytes in SecretBytes, which
 // prints as a count and is zeroed when done. Swift may still leave copies
 // (Data, temporaries); zeroing only shortens how long the value sits around.
@@ -118,7 +118,8 @@ public enum PasscodeLookup {
     }
 
     /// The short key people write: phone2 -> PHONE2_PASSCODE. Safe because
-    /// an alias belongs to one UDID at a time (validateAlias).
+    /// validateAlias refuses an alias whose key another phone's alias has,
+    /// and a rename turns that phone's auto-unlock off.
     public static func key(alias: String) -> String? {
         let name = alias.uppercased().replacingOccurrences(of: "-", with: "_")
         guard name.range(of: "^[A-Z][A-Z0-9_]*$", options: .regularExpression) != nil else { return nil }
