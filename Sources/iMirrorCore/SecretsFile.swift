@@ -1,7 +1,7 @@
 import Foundation
 
 // SecretsFile — reads one phone's passcode from a dotenv-style file for
-// Settings → "Type passcode now". The value must never reach a log, an
+// Settings → "Type passcode now" and for auto-unlock. The value must never reach a log, an
 // event, argv or a description, so it is kept as bytes in SecretBytes, which
 // prints as a count and is zeroed when done. Swift may still leave copies
 // (Data, temporaries); zeroing only shortens how long the value sits around.

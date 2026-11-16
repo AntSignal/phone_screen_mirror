@@ -8,17 +8,29 @@
 import Foundation
 import iMirrorCore
 
+/// Runs just before a transport's first key; false sends nothing.
+typealias FirstKeyCheck = @MainActor @Sendable () -> Bool
+
 @MainActor
 protocol KeyboardTransport: AnyObject {
     var kind: KeyboardTransportKind { get }
     /// Opens a pairing window for `udid`. On `.paired` the tie is saved.
     func pair(udid: String, window: TimeInterval) async throws -> PairingOutcome
-    /// Types to the phone in `pair` and no other.
-    func type(_ steps: [KeyStep], to pair: KeyboardPair) async throws
+    /// Types to the phone in `pair` and no other. `beforeFirstKey` runs
+    /// just before the first key, where the transport can see that
+    /// moment; false sends nothing and throws `.stale`. The dongle can't
+    /// see it (it connects and types inside one SEND), so it never calls it.
+    func type(_ steps: [KeyStep], to pair: KeyboardPair, beforeFirstKey: FirstKeyCheck?) async throws
     /// Drops the transport's own memory of the phone, such as a bond.
     func forget(_ pair: KeyboardPair) async throws
     /// Ends any wait, so the phone gets its on-screen keyboard back.
     func stop()
+}
+
+extension KeyboardTransport {
+    func type(_ steps: [KeyStep], to pair: KeyboardPair) async throws {
+        try await type(steps, to: pair, beforeFirstKey: nil)
+    }
 }
 
 /// keyboard-pairs.json, shared by both transports.
@@ -54,9 +66,9 @@ extension BLEKeyboard: KeyboardTransport {
         try await startPairing(udid: udid, window: window)
     }
 
-    func type(_ steps: [KeyStep], to pair: KeyboardPair) async throws {
+    func type(_ steps: [KeyStep], to pair: KeyboardPair, beforeFirstKey: FirstKeyCheck?) async throws {
         guard let id = pair.central.flatMap(UUID.init(uuidString:)) else { throw BLEKeyboardError.notConnected }
-        try await type(reports: steps, to: id)
+        try await type(reports: steps, to: id, beforeFirstKey: beforeFirstKey)
     }
 
     /// Nothing to drop: the phone keeps its bond until removed there.

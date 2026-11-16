@@ -1,6 +1,7 @@
-// Only a person's click may type a passcode. These tests read the app's
-// source and fail if anything else starts that path: a timer, a request
-// file or an MCP call that typed a passcode could burn a phone's attempts.
+// A passcode is typed on a person's click, or by auto-unlock's gate for a
+// phone a person opted in. These tests read the app's source and fail if
+// anything else starts either path: a timer, a request file or an MCP call
+// that typed a passcode could burn a phone's attempts.
 
 import AppKit
 import XCTest
@@ -40,6 +41,38 @@ final class PasscodeCallSiteTests: XCTestCase {
         // Nothing calls the action directly; only the button names it.
         XCTAssertEqual(count("typePasscodeClicked", in: main), 2)
         XCTAssertEqual(count("#selector(typePasscodeClicked(_:))", in: main), 1)
+    }
+
+    func testOnlyTheGatesTypeStepTypesAutomatically() throws {
+        var defs: [String] = [], calls: [String] = []
+        for (name, text) in try sources() {
+            let d = count("func typePasscodeAutomatically(", in: text)
+            defs += Array(repeating: name, count: d)
+            calls += Array(repeating: name, count: count("typePasscodeAutomatically(", in: text) - d)
+        }
+        XCTAssertEqual(defs, ["KeyboardControl.swift"])
+        XCTAssertEqual(calls, ["AutoUnlock.swift"], "one call")
+        let driver = try XCTUnwrap(try sources().first { $0.name == "AutoUnlock.swift" }?.text)
+        let typeCase = try XCTUnwrap(driver.range(of: "case .type(let approval):"))
+        let call = try XCTUnwrap(driver.range(of: "typePasscodeAutomatically("))
+        XCTAssertLessThan(typeCase.upperBound, call.lowerBound)
+        XCTAssertFalse(driver[typeCase.upperBound..<call.lowerBound].contains("case "), "inside the .type case")
+    }
+
+    func testOnlyTheCoreMakesAnApproval() throws {
+        for (name, text) in try sources() where !text.contains("public struct AutoTypeApproval") {
+            XCTAssertFalse(text.contains("AutoTypeApproval("), name)
+        }
+    }
+
+    /// The lock probe and the ladder decide when, never with the value.
+    func testTheProbeAndTheLadderNeverSeeTheSecret() throws {
+        for (name, text) in try sources() where ["LockProbe.swift", "DeviceController.swift",
+                                                 "ChainManager.swift"].contains(name) {
+            for word in ["PasscodeLookup", "SecretBytes", "PasscodeFile", "passcodeFile", "SecretsFile"] {
+                XCTAssertFalse(text.contains(word), "\(name) mentions \(word)")
+            }
+        }
     }
 
     func testThePasscodeIsReadInOnePlaceOnly() throws {

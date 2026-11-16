@@ -53,6 +53,14 @@ final class DeviceController {
     private var timer: Timer?
     private var running = false
 
+    /// Lock readings (iMirrorCore/LockProbe.swift); drive the lock hold.
+    private(set) var lockWatch = LockWatch()
+    private var lockProbing = false
+    private var lastLockProbeAt: TimeInterval?
+    /// Bumped when a hung probe is given up on; its late answer is dropped.
+    private var lockProbeEpoch = 0
+    private var lockTimer: Timer?
+
     // Wired by ChainManager.
     /// Is any OTHER phone connected right now? (The tunnel is shared, so
     /// restarting it costs them their WDA.)
@@ -62,6 +70,16 @@ final class DeviceController {
     /// Ask for the shared tunnel (and so every chain) to restart. False when
     /// its cooldown refused, so nothing was restarted.
     var requestTunnelRestart: () -> Bool = { false }
+    /// Runs one lock probe off main and answers on main. Nil: no go-ios.
+    var probeLock: ((@escaping (LockReading) -> Void) -> Void)?
+    /// Every lock reading, after this controller has noted it.
+    var onLockReading: ((LockReading, TimeInterval) -> Void)?
+    /// Who unlocked the phone: "auto", "click" or "other".
+    var unlockCause: () -> String = { "other" }
+    /// devices.json auto_unlock; nil for a phone with no keyboard pairing.
+    var autoUnlockState: () -> String? = { nil }
+    /// Where events go. Tests swap it so nothing reaches the real log.
+    var writeEvent: (DeviceEvent) -> Void = { EventLog.shared.write($0) }
 
     // Observed by the window and the device file.
     var onChange: (() -> Void)?
@@ -111,12 +129,17 @@ final class DeviceController {
             RunLoop.main.add(t, forMode: .common)   // keep firing during UI tracking
             self.timer = t
         }
+        let lt = Timer(timeInterval: 1, repeats: true) { [weak self] _ in self?.lockTick() }
+        RunLoop.main.add(lt, forMode: .common)
+        lockTimer = lt
     }
 
     func stop() {
         running = false
         timer?.invalidate()
         timer = nil
+        lockTimer?.invalidate()
+        lockTimer = nil
         chain?.stop()
         let old = health
         health = .down
@@ -209,9 +232,18 @@ final class DeviceController {
 
     // MARK: Device file
 
+    /// A recent lock probe said locked.
+    var isLocked: Bool { lockWatch.isLocked(now: ProcessInfo.processInfo.systemUptime) }
+
     var registryState: RegisteredDevice.State {
-        if ladder.hardStopped || unrecoverable { return .failed }
-        if case .failed = lastRunnerInstall { return .failed }
+        // Locked is waiting for a person or auto-unlock, never failed.
+        let locked = isLocked
+        if (ladder.hardStopped && !locked) || unrecoverable { return .failed }
+        switch lastRunnerInstall {
+        case .failed(.deviceLocked) where locked: break
+        case .failed: return .failed
+        default: break
+        }
         if installingRunner { return .installing }
         switch health {
         case .connected: return .ready
@@ -224,7 +256,7 @@ final class DeviceController {
         deviceReason(DeviceReasonInputs(
             ready: registryState == .ready, runwda: runwdaClass, gaveUp: ladder.hardStopped, macAsleep: macAsleep,
             usbReset: usbResetPending, tunnelHasDevice: chain == nil || tunnelHasDevice(),
-            restarting: ladder.stage >= 1, everConnected: ladder.hadSuccessfulConnection))
+            restarting: ladder.stage >= 1, everConnected: ladder.hadSuccessfulConnection, locked: isLocked))
     }
 
     /// This phone's devices.json entry. Logs a state event when the state
@@ -235,7 +267,7 @@ final class DeviceController {
             log(.state, from: change.from?.rawValue, to: state.rawValue, reason: why,
                 detail: state == .ready ? nil : detail)
         }
-        let retryAt = ladder.nextAutoRetryAt.map {
+        let retryAt = isLocked ? nil : ladder.nextAutoRetryAt.map {
             DeviceRegistryCodec.timestamp(now.addingTimeInterval($0 - ProcessInfo.processInfo.systemUptime))
         }
         return RegisteredDevice(
@@ -243,7 +275,8 @@ final class DeviceController {
             iosVersion: attached.productVersion, connection: attached.connection, slot: slot.index,
             wdaURL: slot.relayURL, mjpegPort: Int(slot.mjpegPort), state: state, detail: detail,
             reason: why?.rawValue, stateSince: published.since.map(DeviceRegistryCodec.timestamp),
-            chainEpoch: chain?.epoch, lastError: lastError, nextRetryAt: retryAt)
+            chainEpoch: chain?.epoch, lastError: lastError, nextRetryAt: retryAt,
+            autoUnlock: autoUnlockState())
     }
 
     // MARK: Mac sleep and wake (rules in iMirrorCore/PowerPolicy.swift)
@@ -273,9 +306,9 @@ final class DeviceController {
 
     private func log(_ kind: DeviceEventKind, from: String? = nil, to: String? = nil,
                      reason: DeviceReason? = nil, detail: String? = nil, expected: Bool? = nil) {
-        EventLog.shared.write(DeviceEvent(at: Date(), udid: udid, alias: alias, event: kind,
-                                          from: from, to: to, reason: reason?.rawValue,
-                                          detail: detail, expected: expected))
+        writeEvent(DeviceEvent(at: Date(), udid: udid, alias: alias, event: kind,
+                               from: from, to: to, reason: reason?.rawValue,
+                               detail: detail, expected: expected))
     }
 
     // MARK: Health probe + recovery ladder
@@ -356,12 +389,35 @@ final class DeviceController {
     /// deadline; this covers the respawns not bringing WDA back.
     private func runWatchdog() {
         guard chain != nil, health == .down else { return }
+        let afterUnlock = ladder.unlockedAt != nil
         let action = ladder.tick(now: ProcessInfo.processInfo.systemUptime,
                                  othersHealthy: othersHealthy(), tunnelHasDevice: tunnelHasDevice(),
-                                 held: chain?.passcodeHeld ?? false)
+                                 held: chain?.passcodeHeld ?? false, locked: isLocked)
         switch action {
-        case .wait, .holdForLock:
-            break   // nothing passes `locked` yet
+        case .wait:
+            break
+        case .holdForLock:
+            // Restarts can't reach a locked phone; the relay stays up.
+            chain?.stopChildren()
+            status("\(alias) is locked — "
+                 + (autoUnlockState() == AutoUnlockState.on.rawValue
+                    ? "auto-unlock is on, so iMirror will type its passcode."
+                    : "unlock it and WebDriverAgent comes back by itself."))
+            onChange?()
+        case .restartDeviceChain where afterUnlock:
+            log(.restart, detail: "unlocked")
+            status("\(alias) is unlocked — restarting its connection…")
+            chain?.restart()
+            onChange?()
+        case .restartTunnelAndChains where afterUnlock:
+            log(.restart, detail: "unlocked")
+            status("\(alias) is unlocked — resetting the USB connection…")
+            if !requestTunnelRestart() {
+                // Cooldown refused: ask again soon, never climb to give-up.
+                chain?.restart()
+                ladder.tunnelRestartRefusedAfterUnlock(now: ProcessInfo.processInfo.systemUptime)
+            }
+            onChange?()
         case .autoRetry:
             log(.autoRetry, detail: "after give-up \(ladder.giveUps)")
             // The new runwda reports its own cause. A stale needs_passcode
@@ -404,6 +460,69 @@ final class DeviceController {
     private func restartOwnOrTunnel(tunnelAllowed: Bool = true) {
         if tunnelHasDevice() || !tunnelAllowed || !requestTunnelRestart() { chain?.restart() }
         onChange?()
+    }
+
+    // MARK: Lock probe (rules in iMirrorCore/LockProbe.swift)
+
+    /// Every 5 s while WDA is down and the Mac awake, take a reading.
+    /// A ready phone is never probed on this schedule.
+    private func lockTick() {
+        guard running else { return }
+        let now = ProcessInfo.processInfo.systemUptime
+        // A probe stuck in the kernel must not stop probing.
+        if lockProbing, now - (lastLockProbeAt ?? now) > AutoUnlockTiming.probeTimeoutSec + 5 {
+            lockProbing = false
+            lockProbeEpoch += 1
+        }
+        if chain != nil, health != .connected, !macAsleep,
+           now - (lastLockProbeAt ?? -.infinity) >= AutoUnlockTiming.probeIntervalSec {
+            probeLockNow()
+        }
+    }
+
+    /// When the probe now running started; nil when none runs.
+    var lockProbeInFlightSince: TimeInterval? { lockProbing ? lastLockProbeAt : nil }
+
+    /// One probe now, unless one is already running for this phone.
+    func probeLockNow() {
+        guard running, let probeLock, !lockProbing else { return }
+        lockProbing = true
+        let startedAt = ProcessInfo.processInfo.systemUptime
+        lastLockProbeAt = startedAt
+        let epoch = lockProbeEpoch
+        probeLock { [weak self] r in
+            guard let self, epoch == self.lockProbeEpoch else { return }
+            self.lockProbing = false
+            guard self.running else { return }
+            self.lockRead(r, startedAt: startedAt)
+        }
+    }
+
+    /// Note a reading. Auto-unlock sees it first, so its own events come
+    /// before the lock event and the restart. An unlock re-arms the
+    /// ladder and restarts the chain at once.
+    func lockRead(_ r: LockReading, startedAt: TimeInterval) {
+        let wasLocked = isLocked
+        let change = lockWatch.record(r, startedAt: startedAt)
+        onLockReading?(r, startedAt)
+        switch change {
+        case .becameLocked?:
+            log(.lock, detail: "locked")
+        case .becameUnlocked?:
+            writeEvent(DeviceEvent(at: Date(), udid: udid, alias: alias, event: .lock,
+                                   reason: unlockCause(), detail: "unlocked"))
+            // With WDA up there is nothing to bring back.
+            if health != .connected { ladder.noteUnlocked(now: ProcessInfo.processInfo.systemUptime) }
+            // Only the lock's own trace; a passcode-sheet hold stays.
+            if runwdaClass == .locked { runwdaClass = nil }
+            if case .failed(.deviceLocked)? = lastRunnerInstall { lastRunnerInstall = nil }
+        case nil:
+            break
+        }
+        if change != nil || wasLocked != isLocked {
+            if health == .down { runWatchdog() }
+            onChange?()
+        }
     }
 
     /// runwda's output named a cause and/or an error (DeviceChain.runwdaSaid).

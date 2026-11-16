@@ -334,3 +334,119 @@ def test_keyboard_refuses_a_simulator_and_a_dead_app(app_dir, capsys):
     write_devices(app_dir / "devices.json", DEVICES, pid=999_999)
     assert ctl.main(["keyboard", "test", "phone1", "hello"]) == 1
     assert not (app_dir / "requests").exists()
+
+
+# ---- keyboard auto: on or off, never a passcode ----
+
+def test_keyboard_auto_requests_carry_only_the_action(tmp_path):
+    for action in ("auto_on", "auto_off"):
+        path = ctl.write_keyboard_request(str(tmp_path), PHONE_16E, NOW, action)
+        body = json.loads(open(path).read())
+        assert body == {"udid": PHONE_16E, "requested_at": "2026-11-13T10:00:00.000Z",
+                        "requested_by": "imirror-ctl", "action": action}
+    with pytest.raises(ctl.CtlError):
+        ctl.write_keyboard_request(str(tmp_path), PHONE_16E, NOW, "auto_on", "222222")
+
+
+class FakeAutoApp:
+    """Plays the app: answers the first wait with one keyboard event."""
+
+    def __init__(self, folder, **answer):
+        self.folder, self.answer, self.seen = folder, answer, None
+
+    def sleep(self, _s):
+        req = self.folder / "requests" / f"keyboard-{PHONE_16E}.json"
+        if self.seen is None and req.exists():
+            self.seen = json.loads(req.read_text())
+            req.unlink()
+            with open(self.folder / "events.jsonl", "a") as f:
+                f.write(ev(ctl.iso(datetime.now(timezone.utc) + timedelta(seconds=1)), PHONE_16E, "keyboard",
+                           **self.answer) + "\n")
+
+
+def run_auto(app_dir, monkeypatch, mode, **answer):
+    fake = FakeAutoApp(app_dir, **answer)
+    monkeypatch.setattr(ctl.time, "sleep", fake.sleep)
+    monkeypatch.setattr(ctl, "keyboard", _with_sleep(ctl.keyboard, fake.sleep))
+    return ctl.main(["keyboard", "auto", mode, "phone1", "--wait", "5"]), fake
+
+
+def _with_sleep(fn, sleep):
+    def wrapped(*a, **kw):
+        kw["sleep"] = sleep
+        return fn(*a, **kw)
+    return wrapped
+
+
+def test_keyboard_auto_on_is_answered_by_auto_on(app_dir, monkeypatch, capsys):
+    code, fake = run_auto(app_dir, monkeypatch, "on", detail="auto_on", reason="request")
+    assert code == 0
+    assert fake.seen["action"] == "auto_on" and set(fake.seen) == {"udid", "requested_at", "requested_by", "action"}
+    assert "auto_on: phone1 (request)" in capsys.readouterr().out
+
+
+def test_keyboard_auto_on_reports_a_refusal(app_dir, monkeypatch, capsys):
+    code, _ = run_auto(app_dir, monkeypatch, "on", detail="failed", reason="no_passcode")
+    assert code == 1
+    assert "no value for this phone" in capsys.readouterr().out
+
+
+def test_an_auto_request_is_answered_only_by_its_own_events():
+    def k(detail, reason):
+        return json.loads(ev("2026-11-13T10:00:01.000Z", PHONE_16E, "keyboard", detail=detail, reason=reason))
+    # An automatic try's failure, or a click's, answers neither.
+    assert ctl.keyboard_outcome([k("failed", "busy"), k("failed", "send_failed")], PHONE_16E, NOW, "auto_on") is None
+    # A failed click logs auto_off still_locked: not this request's answer.
+    assert ctl.keyboard_outcome([k("auto_off", "still_locked")], PHONE_16E, NOW, "auto_off") is None
+    assert ctl.keyboard_outcome([k("auto_off", "renamed")], PHONE_16E, NOW, "auto_off") is None
+    assert ctl.keyboard_outcome([k("auto_on", "request")], PHONE_16E, NOW, "auto_on")["detail"] == "auto_on"
+    assert ctl.keyboard_outcome([k("auto_on", "settings")], PHONE_16E, NOW, "auto_on") is None
+    for why in ("not_paired", "not_attached", "no_passcode", "no_file", "untypeable", "stale"):
+        assert ctl.keyboard_outcome([k("failed", why)], PHONE_16E, NOW, "auto_on")["reason"] == why
+
+
+def test_keyboard_auto_off_writes_auto_off(app_dir, monkeypatch):
+    code, fake = run_auto(app_dir, monkeypatch, "off", detail="auto_off", reason="request")
+    assert code == 0 and fake.seen["action"] == "auto_off"
+
+
+def test_keyboard_auto_status_writes_nothing_and_prints_the_field(app_dir, capsys):
+    devices = [dict(DEVICES[0], auto_unlock="off_after_failure", reason="locked")] + DEVICES[1:]
+    write_devices(app_dir / "devices.json", devices)
+    (app_dir / "events.jsonl").write_text("\n".join([
+        ev("2026-11-13T09:00:00.000Z", PHONE_16E, "keyboard", detail="auto_wake"),
+        ev("2026-11-13T09:00:01.000Z", PHONE_16E, "keyboard", detail="typed_test", chars=5),
+        ev("2026-11-13T09:00:02.000Z", PHONE_16E, "lock", detail="locked"),
+        ev("2026-11-13T09:00:20.000Z", PHONE_16E, "keyboard", detail="auto_failed", reason="still_locked"),
+    ]) + "\n")
+    assert ctl.main(["keyboard", "auto", "status", "phone1"]) == 0
+    out = capsys.readouterr().out
+    assert "auto_unlock   off_after_failure" in out
+    assert "auto_wake" in out and "lock" in out and "still_locked" in out and "typed_test" not in out
+    assert not (app_dir / "requests").exists()
+
+
+def test_keyboard_auto_refuses_a_simulator(app_dir, capsys):
+    assert ctl.main(["keyboard", "auto", "on", "sim-17"]) == 1
+    assert "Simulator" in capsys.readouterr().err
+    assert not (app_dir / "requests").exists()
+
+
+def test_keyboard_auto_takes_no_passcode_argument(app_dir, capsys):
+    with pytest.raises(SystemExit):
+        ctl.main(["keyboard", "auto", "on", "phone1", "222222"])
+    assert ctl.main(["keyboard", "auto", "maybe", "phone1"]) == 1
+    assert ctl.main(["keyboard", "auto", "on"]) == 1
+    assert not (app_dir / "requests").exists()
+
+
+def test_status_shows_auto_unlock(app_dir, capsys):
+    write_devices(app_dir / "devices.json", [dict(DEVICES[0], auto_unlock="on")])
+    assert ctl.main(["status", "phone1"]) == 0
+    assert "auto_unlock   on" in capsys.readouterr().out
+
+
+def test_the_mcp_server_never_turns_auto_unlock_on():
+    src = open(os.path.join(HERE, "imirror_mcp.py"), encoding="utf-8").read()
+    assert "auto_on" not in src
+    assert "keyboard-" not in src, "the MCP server writes no keyboard requests"

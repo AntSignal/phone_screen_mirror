@@ -22,6 +22,8 @@ enum BLEKeyboardError: Error, Equatable {
     case sendFailed
     /// Another pairing or typing run is still going.
     case busy
+    /// The check before the first key said no; nothing was sent.
+    case stale
 }
 
 /// One-shot wake-up for a suspended task. Main queue only.
@@ -117,8 +119,11 @@ final class BLEKeyboard: NSObject {
     }
 
     /// Sends `reports` to one phone only, waiting for it to connect first.
+    /// `beforeFirstKey` runs after the connect wait and settle, so a
+    /// caller's freshness rule covers the real first key.
     /// Never logs the reports: they may spell a passcode.
-    func type(reports: [KeyStep], to central: UUID, connectTimeout: TimeInterval = 15) async throws {
+    func type(reports: [KeyStep], to central: UUID, connectTimeout: TimeInterval = 15,
+              beforeFirstKey: FirstKeyCheck? = nil) async throws {
         guard !running else { throw BLEKeyboardError.busy }
         running = true
         defer { running = false }
@@ -135,6 +140,7 @@ final class BLEKeyboard: NSObject {
         }
         let settle = Self.linkSettleSec - Date().timeIntervalSince(subscribedAt[central] ?? .distantPast)
         if settle > 0 { try await Task.sleep(nanoseconds: UInt64(settle * 1e9)) }
+        if let beforeFirstKey, !beforeFirstKey() { throw BLEKeyboardError.stale }
         do {
             for step in reports {
                 try await send(Data(step.report), to: central)

@@ -57,6 +57,14 @@ final class ChainManager {
     var onKeyboardRequest: ((KeyboardRequestFile.Read) -> Void)?
     /// Automation can't start (another iMirror owns the phones).
     var onBlocked: ((String) -> Void)?
+    /// Auto-unlock's hooks (AutoUnlock.swift); see DeviceController.
+    var onLockReading: ((DeviceController, LockReading, TimeInterval) -> Void)?
+    var unlockCause: (String) -> String = { _ in "other" }
+    var autoUnlockState: (String) -> String? = { _ in nil }
+    /// Could auto-unlock still type for this locked phone? (PowerPolicy)
+    var autoUnlockMayAct: (String) -> Bool = { _ in false }
+    /// A phone's alias changed; its passcode key changed with it.
+    var onAliasChanged: ((_ udid: String, _ alias: String) -> Void)?
 
     private static let slotsKey = "imirror.deviceSlots"
 
@@ -102,7 +110,9 @@ final class ChainManager {
     private func updateSleepAssertion() {
         let now = ProcessInfo.processInfo.systemUptime
         let lastTraffic = controllers.compactMap { $0.sampleTraffic(now: now) }.max()
-        let recovering = controllers.contains { SleepPolicy.isRecovering($0.reason, gaveUp: $0.ladder.hardStopped) }
+        let recovering = controllers.contains {
+            SleepPolicy.isRecovering($0.reason, gaveUp: $0.ladder.hardStopped, lockMayClear: autoUnlockMayAct($0.udid))
+        }
         sleepAssertion.set(SleepPolicy.keepAwake(automationOn: running, lastTrafficAt: lastTraffic,
                                                  recovering: recovering, now: now))
     }
@@ -299,6 +309,15 @@ final class ChainManager {
         }
         c.tunnelHasDevice = { [weak self] in self?.tunnelUDIDs.contains(device.udid) ?? false }
         c.requestTunnelRestart = { [weak self] in self?.requestTunnelRestart(coalesce: true) ?? true }
+        if let bin, chain != nil {
+            c.probeLock = LockProbe.make(bin: bin, udid: device.udid, workDir: workDir)
+        }
+        c.onLockReading = { [weak self, weak c] r, at in
+            guard let self, let c else { return }
+            self.onLockReading?(c, r, at)
+        }
+        c.unlockCause = { [weak self] in self?.unlockCause(device.udid) ?? "other" }
+        c.autoUnlockState = { [weak self] in self?.autoUnlockState(device.udid) }
         c.onChange = { [weak self, weak c] in
             guard let self, let c else { return }
             self.scheduleWrite()
@@ -350,6 +369,9 @@ final class ChainManager {
         return true
     }
 
+    /// Something devices.json shows changed outside a controller.
+    func refreshDeviceFile() { scheduleWrite() }
+
     // MARK: Aliases
 
     /// Rename a phone. The name is what agents pass as `device=`, so it must
@@ -357,9 +379,11 @@ final class ChainManager {
     func rename(_ c: DeviceController, to alias: String) -> AliasProblem? {
         if let problem = validateAlias(alias, forUDID: c.udid, in: table) { return problem }
         if reservedAliases().contains(alias.lowercased()) { return .taken(byUDID: "simulator") }
+        let changed = table.entries[c.udid]?.alias != alias
         table.entries[c.udid]?.alias = alias
         saveTable()
         c.alias = alias
+        if changed { onAliasChanged?(c.udid, alias) }
         onDevicesChanged?()
         scheduleWrite()
         return nil
