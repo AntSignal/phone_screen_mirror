@@ -158,8 +158,16 @@ final class PasscodeSplitTests: XCTestCase {
         wake[wake.count - 1].delayAfterMs = HIDKeyboard.wakeSettleMs
         let rest = try XCTUnwrap(HIDKeyboard.passcodeAfterWake(ascii: code))
         XCTAssertEqual(wake + rest, HIDKeyboard.wakeThenPasscode(ascii: code))
-        XCTAssertNotEqual(HIDKeyboard.wakeOnly().last?.delayAfterMs, HIDKeyboard.wakeSettleMs,
-                          "only the click path waits 600 ms inside one SEND")
+        XCTAssertEqual(HIDKeyboard.autoWake() + rest, HIDKeyboard.wakeThenPasscode(ascii: code))
+    }
+
+    /// The auto wake keeps the 600 ms settle, so the approving reading
+    /// and the first Backspace come after the screen is up.
+    func testTheAutoWakeIsShiftThenTheSettle() {
+        let w = HIDKeyboard.autoWake()
+        XCTAssertEqual(w.map(\.report), HIDKeyboard.wakeOnly().map(\.report))
+        XCTAssertEqual(w.last?.delayAfterMs, HIDKeyboard.wakeSettleMs)
+        XCTAssertFalse(w.contains { $0.report[2] == HIDKeyboard.backspaceUsage }, "no key that edits text")
     }
 
     func testANumericCodeStartsWithBackspaceAndHasNoReturn() throws {

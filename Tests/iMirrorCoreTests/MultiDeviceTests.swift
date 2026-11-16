@@ -147,6 +147,15 @@ final class PortSlotTests: XCTestCase {
         XCTAssertNil(validateAlias("bee", forUDID: phone17, in: table))
     }
 
+    /// phone-2 and phone_2 read the same PHONE_2_PASSCODE: one phone
+    /// would type the other's code, a wrong attempt.
+    func testAnAliasMayNotShareAnotherPhonesPasscodeKey() {
+        let table = SlotTable(entries: [phone16e: .init(slot: 1, alias: "phone-2")])
+        XCTAssertEqual(validateAlias("phone_2", forUDID: phone17, in: table), .taken(byUDID: phone16e))
+        XCTAssertNil(validateAlias("phone_2", forUDID: phone16e, in: table), "its own key")
+        XCTAssertNil(validateAlias("phone2", forUDID: phone17, in: table), "PHONE2 is another key")
+    }
+
     func testSlotTablePersistsAsJSON() throws {
         let table = SlotTable(entries: [phone16e: .init(slot: 0, alias: "phone1", lastSeen: now)])
         let data = try JSONEncoder().encode(table)

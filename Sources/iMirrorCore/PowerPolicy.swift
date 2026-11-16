@@ -45,8 +45,12 @@ public enum SleepPolicy {
     /// `gaveUp` is asked apart from the reason: a cause runwda named
     /// (needs_passcode, locked, untrusted) outranks gave_up in the reason,
     /// and a phone left locked overnight would keep the Mac awake for good.
-    public static func isRecovering(_ reason: DeviceReason?, gaveUp: Bool) -> Bool {
+    /// A locked phone never gives up (the ladder holds instead), so
+    /// `locked` counts only while auto-unlock could still act on it
+    /// (`lockMayClear`, PasscodeGate.mayStillAct), which is bounded.
+    public static func isRecovering(_ reason: DeviceReason?, gaveUp: Bool, lockMayClear: Bool = false) -> Bool {
         guard let reason, !gaveUp else { return false }
+        if reason == .locked { return lockMayClear }
         return reason != .gaveUp && reason != .macAsleep
     }
 }

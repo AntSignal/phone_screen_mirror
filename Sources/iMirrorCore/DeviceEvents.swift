@@ -136,11 +136,14 @@ public struct DeviceEvent: Encodable, Equatable, Sendable {
     public var probeAgeMs: Int?
     /// auto_typed: how long the passcode SEND took (ms).
     public var sendMs: Int?
+    /// auto_typed: reading age at the first key, ms (upper bound).
+    public var firstKeyAgeMs: Int?
 
     enum CodingKeys: String, CodingKey {
         case ts, udid, alias, event, from, to, reason, detail, expected, chars, transport
         case probeAgeMs = "probe_age_ms"
         case sendMs = "send_ms"
+        case firstKeyAgeMs = "first_key_age_ms"
     }
 
     public init(at date: Date, udid: String, alias: String, event: DeviceEventKind,
