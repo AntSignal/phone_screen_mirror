@@ -57,6 +57,10 @@ final class ChainManager {
     var onKeyboardRequest: ((KeyboardRequestFile.Read) -> Void)?
     /// Automation can't start (another iMirror owns the phones).
     var onBlocked: ((String) -> Void)?
+    /// Auto-unlock's hooks (AutoUnlock.swift); see DeviceController.
+    var onLockReading: ((DeviceController, LockReading, TimeInterval) -> Void)?
+    var unlockCause: (String) -> String = { _ in "other" }
+    var autoUnlockState: (String) -> String? = { _ in nil }
 
     private static let slotsKey = "imirror.deviceSlots"
 
@@ -299,6 +303,15 @@ final class ChainManager {
         }
         c.tunnelHasDevice = { [weak self] in self?.tunnelUDIDs.contains(device.udid) ?? false }
         c.requestTunnelRestart = { [weak self] in self?.requestTunnelRestart(coalesce: true) ?? true }
+        if let bin, chain != nil {
+            c.probeLock = LockProbe.make(bin: bin, udid: device.udid, workDir: workDir)
+        }
+        c.onLockReading = { [weak self, weak c] r, at in
+            guard let self, let c else { return }
+            self.onLockReading?(c, r, at)
+        }
+        c.unlockCause = { [weak self] in self?.unlockCause(device.udid) ?? "other" }
+        c.autoUnlockState = { [weak self] in self?.autoUnlockState(device.udid) }
         c.onChange = { [weak self, weak c] in
             guard let self, let c else { return }
             self.scheduleWrite()
@@ -349,6 +362,9 @@ final class ChainManager {
         }
         return true
     }
+
+    /// Something devices.json shows changed outside a controller.
+    func refreshDeviceFile() { scheduleWrite() }
 
     // MARK: Aliases
 

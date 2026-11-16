@@ -1,11 +1,14 @@
-// KeyboardControl — acts on keyboard request files (pair, forget, test) and
-// on Settings → "Type passcode now", and logs each outcome as a "keyboard"
-// event. Pairing uses the USB dongle when one answers HELLO, else this Mac's
+// KeyboardControl — acts on keyboard request files (pair, forget, test,
+// auto_on, auto_off), on Settings → "Type passcode now", and on
+// auto-unlock's steps, and logs each outcome as a "keyboard" event.
+// Pairing uses the USB dongle when one answers HELLO, else this Mac's
 // BLEKeyboard; typing uses whichever the phone was paired with. The rules
-// live in iMirrorCore/KeyboardRequests.swift; this file only does the work.
+// live in iMirrorCore (KeyboardRequests.swift, PasscodeGate.swift); this
+// file only does the work.
 //
-// One run at a time. After each run the keyboard stops (no advertising, no
-// services), so the phone drops it and its on-screen keyboard comes back.
+// One run at a time; an auto-unlock sequence holds the keyboard from its
+// wake to its last key. After each run the keyboard stops (no advertising,
+// no services), so the phone drops it and its on-screen keyboard comes back.
 //
 // Events carry counts, never text. Main thread only.
 
@@ -22,22 +25,40 @@ final class KeyboardControl {
     /// A pairing changed or a run ended; Settings redraws.
     var onChange: (() -> Void)?
     private(set) var busy = false
+    /// The phone whose auto-unlock sequence holds the keyboard.
+    private(set) var autoSequenceUDID: String?
+    /// A request asked to turn auto-unlock on or off (AutoUnlockDriver).
+    var onAutoRequest: ((_ udid: String, _ on: Bool) -> Void)?
+    /// A clicked passcode was sent; auto-unlock checks it took.
+    var onClickTyped: ((_ udid: String) -> Void)?
+    /// The secrets file, as Settings has it.
+    var passcodeFile: () -> URL = {
+        PasscodeFile.url(stored: UserDefaults.standard.string(forKey: PasscodeFile.defaultsKey))
+    }
+    /// Where events go. Tests swap it so nothing reaches the real log.
+    var writeEvent: (DeviceEvent) -> Void = { EventLog.shared.write($0) }
+    /// Tests only: a fake keyboard in place of the dongle and Bluetooth.
+    var transportOverride: KeyboardTransport?
+    /// Monotonic seconds; tests move it forward.
+    var uptime: () -> TimeInterval = { ProcessInfo.processInfo.systemUptime }
 
-    /// `dir` holds devices.json; the pairs file sits beside it.
-    init(dir: URL) {
+    /// `dir` holds devices.json; the pairs file sits beside it. Tests pass
+    /// `watchDongle: false` so no USB polling starts.
+    init(dir: URL, watchDongle: Bool = true) {
         pairsFile = KeyboardPairsFile(url: dir.appendingPathComponent("keyboard-pairs.json"))
         ble = BLEKeyboard(pairsURL: pairsFile.url)
         dongle = SerialDongleKeyboard(pairsFile: pairsFile)
         ble.onLinkChange = { [weak self] central, up in self?.linkChanged(central, up) }
         dongle.onStateChange = { [weak self] in self?.onChange?() }
-        dongle.startWatching()
+        if watchDongle { dongle.startWatching() }
     }
 
     func pairs() -> KeyboardPairs { pairsFile.load() }
 
     /// The transport a phone was paired with.
     func transport(for pair: KeyboardPair) -> KeyboardTransport {
-        pair.transport == .dongle ? dongle : ble
+        if let t = transportOverride { return t }
+        return pair.transport == .dongle ? dongle : ble
     }
 
     func handle(_ read: KeyboardRequestFile.Read) {
@@ -78,9 +99,12 @@ final class KeyboardControl {
                 try await t.type(reports, to: pair)
                 return (.typedTest, text.count)
             }
-        case .autoOn, .autoOff:
-            // Auto-unlock is not wired up yet: refuse rather than pretend.
-            log(r.udid, .failed, .unknownAction, transport: pair?.transport)
+        case .autoOn:
+            // The value must exist now, not at the first lock.
+            if let why = autoOnPrecheck(udid: r.udid) { return log(r.udid, .failed, why, transport: pair?.transport) }
+            onAutoRequest?(r.udid, true)
+        case .autoOff:
+            onAutoRequest?(r.udid, false)
         }
     }
 
@@ -123,8 +147,9 @@ final class KeyboardControl {
         }
     }
 
-    /// The one way a passcode is typed: a person clicked "Type passcode now".
-    /// Only that button's action may call this; PasscodeCallSiteTests checks.
+    /// A person clicked "Type passcode now". Only that button's action may
+    /// call this; PasscodeCallSiteTests checks. (The only other path is
+    /// typePasscodeAutomatically, for a phone a person opted in.)
     /// Reads the value, wakes the phone, types it to that phone's central,
     /// zeroes the buffers and logs a count. Returns a line for the status bar.
     func typePasscodeFromClick(udid: String, event: NSEvent?, file: URL) -> String {
@@ -154,12 +179,94 @@ final class KeyboardControl {
             log(udid, .failed, .untypeable, chars: chars, transport: t.kind)
             return "The passcode has a character the keyboard can't type."
         }
-        run(udid, chars: chars, pick: { t }) { t in
+        run(udid, chars: chars, pick: { t }) { [weak self] t in
             defer { HIDKeyboard.wipe(&steps) }
             try await t.type(steps, to: pair)
+            self?.onClickTyped?(udid)
             return (.typedPasscode, chars)
         }
         return "Typing the passcode (\(chars) characters)…"
+    }
+
+    // MARK: Auto-unlock (decisions in iMirrorCore/PasscodeGate.swift)
+
+    /// Hold the keyboard for one phone's auto-unlock, from the wake to
+    /// the last key, so a click in between gets "busy".
+    func beginAutoSequence(udid: String) -> Bool {
+        guard !busy else { return false }
+        busy = true
+        autoSequenceUDID = udid
+        onChange?()
+        return true
+    }
+
+    func endAutoSequence() {
+        guard autoSequenceUDID != nil else { return }
+        autoSequenceUDID = nil
+        busy = false
+        onChange?()
+    }
+
+    /// Shift only, to the paired phone only. `done` gets nil when sent.
+    func sendAutoWake(udid: String, done: @escaping (KeyboardFailure?) -> Void) {
+        guard autoSequenceUDID == udid, let pair = pairs().pair(for: udid) else { return done(.notPaired) }
+        let t = transport(for: pair)
+        Task { @MainActor in
+            var failure: KeyboardFailure?
+            do { try await t.type(HIDKeyboard.wakeOnly(), to: pair) } catch { failure = Self.failure(error) }
+            t.stop()
+            done(failure)
+        }
+    }
+
+    /// The one automatic way a passcode is typed. Only AutoUnlock.swift
+    /// calls it, for a `.type` step; PasscodeCallSiteTests checks. Re-checks
+    /// the approval's age and the pairing, reads the value, types it to
+    /// that phone's peer only, zeroes the buffers and logs a count.
+    func typePasscodeAutomatically(_ a: AutoTypeApproval, done: @escaping (TypeResult) -> Void) {
+        let now = uptime()
+        guard autoSequenceUDID == a.udid, a.isFresh(now: now) else { return done(.notSent(.stale)) }
+        guard let pair = pairs().pair(for: a.udid) else { return done(.notSent(.notPaired)) }
+        let secret: SecretBytes
+        switch PasscodeLookup.load(udid: a.udid, alias: aliasOf(a.udid), file: passcodeFile()) {
+        case .noFile: return done(.notSent(.noFile))
+        case .noPasscode: return done(.notSent(.noPasscode))
+        case .found(let s): secret = s
+        }
+        let chars = secret.count
+        let steps = HIDKeyboard.passcodeAfterWake(ascii: secret.bytes)
+        secret.wipe()
+        guard var steps else { return done(.notSent(.untypeable)) }
+        let t = transport(for: pair)
+        let probeAgeMs = Int((now - a.readingStartedAt) * 1000)
+        Task { @MainActor in
+            var failure: KeyboardFailure?
+            do { try await t.type(steps, to: pair) } catch { failure = Self.failure(error) }
+            HIDKeyboard.wipe(&steps)
+            t.stop()
+            let sendMs = Int((self.uptime() - now) * 1000)
+            if let failure {
+                log(a.udid, .failed, failure, chars: chars, transport: t.kind)
+            } else {
+                writeEvent(.keyboard(at: Date(), udid: a.udid, alias: aliasOf(a.udid) ?? "", .autoTyped,
+                                     reason: nil, chars: chars, probeAgeMs: probeAgeMs, sendMs: sendMs,
+                                     transport: t.kind))
+            }
+            done(TypeResult(failure: failure))
+        }
+    }
+
+    /// Before auto-unlock is turned on: is there a value to type? Reads
+    /// the file, wipes the value at once, and returns why not, or nil.
+    func autoOnPrecheck(udid: String) -> KeyboardFailure? {
+        switch PasscodeLookup.load(udid: udid, alias: aliasOf(udid), file: passcodeFile()) {
+        case .noFile: return .noFile
+        case .noPasscode: return .noPasscode
+        case .found(let s):
+            let typeable = HIDKeyboard.strokes(ascii: s.bytes) != nil
+            s.wipe()
+            return typeable ? nil : .untypeable
+        }
     }
 
     /// True for a mouse click or a key press on the button, which only a
@@ -179,8 +286,8 @@ final class KeyboardControl {
 
     func log(_ udid: String, _ detail: KeyboardEventDetail, _ why: KeyboardFailure? = nil, chars: Int? = nil,
              transport: KeyboardTransportKind? = nil) {
-        EventLog.shared.write(.keyboard(at: Date(), udid: udid, alias: aliasOf(udid) ?? "", detail,
-                                        reason: why, chars: chars, transport: transport))
+        writeEvent(.keyboard(at: Date(), udid: udid, alias: aliasOf(udid) ?? "", detail,
+                             reason: why, chars: chars, transport: transport))
     }
 
     nonisolated static func failure(_ error: Error) -> KeyboardFailure {

@@ -14,6 +14,7 @@
 import AppKit
 import iMirrorCore
 import os
+import UserNotifications
 
 /// Unified-logging channel. NSLog output was not reaching `log show`, which made
 /// field reports (black mirror on a user's Mac) undiagnosable without a debugger.
@@ -295,6 +296,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSToolbarDelegate {
     private lazy var keyboardControl: KeyboardControl = MainActor.assumeIsolated {
         KeyboardControl(dir: EventLog.shared.url.deletingLastPathComponent())
     }
+    /// Types a locked phone's passcode by itself, for phones a person opted in.
+    private lazy var autoUnlock: AutoUnlockDriver = MainActor.assumeIsolated {
+        AutoUnlockDriver(keyboard: keyboardControl, notify: { title, body in AppDelegate.notify(title, body) })
+    }
     private var selectedUDID: String? = UserDefaults.standard.string(forKey: "imirror.selectedDevice")
     private var selected: DeviceController? { manager.controller(selectedUDID) }
     private var wda: WDAClient? { selected?.wda }
@@ -324,6 +329,21 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSToolbarDelegate {
         }
         manager.onKeyboardRequest = { [weak self] r in
             MainActor.assumeIsolated { self?.keyboardControl.handle(r) }
+        }
+        MainActor.assumeIsolated {
+            autoUnlock.onChange = { [weak self] in
+                self?.manager.refreshDeviceFile()
+                self?.rebuildDeviceRows()
+            }
+        }
+        manager.onLockReading = { [weak self] c, r, at in
+            MainActor.assumeIsolated { self?.autoUnlock.reading(c, r, startedAt: at) }
+        }
+        manager.unlockCause = { [weak self] udid in
+            MainActor.assumeIsolated { self?.autoUnlock.unlockCause(udid) ?? "other" }
+        }
+        manager.autoUnlockState = { [weak self] udid in
+            MainActor.assumeIsolated { self?.autoUnlock.registryState(udid) }
         }
         manager.onControllerChange = { [weak self] c in
             guard let self else { return }
@@ -1232,7 +1252,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSToolbarDelegate {
         stack.addArrangedSubview(tunnelButton)
 
         // Where "Type passcode now" reads each phone's passcode.
-        stack.addArrangedSubview(smallLabel("Passcode file (e.g. PHONE2_PASSCODE=…, read only on a click):"))
+        stack.addArrangedSubview(smallLabel("Passcode file (e.g. PHONE2_PASSCODE=…, read on a click or by auto-unlock):"))
         let fileField = NSTextField(string: UserDefaults.standard.string(forKey: PasscodeFile.defaultsKey) ?? "")
         fileField.placeholderString = PasscodeFile.defaultPath
         fileField.font = .systemFont(ofSize: 11)
@@ -1420,11 +1440,77 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSToolbarDelegate {
             type.toolTip = "Wakes the phone and types its passcode over the paired Bluetooth keyboard. "
                 + "Use only while the phone shows a passcode prompt: otherwise the keys go to the focused field."
             let via = pair.transport == .dongle ? "dongle" : "this Mac"
-            let row = NSStackView(views: [smallLabel("Keyboard: paired (\(via))"), type])
-            row.orientation = .horizontal
-            row.spacing = 6
+            let top = NSStackView(views: [smallLabel("Keyboard: paired (\(via))"), type])
+            top.orientation = .horizontal
+            top.spacing = 6
+            let auto = NSButton(checkboxWithTitle: "Unlock by itself when locked (types the passcode while WDA is down)",
+                                target: self, action: #selector(autoUnlockToggled(_:)))
+            auto.controlSize = .small
+            auto.font = .systemFont(ofSize: 11)
+            auto.identifier = NSUserInterfaceItemIdentifier(udid)
+            auto.state = autoUnlock.record(udid).enabled ? .on : .off
+            let alias = manager.controller(udid)?.alias ?? udid
+            let row = NSStackView(views: [top, auto])
+            if let line = autoUnlock.statusText(udid, alias: alias) { row.addArrangedSubview(smallLabel(line)) }
+            row.orientation = .vertical
+            row.alignment = .leading
+            row.spacing = 2
             return row
         }
+    }
+
+    /// The auto-unlock checkbox. On needs a person's click, a confirm and
+    /// a value in the passcode file; off needs nothing.
+    @objc private func autoUnlockToggled(_ sender: NSButton) {
+        guard let udid = sender.identifier?.rawValue else { return }
+        MainActor.assumeIsolated {
+            guard sender.state == .on else {
+                autoUnlock.setEnabled(udid, false, by: .settings)
+                return
+            }
+            sender.state = .off   // stays off unless every check passes
+            guard KeyboardControl.isHumanClick(NSApp.currentEvent?.type) else { return }
+            let alias = manager.controller(udid)?.alias ?? udid
+            let alert = NSAlert()
+            alert.messageText = "Let iMirror unlock \(alias) by itself?"
+            alert.informativeText = "When \(alias) is locked and WebDriverAgent is down, iMirror wakes it, checks it "
+                + "is still locked, and types its passcode from the passcode file over the paired keyboard. "
+                + "It tries once per lock, at most 3 times an hour. A try that leaves the phone locked turns "
+                + "this off again, because a wrong passcode counts toward the phone's lockout."
+            alert.addButton(withTitle: "Turn On")
+            alert.addButton(withTitle: "Cancel")
+            guard alert.runModal() == .alertFirstButtonReturn else { return }
+            if let why = keyboardControl.autoOnPrecheck(udid: udid) {
+                let key = PasscodeLookup.suggestedKey(udid: udid, alias: alias)
+                setStatus(why == .noFile ? "Can't read the passcode file."
+                          : "The passcode file has no usable \(key); auto-unlock stays off.")
+                keyboardControl.log(udid, .failed, why)
+                return
+            }
+            autoUnlock.setEnabled(udid, true, by: .settings)
+            sender.state = .on
+            AppDelegate.askToNotify()
+        }
+    }
+
+    /// A packaged app can post notifications; a bare `swift run` binary
+    /// has no bundle and UNUserNotificationCenter would crash it.
+    private static var canNotify: Bool { Bundle.main.bundleURL.pathExtension == "app" }
+
+    static func askToNotify() {
+        guard canNotify else { return }
+        UNUserNotificationCenter.current().requestAuthorization(options: [.alert, .sound]) { _, _ in }
+    }
+
+    /// Without permission the event and the Settings line still say it.
+    static func notify(_ title: String, _ body: String) {
+        NSLog("iMirror: \(title): \(body)")
+        guard canNotify else { return }
+        let content = UNMutableNotificationContent()
+        content.title = title
+        content.body = body
+        UNUserNotificationCenter.current().add(UNNotificationRequest(identifier: UUID().uuidString,
+                                                                     content: content, trigger: nil))
     }
 
     /// The only caller of typePasscodeFromClick: a button's action.
