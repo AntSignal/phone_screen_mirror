@@ -222,6 +222,9 @@ public struct ChainLadderState: Equatable, Sendable {
     public private(set) var lockHeld = false
     /// When the phone was seen unlocked; the next tick restarts it.
     public private(set) var unlockedAt: TimeInterval?
+    /// Ask for a refused post-unlock tunnel restart again then.
+    public private(set) var unlockTunnelRetryAt: TimeInterval?
+    private var unlockTunnelRefusals = 0
 
     /// How long each give-up lasts: 2 min, 5 min, then 10 min for good. Most
     /// outages (a USB reset, a crashed runner, a passcode sheet the user
@@ -259,13 +262,20 @@ public struct ChainLadderState: Equatable, Sendable {
         giveUps = 0
         hadSuccessfulConnection = true
         lockHeld = false
+        clearUnlock()
+    }
+
+    private mutating func clearUnlock() {
         unlockedAt = nil
+        unlockTunnelRetryAt = nil
+        unlockTunnelRefusals = 0
     }
 
     /// The lock probe saw the phone unlock (by auto-unlock, a click or a
     /// person). The next tick brings the chain back at once instead of
     /// waiting out a give-up's backoff.
     public mutating func noteUnlocked(now: TimeInterval) {
+        clearUnlock()
         unlockedAt = now
         giveUps = 0
         hardStopped = false
@@ -292,7 +302,18 @@ public struct ChainLadderState: Equatable, Sendable {
         hardStoppedAt = nil
         giveUps = 0
         lockHeld = false
-        unlockedAt = nil
+        clearUnlock()
+    }
+
+    /// After an unlock the tunnel restart was refused (its cooldown), so
+    /// only this phone's chain restarted, which can't reach a phone the
+    /// tunnel doesn't list. Ask again soon instead of climbing to a
+    /// give-up and a 2-10 min backoff. Bounded by unlockTunnelRetries.
+    public mutating func tunnelRestartRefusedAfterUnlock(now: TimeInterval) {
+        guard unlockTunnelRefusals < AutoUnlockTiming.unlockTunnelRetries else { return }
+        unlockTunnelRefusals += 1
+        unlockedAt = now
+        unlockTunnelRetryAt = now + AutoUnlockTiming.unlockTunnelRetrySec
     }
 
     /// A retry (the user's or the ladder's own) is restarting the chain now.
@@ -340,15 +361,21 @@ public struct ChainLadderState: Equatable, Sendable {
     /// `held`: runwda waits on the passcode sheet (PasscodeHold); a restart
     /// would only raise the sheet again, so the climb pauses.
     /// `locked`: a recent lock probe says locked. The ladder holds once,
-    /// then waits, with no give-up and no backoff, until an unlock.
+    /// then waits, with no give-up and no backoff, until an unlock. While
+    /// the tunnel still lists the phone, the stage's grace runs first: a
+    /// health blip there may heal by itself.
     public mutating func tick(now: TimeInterval, othersHealthy: Bool,
                               tunnelHasDevice: Bool, held: Bool = false, locked: Bool = false) -> DeviceRecoveryAction {
         if locked {
-            unlockedAt = nil
+            clearUnlock()
             hardStopped = false
             hardStoppedAt = nil
             // The sheet means runwda is up and waiting: keep it.
             if held || lockHeld { return .wait }
+            if tunnelHasDevice, let since = wedgeSince,
+               now - since < chainRecoveryGraceSec(stage: stage, postConnectionOutage: hadSuccessfulConnection) {
+                return .wait
+            }
             lockHeld = true
             return .holdForLock
         }
@@ -389,12 +416,16 @@ public struct ChainLadderState: Equatable, Sendable {
         let action: DeviceRecoveryAction
         if tunnelHasDevice {
             action = .restartDeviceChain
+        } else if let retry = unlockTunnelRetryAt {
+            guard now >= retry else { return .wait }
+            action = .restartTunnelAndChains
         } else if !othersHealthy || now - at >= AutoUnlockTiming.unlockTunnelWaitSec {
             action = .restartTunnelAndChains
         } else {
             return .wait
         }
         unlockedAt = nil
+        unlockTunnelRetryAt = nil
         stage = action == .restartDeviceChain ? 1 : 2
         beginRestart(now: now)
         return action

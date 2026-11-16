@@ -22,11 +22,17 @@ public struct PasscodeGateContext: Equatable, Sendable {
     public var wdaUp: Bool
     /// The keyboard runs a job that is not this gate's own sequence.
     public var keyboardBusy: Bool
+    /// A clicked passcode is still being checked (same file).
+    public var clickChecking: Bool
+    /// Start of the probe now running; nil when none.
+    public var probeInFlightSince: TimeInterval?
 
     public init(enabled: Bool, paired: Bool, attached: Bool, macAsleep: Bool = false, sheetUp: Bool = false,
-                wdaUp: Bool = false, keyboardBusy: Bool = false) {
+                wdaUp: Bool = false, keyboardBusy: Bool = false, clickChecking: Bool = false,
+                probeInFlightSince: TimeInterval? = nil) {
         self.enabled = enabled; self.paired = paired; self.attached = attached; self.macAsleep = macAsleep
         self.sheetUp = sheetUp; self.wdaUp = wdaUp; self.keyboardBusy = keyboardBusy
+        self.clickChecking = clickChecking; self.probeInFlightSince = probeInFlightSince
     }
 }
 
@@ -39,6 +45,9 @@ public enum PasscodeGateHold: String, Sendable, CaseIterable {
     case sheet
     case wdaUp = "wda_up"
     case keyboardBusy = "keyboard_busy"
+    case clickChecking = "click_checking"
+    /// A wake SEND never came back; the try ended unsent.
+    case sendStuck = "send_stuck"
     case lockUnknown = "lock_unknown"
     case probeTimeout = "probe_timeout"
     case unlocked
@@ -70,6 +79,10 @@ public enum AutoUnlockOutcome: Equatable, Sendable {
     /// Face ID or a person unlocked it during the wake: no digits sent.
     case unlockedBeforeTyping
     case stillLocked, unverified, interrupted
+    /// Unlocked too long after typing to prove the code worked.
+    case unlockedLate
+    /// The first key may have left too late (slow reconnect).
+    case lateFirstKey
     /// Stopped before typing; the hold says why.
     case aborted(PasscodeGateHold)
     /// The keyboard failed before any key went out.
@@ -78,7 +91,7 @@ public enum AutoUnlockOutcome: Equatable, Sendable {
     /// True for the outcomes that turn auto-unlock off.
     public var disables: Bool {
         switch self {
-        case .stillLocked, .unverified, .interrupted: return true
+        case .stillLocked, .unverified, .interrupted, .unlockedLate, .lateFirstKey: return true
         default: return false
         }
     }
@@ -89,6 +102,8 @@ public enum AutoUnlockOutcome: Equatable, Sendable {
         case .stillLocked: return .stillLocked
         case .unverified: return .unverified
         case .interrupted: return .interrupted
+        case .unlockedLate: return .unlockedLate
+        case .lateFirstKey: return .slowKeyboard
         case .unlockedBeforeTyping: return .unlockedBeforeTyping
         case .aborted(.lockUnknown): return .lockUnknown
         case .aborted(.probeTimeout): return .probeTimeout
@@ -130,8 +145,9 @@ public enum TypeResult: Equatable, Sendable {
     case notSent(KeyboardFailure)
 
     /// Failures that happen before any key leaves the Mac.
+    /// `.stale` comes only from the pre-first-key check.
     public static let beforeAnyKey: Set<KeyboardFailure> = [.notPaired, .dongleUnavailable, .noFile, .noPasscode,
-                                                            .untypeable, .busy]
+                                                            .untypeable, .busy, .stale]
 
     public init(failure: KeyboardFailure?) {
         guard let f = failure else { self = .sent; return }
@@ -144,9 +160,9 @@ public enum TypeResult: Equatable, Sendable {
 public struct PasscodeGate: Equatable, Sendable {
     enum Phase: Equatable, Sendable {
         case idle
-        case waking
+        case waking(since: TimeInterval)
         case awaitingProbe(since: TimeInterval)
-        case typing
+        case typing(since: TimeInterval)
         case verifying(since: TimeInterval)
         case ending(AutoUnlockOutcome)
     }
@@ -156,7 +172,10 @@ public struct PasscodeGate: Equatable, Sendable {
     private(set) var phase: Phase = .idle
     private var watch = LockWatch()
     private var sawLocked = false
-    private var sawUnlocked = false
+    /// Start of the first unlocked reading after typing.
+    private var firstUnlockedAt: TimeInterval?
+    /// The first key may have left after firstKeyMaxSec.
+    private var lateKeys = false
 
     public init(udid: String, history: AutoUnlockRecord) {
         self.udid = udid
@@ -180,14 +199,35 @@ public struct PasscodeGate: Equatable, Sendable {
         record.disable(reason: .stillLocked, by: .failure, at: wallNow)
     }
 
+    /// A person's clicked passcode went out. It spends this episode's
+    /// try and counts toward the gap and the cap, since it read the same
+    /// file: a wrong click must not be followed by the same wrong value.
+    public mutating func clickTyped(wallNow: Date) {
+        record.episodeAttempted = true
+        record.prune(wallNow: wallNow)
+        record.attempts.append(wallNow)
+        record.attempts = Array(record.attempts.suffix(AutoUnlockRecord.maxKeptAttempts))
+    }
+
+    /// Could this gate still type for the current lock? Keeps the Mac
+    /// awake only that long (SleepPolicy), never for good.
+    public func mayStillAct(now: TimeInterval) -> Bool {
+        if inProgress { return true }
+        guard record.enabled, !record.episodeAttempted, let start = watch.episodeStart else { return false }
+        return now - start <= AutoUnlockTiming.keepAwakeLockedSec
+    }
+
     /// Feed every lock reading, in the order the probes started.
     public mutating func reading(_ r: LockReading, startedAt: TimeInterval) {
+        // An out-of-order reading is dropped, so it ends nothing.
+        let accepted = watch.latest.map { startedAt >= $0.startedAt } ?? true
         watch.record(r, startedAt: startedAt)
+        guard accepted else { return }
         if r == .unlocked { record.episodeAttempted = false }
-        if case .verifying(let since) = phase, startedAt >= since,
-           startedAt <= since + AutoUnlockTiming.verifySec {
-            if r == .locked { sawLocked = true }
-            if r == .unlocked { sawUnlocked = true }
+        if case .verifying(let since) = phase, startedAt >= since {
+            if r == .locked, startedAt <= since + AutoUnlockTiming.verifySec { sawLocked = true }
+            // Kept even after the window: then it reads as unlockedLate.
+            if r == .unlocked, firstUnlockedAt == nil { firstUnlockedAt = startedAt }
         }
     }
 
@@ -195,15 +235,36 @@ public struct PasscodeGate: Equatable, Sendable {
     public mutating func decide(_ c: PasscodeGateContext, now: TimeInterval, wallNow: Date) -> PasscodeGateStep {
         switch phase {
         case .idle: return decideIdle(c, now: now, wallNow: wallNow)
-        case .waking, .typing: return .nothing(.inProgress)
+        case .waking(let since):
+            // A wake sends no digits: a stuck one ends unsent.
+            if now - since > AutoUnlockTiming.sendDeadlineSec { return finish(.aborted(.sendStuck), wallNow: wallNow) }
+            return .nothing(.inProgress)
+        case .typing(let since):
+            // Keys may be out: a stuck SEND fails closed.
+            if now - since > AutoUnlockTiming.sendDeadlineSec { return finish(.unverified, wallNow: wallNow) }
+            return .nothing(.inProgress)
         case .awaitingProbe(let since): return decideAfterWake(c, since: since, now: now, wallNow: wallNow)
-        case .verifying(let since):
-            if sawUnlocked { return finish(.unlocked, wallNow: wallNow) }
-            if now - since < AutoUnlockTiming.verifySec { return .verifyProbe }
-            return finish(sawLocked ? .stillLocked : .unverified, wallNow: wallNow)
+        case .verifying(let since): return decideVerify(c, since: since, now: now, wallNow: wallNow)
         case .ending(let outcome):
             return finish(outcome, wallNow: wallNow)
         }
+    }
+
+    /// An unlock proves the code only when seen soon after typing; one
+    /// seen later may be a person's Face ID, so it turns auto off.
+    private mutating func decideVerify(_ c: PasscodeGateContext, since: TimeInterval, now: TimeInterval,
+                                       wallNow: Date) -> PasscodeGateStep {
+        if let u = firstUnlockedAt {
+            if u - since > AutoUnlockTiming.verifyProvenSec { return finish(.unlockedLate, wallNow: wallNow) }
+            return finish(lateKeys ? .lateFirstKey : .unlocked, wallNow: wallNow)
+        }
+        if now - since < AutoUnlockTiming.verifySec { return .verifyProbe }
+        // A probe started inside the window may still answer.
+        if let p = c.probeInFlightSince, p >= since, p <= since + AutoUnlockTiming.verifySec,
+           now - p <= AutoUnlockTiming.probeTimeoutSec + 1 {
+            return .nothing(.inProgress)
+        }
+        return finish(sawLocked ? .stillLocked : .unverified, wallNow: wallNow)
     }
 
     private mutating func decideIdle(_ c: PasscodeGateContext, now: TimeInterval, wallNow: Date) -> PasscodeGateStep {
@@ -214,6 +275,7 @@ public struct PasscodeGate: Equatable, Sendable {
         if c.sheetUp { return .nothing(.sheet) }
         if c.wdaUp { return .nothing(.wdaUp) }
         if c.keyboardBusy { return .nothing(.keyboardBusy) }
+        if c.clickChecking { return .nothing(.clickChecking) }
         guard let r = watch.latest, now - r.startedAt <= AutoUnlockTiming.freshProbeSec else { return .probe }
         if r.reading == .unknown { return .nothing(.lockUnknown) }
         if r.reading == .unlocked { return .nothing(.unlocked) }
@@ -236,6 +298,7 @@ public struct PasscodeGate: Equatable, Sendable {
         if c.sheetUp { return finish(.aborted(.sheet), wallNow: wallNow) }
         if c.wdaUp { return finish(.aborted(.wdaUp), wallNow: wallNow) }
         if c.keyboardBusy { return finish(.aborted(.keyboardBusy), wallNow: wallNow) }
+        if c.clickChecking { return finish(.aborted(.clickChecking), wallNow: wallNow) }
         if !c.paired { return finish(.aborted(.notPaired), wallNow: wallNow) }
         if !c.attached { return finish(.aborted(.notAttached), wallNow: wallNow) }
         // Only a reading taken after the wake ended counts.
@@ -244,7 +307,7 @@ public struct PasscodeGate: Equatable, Sendable {
             case .unlocked: return finish(.unlockedBeforeTyping, wallNow: wallNow)
             case .unknown: return finish(.aborted(.lockUnknown), wallNow: wallNow)
             case .locked where now - r.startedAt <= AutoUnlockTiming.freshProbeSec:
-                phase = .typing
+                phase = .typing(since: now)
                 return .type(AutoTypeApproval(udid: udid, readingStartedAt: r.startedAt))
             case .locked: break   // too old to type on: probe again
             }
@@ -264,25 +327,27 @@ public struct PasscodeGate: Equatable, Sendable {
         record.attempts = Array(record.attempts.suffix(AutoUnlockRecord.maxKeptAttempts))
         record.pendingSince = wallNow
         record.episodeAttempted = true
-        phase = .waking
+        phase = .waking(since: now)
     }
 
     /// The wake finished. A failed wake sent no digits, so it ends the
     /// attempt without turning auto off.
     public mutating func wakeEnded(now: TimeInterval, failure: KeyboardFailure? = nil) {
-        guard phase == .waking else { return }
+        guard case .waking = phase else { return }
         phase = failure.map { .ending(.notSent($0)) } ?? .awaitingProbe(since: now)
     }
 
     /// The passcode SEND finished. Only readings started after this count.
-    public mutating func typingEnded(_ r: TypeResult, now: TimeInterval) {
-        guard phase == .typing else { return }
+    /// `firstKeyAgeSec` is FirstKeyAge's answer; nil reads as too old.
+    public mutating func typingEnded(_ r: TypeResult, now: TimeInterval, firstKeyAgeSec: TimeInterval?) {
+        guard case .typing = phase else { return }
         switch r {
         case .notSent(let f):
             phase = .ending(.notSent(f))
         case .sent, .maybeSent:
             sawLocked = false
-            sawUnlocked = false
+            firstUnlockedAt = nil
+            lateKeys = (firstKeyAgeSec ?? .infinity) > AutoUnlockTiming.firstKeyMaxSec
             phase = .verifying(since: now)
         }
     }

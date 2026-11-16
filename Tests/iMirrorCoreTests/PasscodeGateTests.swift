@@ -68,6 +68,11 @@ final class PasscodeGateDecideTests: XCTestCase {
         XCTAssertEqual(decide(&g, c), .nothing(.keyboardBusy))
     }
 
+    func testAClickBeingCheckedHolds() {
+        var g = lockedGate(); var c = ok; c.clickChecking = true
+        XCTAssertEqual(decide(&g, c), .nothing(.clickChecking))
+    }
+
     func testNoReadingProbes() {
         var g = PasscodeGate(udid: udid, history: on())
         XCTAssertEqual(decide(&g), .probe)
@@ -243,8 +248,8 @@ final class PasscodeGateAfterWakeTests: XCTestCase {
 
 /// From the typing to the verdict.
 final class PasscodeGateVerifyTests: XCTestCase {
-    /// Typed; the SEND ended at 40.
-    private func typed(_ r: TypeResult = .sent) -> PasscodeGate {
+    /// Typed; the SEND ended at 40, its first key 1 s after the reading.
+    private func typed(_ r: TypeResult = .sent, firstKeyAge: TimeInterval? = 1) -> PasscodeGate {
         var g = PasscodeGate(udid: udid, history: on())
         g.reading(.locked, startedAt: 0)
         g.reading(.locked, startedAt: 30)
@@ -253,7 +258,7 @@ final class PasscodeGateVerifyTests: XCTestCase {
         g.wakeEnded(now: 32)
         g.reading(.locked, startedAt: 32.1)
         _ = g.decide(ok, now: 32.4, wallNow: w(32.4))
-        g.typingEnded(r, now: 40)
+        g.typingEnded(r, now: 40, firstKeyAgeSec: firstKeyAge)
         return g
     }
 
@@ -302,18 +307,93 @@ final class PasscodeGateVerifyTests: XCTestCase {
         XCTAssertEqual(g.record.disabledReason, .unverified)
     }
 
-    func testLockedThenUnlockedJustInTime() {
+    func testLockedThenUnlockedWithinFiveSecondsIsSuccess() {
         var g = typed()
-        g.reading(.locked, startedAt: 42)
-        g.reading(.unlocked, startedAt: 54.9)
-        XCTAssertEqual(g.decide(ok, now: 55.2, wallNow: w(55.2)), .finished(.unlocked))
+        g.reading(.locked, startedAt: 41)
+        g.reading(.unlocked, startedAt: 45)
+        XCTAssertEqual(g.decide(ok, now: 45.2, wallNow: w(45.2)), .finished(.unlocked))
+        XCTAssertTrue(g.record.enabled)
     }
 
-    func testUnlockedTooLateStillFails() {
+    /// A person's Face ID could have done it: not proof the code worked.
+    func testAnUnlockAfterFiveSecondsIsUnprovenAndTurnsAutoOff() {
+        var g = typed()
+        g.reading(.locked, startedAt: 42)
+        g.reading(.unlocked, startedAt: 45.1)
+        XCTAssertEqual(g.decide(ok, now: 45.3, wallNow: w(45.3)), .finished(.unlockedLate))
+        XCTAssertFalse(g.record.enabled)
+        XCTAssertEqual(g.record.disabledReason, .unlockedLate)
+    }
+
+    /// Seen unlocked after the window: never "stayed locked".
+    func testAnUnlockAfterTheWindowIsUnlockedLateNotStillLocked() {
         var g = typed()
         g.reading(.locked, startedAt: 42)
         g.reading(.unlocked, startedAt: 55.1)
-        XCTAssertEqual(g.decide(ok, now: 55.3, wallNow: w(55.3)), .finished(.stillLocked))
+        XCTAssertEqual(g.decide(ok, now: 55.3, wallNow: w(55.3)), .finished(.unlockedLate))
+    }
+
+    /// A probe that started inside the window gets to answer.
+    func testTheWindowWaitsForAProbeStartedInsideIt() {
+        var g = typed()
+        g.reading(.locked, startedAt: 42)
+        var c = ok; c.probeInFlightSince = 54.5
+        XCTAssertEqual(g.decide(c, now: 55.2, wallNow: w(55.2)), .nothing(.inProgress))
+        XCTAssertEqual(g.decide(c, now: 58.6, wallNow: w(58.6)), .finished(.stillLocked), "not for ever")
+        var h = typed()
+        h.reading(.locked, startedAt: 42)
+        c.probeInFlightSince = 55.5   // started after the window
+        XCTAssertEqual(h.decide(c, now: 55.6, wallNow: w(55.6)), .finished(.stillLocked))
+    }
+
+    /// The dongle reconnects inside its SEND: a late first key can't be
+    /// proven to have hit a locked phone, so even a success turns it off.
+    func testALateFirstKeyTurnsAutoOffEvenWhenItUnlocked() {
+        var g = typed(firstKeyAge: AutoUnlockTiming.firstKeyMaxSec + 0.1)
+        g.reading(.unlocked, startedAt: 41)
+        XCTAssertEqual(g.decide(ok, now: 41.2, wallNow: w(41.2)), .finished(.lateFirstKey))
+        XCTAssertFalse(g.record.enabled)
+        XCTAssertEqual(g.record.disabledReason, .slowKeyboard)
+        XCTAssertEqual(AutoUnlockOutcome.lateFirstKey.eventReason, "slow_keyboard")
+        var h = typed(firstKeyAge: nil)
+        h.reading(.unlocked, startedAt: 41)
+        XCTAssertEqual(h.decide(ok, now: 41.2, wallNow: w(41.2)), .finished(.lateFirstKey), "unknown is late")
+        var k = typed(firstKeyAge: AutoUnlockTiming.firstKeyMaxSec)
+        k.reading(.unlocked, startedAt: 41)
+        XCTAssertEqual(k.decide(ok, now: 41.2, wallNow: w(41.2)), .finished(.unlocked))
+    }
+
+    func testAStuckPasscodeSendFailsClosed() {
+        var g = PasscodeGate(udid: udid, history: on())
+        g.reading(.locked, startedAt: 0)
+        g.reading(.locked, startedAt: 30)
+        _ = g.decide(ok, now: 30.5, wallNow: w(30.5))
+        g.wakeStarted(now: 30.5, wallNow: w(30.5))
+        g.wakeEnded(now: 32)
+        g.reading(.locked, startedAt: 32.1)
+        XCTAssertEqual(g.decide(ok, now: 32.4, wallNow: w(32.4)),
+                       .type(AutoTypeApproval(udid: udid, readingStartedAt: 32.1)))
+        XCTAssertEqual(g.decide(ok, now: 32.4 + AutoUnlockTiming.sendDeadlineSec, wallNow: w(100)),
+                       .nothing(.inProgress))
+        XCTAssertEqual(g.decide(ok, now: 32.5 + AutoUnlockTiming.sendDeadlineSec, wallNow: w(100)),
+                       .finished(.unverified))
+        XCTAssertFalse(g.record.enabled)
+        XCTAssertNil(g.record.pendingSince)
+        // A late callback changes nothing.
+        g.typingEnded(.sent, now: 200, firstKeyAgeSec: 1)
+        XCTAssertFalse(g.inProgress)
+    }
+
+    func testAStuckWakeEndsUnsentAndStaysOn() {
+        var g = PasscodeGate(udid: udid, history: on())
+        g.reading(.locked, startedAt: 0)
+        g.reading(.locked, startedAt: 30)
+        _ = g.decide(ok, now: 30.5, wallNow: w(30.5))
+        g.wakeStarted(now: 30.5, wallNow: w(30.5))
+        XCTAssertEqual(g.decide(ok, now: 31 + AutoUnlockTiming.sendDeadlineSec, wallNow: w(100)),
+                       .finished(.aborted(.sendStuck)))
+        XCTAssertTrue(g.record.enabled)
+        XCTAssertTrue(g.record.episodeAttempted, "the episode stays spent")
     }
 
     func testMaybeSentIsTreatedAsSent() {
@@ -342,7 +422,7 @@ final class PasscodeGateEpisodeTests: XCTestCase {
         g.wakeEnded(now: t + 32)
         g.reading(.locked, startedAt: t + 32.1)
         _ = g.decide(ok, now: t + 32.4, wallNow: w(t + 32.4))
-        g.typingEnded(.sent, now: t + 40)
+        g.typingEnded(.sent, now: t + 40, firstKeyAgeSec: 1)
         g.reading(.unlocked, startedAt: t + 41)
         XCTAssertEqual(g.decide(ok, now: t + 41.2, wallNow: w(t + 41.2)), .finished(.unlocked))
     }
@@ -395,6 +475,44 @@ final class PasscodeGateEpisodeTests: XCTestCase {
         a.wakeStarted(now: 30.2, wallNow: w(30.2))
         XCTAssertFalse(b.record.episodeAttempted)
         XCTAssertTrue(b.record.attempts.isEmpty)
+    }
+
+    /// A wrong clicked code must not be followed by the same wrong
+    /// value typed automatically in the same lock.
+    func testAClickSpendsTheEpisodeAndCountsTowardTheGap() {
+        var g = PasscodeGate(udid: udid, history: on())
+        g.reading(.locked, startedAt: 0)
+        g.reading(.locked, startedAt: 8)
+        g.clickTyped(wallNow: w(10))
+        g.reading(.locked, startedAt: 25)
+        XCTAssertEqual(g.decide(ok, now: 25.2, wallNow: w(25.2)), .nothing(.triedThisEpisode))
+        XCTAssertEqual(g.record.attempts, [w(10)])
+        // A new lock still waits the gap after the click.
+        g.reading(.unlocked, startedAt: 30)
+        g.reading(.locked, startedAt: 40)
+        g.reading(.locked, startedAt: 70)
+        XCTAssertEqual(g.decide(ok, now: 70.2, wallNow: w(70.2)), .nothing(.tooSoon))
+    }
+
+    func testAnOutOfOrderUnlockedReadingEndsNothing() {
+        var r = on(); r.episodeAttempted = true
+        var g = PasscodeGate(udid: udid, history: r)
+        g.reading(.locked, startedAt: 10)
+        g.reading(.unlocked, startedAt: 9)   // started earlier: dropped
+        XCTAssertTrue(g.record.episodeAttempted)
+    }
+
+    func testMayStillActOnlyWhileATryIsPossibleAndBounded() {
+        var g = PasscodeGate(udid: udid, history: on())
+        XCTAssertFalse(g.mayStillAct(now: 0), "no lock")
+        g.reading(.locked, startedAt: 0)
+        XCTAssertTrue(g.mayStillAct(now: 30))
+        XCTAssertFalse(g.mayStillAct(now: AutoUnlockTiming.keepAwakeLockedSec + 1), "bounded")
+        var off = PasscodeGate(udid: udid, history: AutoUnlockRecord())
+        off.reading(.locked, startedAt: 0)
+        XCTAssertFalse(off.mayStillAct(now: 30), "auto-unlock off: a locked phone needs a person")
+        g.clickTyped(wallNow: w(1))
+        XCTAssertFalse(g.mayStillAct(now: 30), "episode spent")
     }
 
     func testAFailedClickTurnsAutoOff() {

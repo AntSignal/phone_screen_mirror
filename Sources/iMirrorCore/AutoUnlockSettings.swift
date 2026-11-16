@@ -22,9 +22,16 @@ public enum AutoUnlockReason: String, Sendable, CaseIterable {
     case unlockedBeforeTyping = "unlocked_before_typing"
     case lockUnknown = "lock_unknown"
     case probeTimeout = "probe_timeout"
+    /// Unlocked more than verifyProvenSec after typing.
+    case unlockedLate = "unlocked_late"
+    /// The first key may have left too late (firstKeyMaxSec).
+    case slowKeyboard = "slow_keyboard"
+    /// The phone's alias changed, so its passcode key did too.
+    case renamed
 
     /// The reasons that may be stored as `disabled_reason`.
-    public static let disabling: Set<AutoUnlockReason> = [.stillLocked, .unverified, .interrupted]
+    public static let disabling: Set<AutoUnlockReason> = [.stillLocked, .unverified, .interrupted, .unlockedLate,
+                                                          .slowKeyboard]
 }
 
 /// What devices.json shows as `auto_unlock`.
@@ -40,7 +47,7 @@ public struct AutoUnlockRecord: Equatable, Sendable {
     public var changedBy: AutoUnlockChangeSource?
     /// Set when a failure turned it off; cleared when a person turns it on.
     public var disabledReason: AutoUnlockReason?
-    /// Wall-clock times of automatic attempts in the last hour, oldest first.
+    /// Last hour's attempts, automatic or clicked, oldest first.
     public var attempts: [Date] = []
     /// True once this lock episode has had its one attempt.
     public var episodeAttempted = false

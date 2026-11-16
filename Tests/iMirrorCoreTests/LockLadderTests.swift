@@ -138,11 +138,58 @@ final class LockLadderTests: XCTestCase {
 
     func testARestartWhileLockedHoldsAgain() {
         var ladder = ChainLadderState()
-        XCTAssertEqual(ladder.tick(now: 1, othersHealthy: true, tunnelHasDevice: true, locked: true), .holdForLock)
+        XCTAssertEqual(ladder.tick(now: 1, othersHealthy: true, tunnelHasDevice: false, locked: true), .holdForLock)
         ladder.noteTunnelRestart(now: 2)
-        XCTAssertEqual(ladder.tick(now: 3, othersHealthy: true, tunnelHasDevice: true, locked: true), .holdForLock)
+        XCTAssertEqual(ladder.tick(now: 3, othersHealthy: true, tunnelHasDevice: false, locked: true), .holdForLock)
         ladder.forceRetry(now: 4)
-        XCTAssertEqual(ladder.tick(now: 5, othersHealthy: true, tunnelHasDevice: true, locked: true), .holdForLock)
+        XCTAssertEqual(ladder.tick(now: 5, othersHealthy: true, tunnelHasDevice: false, locked: true), .holdForLock)
+    }
+
+    /// With the tunnel still listing the phone, a health blip may heal
+    /// by itself, so the stage's grace runs before the children stop.
+    func testATunnelListingTheLockedPhoneGetsTheGraceFirst() {
+        var ladder = ChainLadderState()
+        ladder.onRunwdaStarted(now: 0)
+        ladder.onConnected()
+        ladder.onDown(now: 10)
+        let grace = chainRecoveryGraceSec(stage: 0, postConnectionOutage: true)
+        XCTAssertEqual(ladder.tick(now: 10 + grace - 0.1, othersHealthy: true, tunnelHasDevice: true, locked: true),
+                       .wait)
+        XCTAssertFalse(ladder.lockHeld)
+        XCTAssertEqual(ladder.tick(now: 10 + grace, othersHealthy: true, tunnelHasDevice: true, locked: true),
+                       .holdForLock)
+        XCTAssertEqual(ladder.stage, 0, "no restart was spent")
+    }
+
+    /// The tunnel's 120 s cooldown refused the restart after an unlock:
+    /// ask again soon, instead of climbing to a give-up and a backoff.
+    func testARefusedTunnelRestartAfterAnUnlockIsAskedAgain() {
+        var ladder = heldThenUnlocked()
+        XCTAssertEqual(ladder.tick(now: 101, othersHealthy: false, tunnelHasDevice: false), .restartTunnelAndChains)
+        ladder.tunnelRestartRefusedAfterUnlock(now: 101)
+        let retry = 101 + AutoUnlockTiming.unlockTunnelRetrySec
+        XCTAssertEqual(ladder.tick(now: retry - 0.1, othersHealthy: true, tunnelHasDevice: false), .wait)
+        XCTAssertEqual(ladder.tick(now: retry, othersHealthy: true, tunnelHasDevice: false), .restartTunnelAndChains)
+        XCTAssertFalse(ladder.hardStopped)
+        // The tunnel lists it meanwhile: its own chain at once.
+        ladder.tunnelRestartRefusedAfterUnlock(now: retry)
+        XCTAssertEqual(ladder.tick(now: retry + 1, othersHealthy: true, tunnelHasDevice: true), .restartDeviceChain)
+    }
+
+    func testRefusedTunnelRestartsAfterAnUnlockAreBounded() {
+        var ladder = heldThenUnlocked()
+        var t: TimeInterval = 101
+        var asked = 0
+        for _ in 0..<200 {
+            guard ladder.unlockedAt != nil else { break }
+            if ladder.tick(now: t, othersHealthy: false, tunnelHasDevice: false) == .restartTunnelAndChains {
+                asked += 1
+                ladder.tunnelRestartRefusedAfterUnlock(now: t)
+            }
+            t += 1
+        }
+        XCTAssertEqual(asked, 1 + AutoUnlockTiming.unlockTunnelRetries)
+        XCTAssertNil(ladder.unlockedAt, "then the usual climb")
     }
 }
 

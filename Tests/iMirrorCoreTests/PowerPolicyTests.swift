@@ -60,6 +60,16 @@ final class SleepPolicyTests: XCTestCase {
         }
     }
 
+    /// A locked phone never gives up now (the ladder holds), so it must
+    /// not keep the Mac awake for good: only while auto-unlock may act.
+    func testALockedPhoneKeepsTheMacAwakeOnlyWhileAutoUnlockMayAct() {
+        XCTAssertFalse(SleepPolicy.isRecovering(.locked, gaveUp: false))
+        XCTAssertFalse(SleepPolicy.isRecovering(.locked, gaveUp: false, lockMayClear: false))
+        XCTAssertTrue(SleepPolicy.isRecovering(.locked, gaveUp: false, lockMayClear: true))
+        XCTAssertFalse(SleepPolicy.isRecovering(.locked, gaveUp: true, lockMayClear: true))
+        XCTAssertTrue(SleepPolicy.isRecovering(.booting, gaveUp: false, lockMayClear: false))
+    }
+
     func testAGivenUpPhoneWaitingOnAPersonLetsTheMacSleep() {
         // runwda's cause outranks gave_up, so the reason alone says "locked".
         for cls in [RunwdaLogClass.locked, .needsPasscode, .untrusted] {

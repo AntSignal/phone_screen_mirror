@@ -46,14 +46,21 @@ extension HIDKeyboard {
     /// it instead, and deletes nothing when it is already empty.
     public static func wakeThenPasscode(ascii: [UInt8]) -> [KeyStep]? {
         guard let rest = passcodeAfterWake(ascii: ascii) else { return nil }
-        var steps = wakeOnly()
-        steps[steps.count - 1].delayAfterMs = wakeSettleMs
-        return steps + rest
+        return autoWake() + rest
     }
 
     /// Shift only. Harmless on any screen, so auto-unlock sends it alone
     /// and probes the lock again before any digit goes out.
     public static func wakeOnly() -> [KeyStep] { wakeReports() }
+
+    /// Auto-unlock's wake SEND: Shift, then wakeSettleMs before the SEND
+    /// ends, so the screen is up before the reading that approves typing
+    /// and the keypad-opening Backspace (the 2026-11-15 timing).
+    public static func autoWake() -> [KeyStep] {
+        var steps = wakeOnly()
+        steps[steps.count - 1].delayAfterMs = wakeSettleMs
+        return steps
+    }
 
     /// Backspace to open the keypad, a wait, Backspaces to clear, then the
     /// code. Nil when the code is empty or has a character with no key.

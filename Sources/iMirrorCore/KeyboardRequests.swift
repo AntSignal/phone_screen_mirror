@@ -184,11 +184,12 @@ extension DeviceEvent {
     /// KeyboardFailures. The timings are milliseconds, numbers only.
     public static func keyboard(at date: Date, udid: String, alias: String, _ detail: KeyboardEventDetail,
                                 reason: String?, chars: Int? = nil, probeAgeMs: Int? = nil, sendMs: Int? = nil,
-                                transport: KeyboardTransportKind? = nil) -> DeviceEvent {
+                                firstKeyAgeMs: Int? = nil, transport: KeyboardTransportKind? = nil) -> DeviceEvent {
         var e = DeviceEvent(at: date, udid: udid, alias: alias, event: .keyboard, reason: reason,
                             detail: detail.rawValue, chars: chars, transport: transport?.rawValue)
         e.probeAgeMs = probeAgeMs
         e.sendMs = sendMs
+        e.firstKeyAgeMs = firstKeyAgeMs
         return e
     }
 }

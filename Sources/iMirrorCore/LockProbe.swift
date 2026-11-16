@@ -36,6 +36,34 @@ public enum AutoUnlockTiming {
     public static let probeTimeoutSec: TimeInterval = 3
     /// After an unlock, how long go-ios gets to retry the tunnel itself.
     public static let unlockTunnelWaitSec: TimeInterval = 20
+    /// After an unlock, retry a refused tunnel restart this often.
+    public static let unlockTunnelRetrySec: TimeInterval = 15
+    /// At most this many such retries per unlock.
+    public static let unlockTunnelRetries = 10
+    /// An unlock seen later than this after typing proves nothing.
+    public static let verifyProvenSec: TimeInterval = 5
+    /// Most seconds from the approving reading to the first key.
+    public static let firstKeyMaxSec: TimeInterval = 4.5
+    /// A wake or passcode SEND running longer ends the try.
+    public static let sendDeadlineSec: TimeInterval = 75
+    /// Longest a locked phone may keep the Mac awake.
+    public static let keepAwakeLockedSec: TimeInterval = 600
+}
+
+/// How old the approving lock reading was when the first key left.
+public enum FirstKeyAge {
+    /// `firstKeyAt` is the moment the transport sent its first key, when
+    /// it can see that (this Mac's Bluetooth). The dongle cannot: it
+    /// connects, waits and types inside one SEND. Its first key is no
+    /// later than the SEND's end minus the steps' own delays, so that
+    /// gives an upper bound, which is the safe side.
+    public static func seconds(readingStartedAt: TimeInterval, firstKeyAt: TimeInterval?,
+                               sendStartedAt: TimeInterval, sendEndedAt: TimeInterval,
+                               stepDelaysMs: Int) -> TimeInterval {
+        if let at = firstKeyAt { return at - readingStartedAt }
+        let bound = max(sendStartedAt, sendEndedAt - TimeInterval(max(stepDelaysMs, 0)) / 1000)
+        return bound - readingStartedAt
+    }
 }
 
 public enum LockProbeParsing {

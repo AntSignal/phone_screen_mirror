@@ -210,17 +210,22 @@ final class AutoUnlockRequestTests: XCTestCase {
                         "auto_aborted"])
         XCTAssertEqual(AutoUnlockReason.allCases.map(\.rawValue),
                        ["settings", "request", "still_locked", "unverified", "interrupted",
-                        "unlocked_before_typing", "lock_unknown", "probe_timeout"])
+                        "unlocked_before_typing", "lock_unknown", "probe_timeout", "unlocked_late",
+                        "slow_keyboard", "renamed"])
+        XCTAssertEqual(PasscodeGateHold.sendStuck.rawValue, "send_stuck")
+        XCTAssertEqual(PasscodeGateHold.clickChecking.rawValue, "click_checking")
         XCTAssertEqual(AutoUnlockState.offAfterFailure.rawValue, "off_after_failure")
     }
 
     func testTheAutoTypedLineHasACountAndNoText() throws {
         let e = DeviceEvent.keyboard(at: Date(timeIntervalSince1970: 0), udid: udid, alias: "phone2", .autoTyped,
-                                     reason: nil, chars: 6, probeAgeMs: 900, sendMs: 4200, transport: .dongle)
+                                     reason: nil, chars: 6, probeAgeMs: 900, sendMs: 4200, firstKeyAgeMs: 2100,
+                                     transport: .dongle)
         let line = DeviceEventCodec.line(e)
         let obj = try JSONSerialization.jsonObject(with: line) as! [String: Any]
         XCTAssertEqual(Set(obj.keys), ["ts", "udid", "alias", "event", "detail", "chars", "probe_age_ms", "send_ms",
-                                       "transport"])
+                                       "first_key_age_ms", "transport"])
+        XCTAssertEqual(obj["first_key_age_ms"] as? Int, 2100)
         XCTAssertEqual(obj["detail"] as? String, "auto_typed")
         XCTAssertEqual(obj["chars"] as? Int, 6)
         XCTAssertEqual(obj["probe_age_ms"] as? Int, 900)
