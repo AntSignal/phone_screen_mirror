@@ -61,6 +61,10 @@ final class ChainManager {
     var onLockReading: ((DeviceController, LockReading, TimeInterval) -> Void)?
     var unlockCause: (String) -> String = { _ in "other" }
     var autoUnlockState: (String) -> String? = { _ in nil }
+    /// Could auto-unlock still type for this locked phone? (PowerPolicy)
+    var autoUnlockMayAct: (String) -> Bool = { _ in false }
+    /// A phone's alias changed; its passcode key changed with it.
+    var onAliasChanged: ((_ udid: String, _ alias: String) -> Void)?
 
     private static let slotsKey = "imirror.deviceSlots"
 
@@ -106,7 +110,9 @@ final class ChainManager {
     private func updateSleepAssertion() {
         let now = ProcessInfo.processInfo.systemUptime
         let lastTraffic = controllers.compactMap { $0.sampleTraffic(now: now) }.max()
-        let recovering = controllers.contains { SleepPolicy.isRecovering($0.reason, gaveUp: $0.ladder.hardStopped) }
+        let recovering = controllers.contains {
+            SleepPolicy.isRecovering($0.reason, gaveUp: $0.ladder.hardStopped, lockMayClear: autoUnlockMayAct($0.udid))
+        }
         sleepAssertion.set(SleepPolicy.keepAwake(automationOn: running, lastTrafficAt: lastTraffic,
                                                  recovering: recovering, now: now))
     }
@@ -373,9 +379,11 @@ final class ChainManager {
     func rename(_ c: DeviceController, to alias: String) -> AliasProblem? {
         if let problem = validateAlias(alias, forUDID: c.udid, in: table) { return problem }
         if reservedAliases().contains(alias.lowercased()) { return .taken(byUDID: "simulator") }
+        let changed = table.entries[c.udid]?.alias != alias
         table.entries[c.udid]?.alias = alias
         saveTable()
         c.alias = alias
+        if changed { onAliasChanged?(c.udid, alias) }
         onDevicesChanged?()
         scheduleWrite()
         return nil

@@ -20,6 +20,8 @@ protocol AutoUnlockPhone: AnyObject {
     var autoUnlockFacts: (macAsleep: Bool, sheetUp: Bool, wdaUp: Bool) { get }
     /// The newest lock reading, unknown ones included.
     var latestLock: LockSample? { get }
+    /// When the lock probe now running started; nil when none runs.
+    var lockProbeInFlightSince: TimeInterval? { get }
     func probeLockNow()
 }
 
@@ -70,6 +72,7 @@ final class AutoUnlockDriver {
         }
         keyboard.onAutoRequest = { [weak self] udid, on in self?.requested(udid, on: on) }
         keyboard.onClickTyped = { [weak self] udid in self?.clickTyped(udid) }
+        keyboard.autoHolds = { [weak self] udid in self?.gates[udid]?.inProgress ?? false }
         guard ticking else { return }
         let t = Timer(timeInterval: AutoUnlockTiming.verifyProbeIntervalSec, repeats: true) { [weak self] _ in
             MainActor.assumeIsolated { self?.tickAll() }
@@ -123,7 +126,10 @@ final class AutoUnlockDriver {
         f.dateFormat = "HH:mm"
         switch r.state {
         case .on:
-            return "Auto-unlock: on" + (lastUnlockedWall[udid].map { " · last unlocked \(f.string(from: $0))" } ?? "")
+            // Show when an agent, not a person, turned it on.
+            let how = r.changedBy == .request ? " (turned on by a request)" : ""
+            return "Auto-unlock: on\(how)"
+                + (lastUnlockedWall[udid].map { " · last unlocked \(f.string(from: $0))" } ?? "")
         case .off:
             return "Auto-unlock: off"
         case .offAfterFailure:
@@ -137,6 +143,24 @@ final class AutoUnlockDriver {
 
     private func gate(_ udid: String) -> PasscodeGate {
         gates[udid] ?? PasscodeGate(udid: udid, history: settings.record(for: udid))
+    }
+
+    /// May a locked phone keep the Mac awake? Only while its gate could
+    /// still type (PasscodeGate.mayStillAct), so never for good.
+    func mayStillAct(_ udid: String) -> Bool { gates[udid]?.mayStillAct(now: uptime()) ?? false }
+
+    /// The phone's alias changed, so the key its passcode is read under
+    /// did too (PHONE2_PASSCODE). Typing another phone's code would be
+    /// a wrong attempt, so auto-unlock goes off until a person checks.
+    func aliasChanged(_ udid: String, to alias: String) {
+        guard record(udid).enabled else { return }
+        var g = gate(udid)
+        g.setEnabled(false, by: .settings, wallNow: Date())
+        gates[udid] = g
+        persist(g)
+        log(udid, alias: alias, .autoOff, AutoUnlockReason.renamed.rawValue)
+        notifyOff(udid, alias: alias, why: "The phone was renamed, so its passcode key changed.")
+        onChange?()
     }
 
     /// Who unlocked the phone, for the lock event.
@@ -176,7 +200,19 @@ final class AutoUnlockDriver {
             paired: keyboard.pairs().pair(for: phone.udid) != nil,
             attached: keyboard.aliasOf(phone.udid) != nil,
             macAsleep: f.macAsleep, sheetUp: f.sheetUp, wdaUp: f.wdaUp,
-            keyboardBusy: keyboard.busy && keyboard.autoSequenceUDID != phone.udid)
+            keyboardBusy: keyboard.busy && keyboard.autoSequenceUDID != phone.udid,
+            clickChecking: clicks[phone.udid] != nil, probeInFlightSince: phone.lockProbeInFlightSince)
+    }
+
+    /// Carry a SEND's end into the gate even when the phone object that
+    /// started it is gone (detached or replaced), so the try never sticks.
+    private func afterSend(_ udid: String, endSequence: Bool, _ change: (inout PasscodeGate) -> Void) {
+        var g = gate(udid)
+        change(&g)
+        gates[udid] = g
+        persist(g)
+        if endSequence { keyboard.endAutoSequence() }
+        if let phone = phones[udid] { step(phone) }
     }
 
     private func step(_ phone: AutoUnlockPhone) {
@@ -189,8 +225,12 @@ final class AutoUnlockDriver {
         switch next {
         case .nothing:
             break
-        case .probe, .verifyProbe:
+        case .probe:
             phone.probeLockNow()
+        case .verifyProbe:
+            // About once a second, not after every reading.
+            let last = g.latest?.startedAt ?? -.infinity
+            if now - last >= AutoUnlockTiming.verifyProbeIntervalSec { phone.probeLockNow() }
         case .wake:
             guard keyboard.beginAutoSequence(udid: udid) else { return }
             // Saved before any key, so a crash turns auto off.
@@ -198,24 +238,18 @@ final class AutoUnlockDriver {
             gates[udid] = g
             persist(g)
             log(udid, alias: phone.alias, .autoWake, nil)
-            keyboard.sendAutoWake(udid: udid) { [weak self, weak phone] failure in
-                guard let self, let phone else { return }
-                var g = self.gate(udid)
-                g.wakeEnded(now: uptime(), failure: failure)
-                self.gates[udid] = g
-                self.persist(g)
-                self.step(phone)
+            keyboard.sendAutoWake(udid: udid) { [weak self] failure in
+                guard let self else { return }
+                let t = self.uptime()
+                self.afterSend(udid, endSequence: false) { $0.wakeEnded(now: t, failure: failure) }
             }
         case .type(let approval):
             // Same main-thread turn as decide: the approval is fresh.
-            keyboard.typePasscodeAutomatically(approval) { [weak self, weak phone] result in
-                guard let self, let phone else { return }
-                var g = self.gate(udid)
-                g.typingEnded(result, now: uptime())
-                self.gates[udid] = g
-                self.persist(g)
-                self.keyboard.endAutoSequence()   // typing is over; verify needs no keys
-                self.step(phone)
+            keyboard.typePasscodeAutomatically(approval) { [weak self] result, age in
+                guard let self else { return }
+                let t = self.uptime()
+                // Typing is over; verify needs no keys.
+                self.afterSend(udid, endSequence: true) { $0.typingEnded(result, now: t, firstKeyAgeSec: age) }
             }
         case .finished(let outcome):
             if keyboard.autoSequenceUDID == udid { keyboard.endAutoSequence() }
@@ -230,22 +264,37 @@ final class AutoUnlockDriver {
             unlockedBy[udid] = ("auto", uptime())
             lastUnlockedWall[udid] = Date()
             log(udid, alias: phone.alias, .autoUnlocked, nil)
-        case .stillLocked, .unverified, .interrupted:
+        case .stillLocked, .unverified, .interrupted, .unlockedLate, .lateFirstKey:
             log(udid, alias: phone.alias, .autoFailed, o.eventReason)
-            notifyOff(udid, alias: phone.alias, why: o == .stillLocked
-                      ? "It typed the passcode and the phone stayed locked."
-                      : "It typed the passcode and could not tell whether the phone unlocked.")
+            notifyOff(udid, alias: phone.alias, why: Self.failureText(o))
         case .unlockedBeforeTyping, .aborted, .notSent:
             log(udid, alias: phone.alias, .autoAborted, o.eventReason)
         }
         onChange?()
     }
 
+    /// Plain words for the notification; never digits from the file.
+    private static func failureText(_ o: AutoUnlockOutcome) -> String {
+        switch o {
+        case .stillLocked: return "It typed the passcode and the phone stayed locked."
+        case .unlockedLate:
+            return "The phone unlocked too long after typing to prove the passcode did it (Face ID?)."
+        case .lateFirstKey:
+            return "The keyboard took too long to connect, so the phone may have unlocked before the keys arrived."
+        default: return "It typed the passcode and could not tell whether the phone unlocked."
+        }
+    }
+
     // MARK: A clicked passcode
 
+    /// A click spends this lock's try, so auto never repeats its value.
     private func clickTyped(_ udid: String) {
         let now = uptime()
         unlockedBy[udid] = ("click", now)
+        var g = gate(udid)
+        g.clickTyped(wallNow: Date(), now: now)
+        gates[udid] = g
+        persist(g)
         guard let v = ClickVerify(typedAt: now, lastBefore: gates[udid]?.latest) else { return }
         clicks[udid] = v
     }

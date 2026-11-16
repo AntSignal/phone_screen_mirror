@@ -39,6 +39,11 @@ KEYBOARD_ANSWERS = {
     "auto_on": {"auto_on", "failed"},
     "auto_off": {"auto_off", "failed"},
 }
+# An auto on/off request is answered only by its own detail with reason
+# "request", or by a failure the request gate or precheck gives. An
+# automatic try's own failures (busy, send_failed) answer nothing.
+AUTO_REQUEST_FAILURES = {"bad_request", "unknown_action", "bad_text", "stale", "not_attached", "not_paired",
+                         "no_file", "no_passcode", "untypeable"}
 # What `keyboard auto status` shows: auto-unlock and lock events.
 AUTO_DETAILS = {"auto_on", "auto_off", "auto_wake", "auto_typed", "auto_unlocked", "auto_failed", "auto_aborted"}
 
@@ -274,12 +279,24 @@ def read_pairs(folder):
     return {k: v for k, v in data.items() if isinstance(v, dict)} if isinstance(data, dict) else {}
 
 
+def answers(e, action):
+    """Does keyboard event `e` answer an `action` request?"""
+    detail = e.get("detail")
+    if detail not in KEYBOARD_ANSWERS[action]:
+        return False
+    if action in ("auto_on", "auto_off"):
+        if detail == "failed":
+            return e.get("reason") in AUTO_REQUEST_FAILURES
+        return e.get("reason") == "request"
+    return True
+
+
 def keyboard_outcome(events, udid, since, action):
     """The newest keyboard event after `since` that answers `action`, or None."""
     for e in reversed(events):
         ts = parse_iso(e.get("ts"))
         if (e.get("event") == "keyboard" and e.get("udid") == udid and ts is not None and ts >= since
-                and e.get("detail") in KEYBOARD_ANSWERS[action]):
+                and answers(e, action)):
             return e
     return None
 

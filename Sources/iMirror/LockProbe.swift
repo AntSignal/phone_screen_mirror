@@ -38,7 +38,8 @@ extension GoIOS {
             p.terminate()
             if exited.wait(timeout: .now() + 0.5) == .timedOut {
                 kill(p.processIdentifier, SIGKILL)
-                exited.wait()
+                // A child stuck in a USB call may outlive SIGKILL.
+                _ = exited.wait(timeout: .now() + 2)
             }
         }
         // A grandchild may hold the pipe open: don't race it.

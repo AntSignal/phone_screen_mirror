@@ -283,11 +283,16 @@ named the same way (`locked`, `untrusted`). While a phone's WDA is down,
 iMirror also asks lockdown every 5 s whether it is locked (`ios lockdown get
 PasswordProtected`, which works over usbmux while the tunnel is down). A
 locked phone gets `reason: locked`, and the ladder stops that phone's
-children once and then waits: no restarts, no give-up, no `next_retry_at`,
-because every tunnel restart would cost the other phones their WDA. When the
+children once (after the stage's grace if the tunnel still lists the phone)
+and then waits: no restarts, no give-up, no `next_retry_at`,
+because every tunnel restart would cost the other phones their WDA. A locked
+phone keeps the Mac awake only while auto-unlock could still act on it, and
+for at most 10 min of the lock. When the
 phone reads unlocked again (by hand, a click or auto-unlock, below), its
 chain restarts at once; if the tunnel cannot reach it yet and another phone
-is up, iMirror gives go-ios 20 s to retry, then restarts the tunnel. A phone is called down only after two
+is up, iMirror gives go-ios 20 s to retry, then restarts the tunnel. If the
+tunnel's 2 min cooldown refuses that restart, it asks again every 15 s (up to
+10 times) instead of climbing to a give-up. A phone is called down only after two
 failed health probes in a row, and a probe that times out while other requests
 (say an agent's slow `/source`) are already waiting on WDA counts as busy, not
 failed. If WDA stays down, a ladder restarts that phone's own chain first, then
@@ -354,15 +359,22 @@ A `keyboard` event is about iMirror's Bluetooth keyboard. It has `transport`
 was trusted), `timeout` (the 120 s pairing window closed with no new phone),
 `connected`, `disconnected`, `typed_test`, `typed_passcode`, `failed`,
 `forgotten`, or one of auto-unlock's (below): `auto_on`, `auto_off` (`reason`
-`settings`, `request`, or `still_locked` when a clicked passcode left the
+`settings`, `request`, `renamed` when the phone's alias changed, or
+`still_locked` when a clicked passcode left the
 phone locked), `auto_wake`, `auto_typed`, `auto_unlocked`, `auto_failed`
-(`reason` `still_locked`, `unverified` or `interrupted`; auto-unlock is now
-off) and `auto_aborted` (no digit was sent; `reason` `unlocked_before_typing`,
-`lock_unknown`, `probe_timeout`, `disabled`, `sheet`, `wda_up`,
-`keyboard_busy`, or a keyboard failure such as `dongle_unavailable`). A
+(`reason` `still_locked`, `unverified`, `interrupted`, `unlocked_late` (it
+unlocked more than 5 s after typing, maybe by Face ID) or `slow_keyboard` (the
+first key may have left more than 4.5 s after the approving reading);
+auto-unlock is now off) and `auto_aborted` (no digit was sent; `reason`
+`unlocked_before_typing`, `lock_unknown`, `probe_timeout`, `disabled`,
+`sheet`, `wda_up`, `keyboard_busy`, `click_checking`, `send_stuck`, `stale`
+(this Mac's Bluetooth saw the first key come too late), or a keyboard failure
+such as `dongle_unavailable`). A
 typing line has `chars`: how many characters were typed, never what they
 were. `auto_typed` also has `probe_age_ms` (how old the lock reading was when
-typing began) and `send_ms` (how long the SEND took), numbers only. A `failed` line has a `reason`: `bad_request`,
+typing began), `send_ms` (how long the SEND took) and `first_key_age_ms` (how
+old it was at the first key; for the dongle an upper bound, from the SEND's
+end less its own delays), numbers only. A `failed` line has a `reason`: `bad_request`,
 `unknown_action`, `bad_text`, `stale`, `not_attached`, `not_paired`, `busy`,
 `bluetooth_unavailable`, `setup_failed`, `not_connected`, `send_failed`,
 `dongle_unavailable` (the phone is paired with the dongle and none answers on
@@ -404,9 +416,11 @@ Bluetooth keyboard for one phone: `{"udid", "requested_at", "requested_by",
 - `auto_on` turns auto-unlock (below) on for that phone. It needs the phone
   on USB, a pairing, and a typeable value for it in the passcode file
   (otherwise `failed` with `not_attached`, `not_paired`, `no_file`,
-  `no_passcode` or `untypeable`). Answered by `auto_on`.
+  `no_passcode` or `untypeable`). Answered by `auto_on` with `reason`
+  `request`. Settings then says "on (turned on by a request)", so a person
+  can see an agent did it.
 - `auto_off` turns it off, always (even for a phone not on USB). Answered by
-  `auto_off`.
+  `auto_off` with `reason` `request`.
 
 Any other action, or any other key in the file, is refused (event `keyboard`,
 `detail` `failed`). A file can turn auto-unlock on or off, never carry or
@@ -508,20 +522,38 @@ keyboard is free:
 1. The phone must have read locked for at least 20 s (so a person unlocking
    it wins), this lock must not have had a try yet, the last try must be
    2 min ago or more, and there must be fewer than 3 tries in the past hour.
-   A try counts from the wake, and the history is kept across restarts.
-2. iMirror sends Shift only (`auto_wake`), which is harmless on any screen.
+   A try counts from the wake, and the history is kept across restarts. A
+   clicked "Type passcode now" counts as a try too (it reads the same file),
+   and spends the lock's try when the phone was being read as locked; while
+   a click is being checked, nothing is typed automatically, and while an
+   automatic try (its check included) runs, the click is refused.
+2. iMirror sends Shift and waits 600 ms (`auto_wake`), which is harmless on
+   any screen. The keyboard is held from here to the last key, and this
+   Mac's Bluetooth is not stopped in between.
 3. It probes the lock again. Only a reading taken after the wake, at most
    2 s old, lets it type. Unlocked (Face ID, or a person) or unknown, or no
    reading within 5 s, ends the try with nothing typed (`auto_aborted`).
 4. It sends Backspace to open the keypad, Backspaces to clear it, and the
-   passcode, to that phone's peer only (`auto_typed`).
-5. For 15 s it probes every second. Any unlocked reading is success
-   (`auto_unlocked`, then `lock` `unlocked` and a chain restart). Otherwise
-   (`auto_failed` `still_locked`, or `unverified` if no reading could tell)
-   auto-unlock turns itself off, saved, with a macOS notification, until a
-   person turns it on again. A clicked passcode that leaves a locked phone
-   locked turns it off the same way (`auto_off` `still_locked`): the file's
-   value is probably wrong.
+   passcode, to that phone's peer only (`auto_typed`). This Mac's Bluetooth
+   checks the reading is still at most 2 s old right before the first key,
+   or sends nothing (`stale`). The dongle can't: it reconnects inside the
+   SEND (up to 15 s, then a 1 s settle). So iMirror bounds the reading's
+   age at the first key from the SEND's timing, and over 4.5 s the try
+   counts as failed (`slow_keyboard`) even if the phone unlocked.
+5. For 15 s it probes about once a second. An unlocked reading that started
+   within 5 s of the end of typing is success (`auto_unlocked`, then `lock`
+   `unlocked` and a chain restart). A later one may be a person's Face ID, so
+   it proves nothing (`unlocked_late`). Otherwise (`still_locked`, or
+   `unverified` if no reading could tell) auto-unlock turns itself off,
+   saved, with a macOS notification, until a person turns it on again. A
+   clicked passcode that leaves a locked phone locked turns it off the same
+   way (`auto_off` `still_locked`): the file's value is probably wrong. A
+   SEND that never comes back ends the try after 75 s (a stuck passcode SEND
+   as `unverified`).
+
+Renaming a phone turns its auto-unlock off (`auto_off` `renamed`), since
+its passcode key (`PHONE2_PASSCODE`) changes with the alias; an alias whose
+key another phone's alias already has (`phone-2` and `phone_2`) is refused.
 
 If iMirror stops during a try, it comes back with auto-unlock off
 (`auto_failed` `interrupted`). "Cannot tell" never types: a probe that
@@ -529,11 +561,17 @@ fails, times out or prints anything but `true`/`false` reads unknown.
 
 Risks, plainly: every try that fails is a wrong attempt toward the phone's
 lockout, which escalates; the limits above cap that at one per lock and three
-an hour, and the first failure stops it. The dongle can take up to 15 s to
-connect between the last probe and the first digit, so a person who unlocks
-the phone in that window would get the Backspaces and digits in whatever has
-focus; the 20 s settle rule and "only while WDA is down" make that unlikely,
-not impossible. The XCTest "Enable UI Automation" sheet (`needs_passcode`) is
+an hour, and the first failure stops it. The dongle firmware (protocol v1)
+reconnects inside every SEND and has no shorter connect wait, so the reading
+that approves typing can be up to about 17 s old at the first key. iMirror
+can only notice that afterwards: a person who unlocks the phone in that
+window gets the Backspaces and digits in whatever has focus, once, and then
+auto-unlock is off (`slow_keyboard`). The 20 s settle rule and "only while
+WDA is down" make that unlikely, not impossible. Closing it needs firmware:
+a SEND with a short connect-wait cap, or a hold that keeps the link from the
+wake to the last key. Separately, `keyboard test` allows three digits per
+request, so two tests sent to a locked phone's keypad can make a 4- or
+6-digit code and submit it. The XCTest "Enable UI Automation" sheet (`needs_passcode`) is
 never auto-typed: click "Type passcode now" for it.
 
 The first pair or type asks for Bluetooth access (System Settings › Privacy &

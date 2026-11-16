@@ -391,6 +391,20 @@ def test_keyboard_auto_on_reports_a_refusal(app_dir, monkeypatch, capsys):
     assert "no value for this phone" in capsys.readouterr().out
 
 
+def test_an_auto_request_is_answered_only_by_its_own_events():
+    def k(detail, reason):
+        return json.loads(ev("2026-11-13T10:00:01.000Z", PHONE_16E, "keyboard", detail=detail, reason=reason))
+    # An automatic try's failure, or a click's, answers neither.
+    assert ctl.keyboard_outcome([k("failed", "busy"), k("failed", "send_failed")], PHONE_16E, NOW, "auto_on") is None
+    # A failed click logs auto_off still_locked: not this request's answer.
+    assert ctl.keyboard_outcome([k("auto_off", "still_locked")], PHONE_16E, NOW, "auto_off") is None
+    assert ctl.keyboard_outcome([k("auto_off", "renamed")], PHONE_16E, NOW, "auto_off") is None
+    assert ctl.keyboard_outcome([k("auto_on", "request")], PHONE_16E, NOW, "auto_on")["detail"] == "auto_on"
+    assert ctl.keyboard_outcome([k("auto_on", "settings")], PHONE_16E, NOW, "auto_on") is None
+    for why in ("not_paired", "not_attached", "no_passcode", "no_file", "untypeable", "stale"):
+        assert ctl.keyboard_outcome([k("failed", why)], PHONE_16E, NOW, "auto_on")["reason"] == why
+
+
 def test_keyboard_auto_off_writes_auto_off(app_dir, monkeypatch):
     code, fake = run_auto(app_dir, monkeypatch, "off", detail="auto_off", reason="request")
     assert code == 0 and fake.seen["action"] == "auto_off"

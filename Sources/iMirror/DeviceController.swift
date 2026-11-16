@@ -57,6 +57,8 @@ final class DeviceController {
     private(set) var lockWatch = LockWatch()
     private var lockProbing = false
     private var lastLockProbeAt: TimeInterval?
+    /// Bumped when a hung probe is given up on; its late answer is dropped.
+    private var lockProbeEpoch = 0
     private var lockTimer: Timer?
 
     // Wired by ChainManager.
@@ -410,7 +412,11 @@ final class DeviceController {
         case .restartTunnelAndChains where afterUnlock:
             log(.restart, detail: "unlocked")
             status("\(alias) is unlocked — resetting the USB connection…")
-            if !requestTunnelRestart() { chain?.restart() }
+            if !requestTunnelRestart() {
+                // Cooldown refused: ask again soon, never climb to give-up.
+                chain?.restart()
+                ladder.tunnelRestartRefusedAfterUnlock(now: ProcessInfo.processInfo.systemUptime)
+            }
             onChange?()
         case .autoRetry:
             log(.autoRetry, detail: "after give-up \(ladder.giveUps)")
@@ -463,11 +469,19 @@ final class DeviceController {
     private func lockTick() {
         guard running else { return }
         let now = ProcessInfo.processInfo.systemUptime
+        // A probe stuck in the kernel must not stop probing.
+        if lockProbing, now - (lastLockProbeAt ?? now) > AutoUnlockTiming.probeTimeoutSec + 5 {
+            lockProbing = false
+            lockProbeEpoch += 1
+        }
         if chain != nil, health != .connected, !macAsleep,
            now - (lastLockProbeAt ?? -.infinity) >= AutoUnlockTiming.probeIntervalSec {
             probeLockNow()
         }
     }
+
+    /// When the probe now running started; nil when none runs.
+    var lockProbeInFlightSince: TimeInterval? { lockProbing ? lastLockProbeAt : nil }
 
     /// One probe now, unless one is already running for this phone.
     func probeLockNow() {
@@ -475,8 +489,9 @@ final class DeviceController {
         lockProbing = true
         let startedAt = ProcessInfo.processInfo.systemUptime
         lastLockProbeAt = startedAt
+        let epoch = lockProbeEpoch
         probeLock { [weak self] r in
-            guard let self else { return }
+            guard let self, epoch == self.lockProbeEpoch else { return }
             self.lockProbing = false
             guard self.running else { return }
             self.lockRead(r, startedAt: startedAt)

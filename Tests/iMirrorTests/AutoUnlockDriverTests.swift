@@ -13,19 +13,30 @@ private let dummy = "222222"
 
 @MainActor
 private final class FakeKeyboard: KeyboardTransport {
-    var kind: KeyboardTransportKind { .dongle }
+    /// .corebluetooth calls beforeFirstKey, as BLEKeyboard does.
+    var kind: KeyboardTransportKind = .dongle
     var sends: [[KeyStep]] = []
     var fail: Error?
+    var stops = 0
+    /// `stops` as each SEND began.
+    var stopsAtSend: [Int] = []
     /// Each SEND takes time; the test clock moves on.
     var onType: (() -> Void)?
+    /// Bluetooth only: runs before the check, like a connect wait.
+    var beforeCheck: (() -> Void)?
     func pair(udid: String, window: TimeInterval) async throws -> PairingOutcome { .none }
-    func type(_ steps: [KeyStep], to pair: KeyboardPair) async throws {
+    func type(_ steps: [KeyStep], to pair: KeyboardPair, beforeFirstKey: FirstKeyCheck?) async throws {
+        if kind == .corebluetooth, let beforeFirstKey {
+            beforeCheck?()
+            if !beforeFirstKey() { throw BLEKeyboardError.stale }
+        }
+        stopsAtSend.append(stops)
         onType?()
         if let fail { throw fail }
         sends.append(steps)
     }
     func forget(_ pair: KeyboardPair) async throws {}
-    func stop() {}
+    func stop() { stops += 1 }
 
     /// True when any SEND held a digit key (usages 0x1E-0x27).
     var sentDigits: Bool { sends.joined().contains { (0x1E...0x27).contains($0.report[2]) } }
@@ -36,6 +47,7 @@ private final class FakePhone: AutoUnlockPhone, @unchecked Sendable {
     let alias = "phone2"
     var autoUnlockFacts: (macAsleep: Bool, sheetUp: Bool, wdaUp: Bool) = (false, false, false)
     var latestLock: LockSample?
+    var lockProbeInFlightSince: TimeInterval?
     var probes = 0
     /// What the next probe reads; nil leaves the probe unanswered.
     var answer: (() -> LockReading)?
@@ -141,19 +153,25 @@ final class AutoUnlockDriverTests: XCTestCase {
     }
 
     func testTheHappyPath() throws {
+        // Asserts go outside: XCTest reports failures on stderr.
+        var sendsAtTyped: [[KeyStep]] = []
+        var causeAtTyped = ""
         let stderrText = try captureStderr {
             driver.setEnabled(udid, true, by: .settings)
             lockedLongEnough()
             phone.answer = { [unowned self] in self.now += 0.3; return .locked }
             driver.reading(phone, .locked, startedAt: now)
             spin { details().contains("auto_typed") }
-            XCTAssertEqual(fake.sends.count, 2, "the wake, then the passcode")
-            XCTAssertEqual(fake.sends.first, HIDKeyboard.wakeOnly())
-            XCTAssertEqual(driver.unlockCause(udid), "auto")
+            sendsAtTyped = fake.sends
+            causeAtTyped = driver.unlockCause(udid)
             now += 3
             driver.reading(phone, .unlocked, startedAt: now)
-            spin { details().contains("auto_unlocked") }
+            spin { details().contains("auto_unlocked") || details().contains("auto_failed") }
         }
+        XCTAssertEqual(sendsAtTyped.count, 2, "the wake, then the passcode")
+        XCTAssertEqual(sendsAtTyped.first, HIDKeyboard.autoWake())
+        XCTAssertEqual(fake.stopsAtSend, [0, 0], "the link stays up from the wake to the last key")
+        XCTAssertEqual(causeAtTyped, "auto")
         XCTAssertEqual(details().filter { $0.hasPrefix("auto_") }, ["auto_on", "auto_wake", "auto_typed", "auto_unlocked"])
         let typed = try XCTUnwrap(events.first { $0.detail == "auto_typed" })
         XCTAssertEqual(typed.chars, 6)
@@ -161,6 +179,8 @@ final class AutoUnlockDriverTests: XCTestCase {
         XCTAssertEqual(driver.unlockCause(udid), "auto")
         XCTAssertTrue(driver.record(udid).enabled)
         XCTAssertNil(driver.record(udid).pendingSince)
+        XCTAssertNotNil(typed.firstKeyAgeMs)
+        XCTAssertEqual(fake.stops, 1)
         let entry = RegisteredDevice(udid: udid, alias: "phone2", kind: .device, wdaURL: "x", state: .down,
                                      autoUnlock: driver.registryState(udid))
         let registry = String(decoding: try JSONEncoder().encode(entry), as: UTF8.self)
@@ -247,14 +267,14 @@ final class AutoUnlockDriverTests: XCTestCase {
     func testAStaleOrForeignApprovalTypesNothing() {
         var results: [TypeResult] = []
         XCTAssertTrue(keyboard.beginAutoSequence(udid: udid))
-        keyboard.typePasscodeAutomatically(AutoTypeApproval(udid: udid, readingStartedAt: now - 2.5)) {
-            results.append($0)
+        keyboard.typePasscodeAutomatically(AutoTypeApproval(udid: udid, readingStartedAt: now - 2.5)) { r, _ in
+            results.append(r)
         }
         keyboard.typePasscodeAutomatically(AutoTypeApproval(udid: "00008150-001928E01404401C",
-                                                            readingStartedAt: now)) { results.append($0) }
+                                                            readingStartedAt: now)) { r, _ in results.append(r) }
         keyboard.endAutoSequence()
-        keyboard.typePasscodeAutomatically(AutoTypeApproval(udid: udid, readingStartedAt: now)) {
-            results.append($0)
+        keyboard.typePasscodeAutomatically(AutoTypeApproval(udid: udid, readingStartedAt: now)) { r, _ in
+            results.append(r)
         }
         drain()
         XCTAssertEqual(results, [.notSent(.stale), .notSent(.stale), .notSent(.stale)],
@@ -278,6 +298,137 @@ final class AutoUnlockDriverTests: XCTestCase {
         XCTAssertFalse(driver.record(udid).enabled)
         XCTAssertEqual(events.last?.detail, "failed")
         XCTAssertEqual(events.last?.reason, "no_passcode")
+    }
+
+    private func click() -> String {
+        let e = NSEvent.mouseEvent(with: .leftMouseUp, location: .zero, modifierFlags: [], timestamp: 0,
+                                   windowNumber: 0, context: nil, eventNumber: 0, clickCount: 1, pressure: 1)
+        return keyboard.typePasscodeFromClick(udid: udid, event: e, file: dir.appendingPathComponent("secrets.env"))
+    }
+
+    /// Review finding: a wrong clicked code, then the same wrong code
+    /// typed automatically on the same lock, is two wrong attempts.
+    func testAClickedPasscodeSpendsTheLocksTry() {
+        driver.setEnabled(udid, true, by: .settings)
+        driver.reading(phone, .locked, startedAt: now - 8)
+        _ = click()
+        spin { details().contains("typed_passcode") }
+        XCTAssertEqual(fake.sends.count, 1)
+        phone.answer = { .locked }   // the clicked value was wrong
+        for _ in 0..<30 {
+            now += 1
+            driver.reading(phone, .locked, startedAt: now)
+            driver.tick(phone)
+            drain()
+        }
+        XCTAssertEqual(fake.sends.count, 1, "no automatic wake on that lock")
+        XCTAssertFalse(details().contains("auto_wake"))
+        XCTAssertFalse(driver.record(udid).enabled, "the failed click turned it off")
+    }
+
+    /// The other way round: a click while auto is verifying is refused.
+    func testAClickDuringAnAutomaticTryIsRefused() {
+        driver.setEnabled(udid, true, by: .settings)
+        lockedLongEnough()
+        phone.answer = { .locked }
+        driver.reading(phone, .locked, startedAt: now)
+        spin { details().contains("auto_typed") }
+        XCTAssertFalse(keyboard.busy, "typing is over")
+        let line = click()
+        XCTAssertTrue(line.contains("Auto-unlock is checking"), line)
+        XCTAssertEqual(fake.sends.count, 2)
+    }
+
+    /// The dongle reconnects inside its SEND; a slow one can't prove
+    /// the phone was still locked when the keys landed.
+    func testASlowDongleSendTurnsAutoOffEvenIfItUnlocked() {
+        driver.setEnabled(udid, true, by: .settings)
+        lockedLongEnough()
+        phone.answer = { .locked }
+        var sendsSeen = 0
+        fake.onType = { [unowned self] in
+            sendsSeen += 1
+            self.now += sendsSeen == 2 ? 12 : 1   // a 12 s reconnect for the code
+        }
+        driver.reading(phone, .locked, startedAt: now)
+        spin { details().contains("auto_typed") }
+        driver.reading(phone, .unlocked, startedAt: now)
+        spin { details().contains("auto_failed") }
+        XCTAssertEqual(events.last { $0.detail == "auto_failed" }?.reason, "slow_keyboard")
+        let typed = events.first { $0.detail == "auto_typed" }
+        XCTAssertGreaterThan(typed?.firstKeyAgeMs ?? 0, Int(AutoUnlockTiming.firstKeyMaxSec * 1000))
+        XCTAssertFalse(driver.record(udid).enabled)
+        XCTAssertEqual(notes.count, 1)
+    }
+
+    /// This Mac's Bluetooth checks at the first key: a slow reconnect
+    /// there sends nothing.
+    func testABluetoothFirstKeyTooLateSendsNothing() {
+        fake.kind = .corebluetooth
+        driver.setEnabled(udid, true, by: .settings)
+        lockedLongEnough()
+        phone.answer = { .locked }
+        fake.beforeCheck = { [unowned self] in self.now += 3 }   // the passcode's connect wait
+        driver.reading(phone, .locked, startedAt: now)
+        spin { details().contains("auto_aborted") }
+        XCTAssertEqual(events.last?.reason, "stale")
+        XCTAssertFalse(fake.sentDigits)
+        XCTAssertEqual(fake.sends.count, 1, "the wake only")
+        XCTAssertTrue(driver.record(udid).enabled, "nothing typed, so it stays on")
+        XCTAssertFalse(keyboard.busy)
+    }
+
+    /// The phone object that started a SEND is gone when it ends: the
+    /// try still ends and the keyboard is freed.
+    func testAReplacedPhoneStillEndsTheTry() {
+        driver.setEnabled(udid, true, by: .settings)
+        lockedLongEnough()
+        var replaced = false
+        fake.onType = { [unowned self] in
+            self.now += 1
+            guard !replaced else { return }
+            replaced = true
+            let fresh = FakePhone()
+            fresh.driver = self.driver
+            fresh.clock = { [unowned self] in self.now }
+            fresh.answer = { .unlocked }
+            self.phone = fresh
+            self.driver.reading(fresh, .locked, startedAt: self.now - 0.5)   // before the wake ended
+        }
+        phone.answer = { .locked }
+        driver.reading(phone, .locked, startedAt: now)
+        spin { details().contains("auto_aborted") }
+        XCTAssertEqual(events.last { $0.detail == "auto_aborted" }?.reason, "unlocked_before_typing")
+        XCTAssertFalse(keyboard.busy)
+        XCTAssertNil(keyboard.autoSequenceUDID)
+    }
+
+    func testARenameTurnsItOff() {
+        driver.setEnabled(udid, true, by: .settings)
+        driver.aliasChanged(udid, to: "sixteen")
+        XCTAssertFalse(driver.record(udid).enabled)
+        XCTAssertEqual(events.last?.detail, "auto_off")
+        XCTAssertEqual(events.last?.reason, "renamed")
+        XCTAssertEqual(notes.count, 1)
+        driver.aliasChanged(udid, to: "phone2")
+        XCTAssertEqual(notes.count, 1, "already off: nothing more")
+    }
+
+    func testTheStatusLineSaysWhenARequestTurnedItOn() {
+        driver.setEnabled(udid, true, by: .request)
+        XCTAssertEqual(driver.statusText(udid, alias: "phone2"), "Auto-unlock: on (turned on by a request)")
+        driver.setEnabled(udid, true, by: .settings)
+        XCTAssertEqual(driver.statusText(udid, alias: "phone2"), "Auto-unlock: on")
+    }
+
+    func testALockedPhoneKeepsTheMacAwakeOnlyWhileATryIsPossible() {
+        driver.reading(phone, .locked, startedAt: now)
+        XCTAssertFalse(driver.mayStillAct(udid), "off")
+        driver.setEnabled(udid, true, by: .settings)
+        driver.reading(phone, .locked, startedAt: now + 1)   // still settling
+        XCTAssertTrue(driver.mayStillAct(udid))
+        now += AutoUnlockTiming.keepAwakeLockedSec + 1
+        XCTAssertFalse(driver.mayStillAct(udid))
     }
 
     /// NSLog writes to stderr in a test run; point fd 2 at a file meanwhile.

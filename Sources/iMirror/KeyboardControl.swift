@@ -7,8 +7,10 @@
 // file only does the work.
 //
 // One run at a time; an auto-unlock sequence holds the keyboard from its
-// wake to its last key. After each run the keyboard stops (no advertising,
-// no services), so the phone drops it and its on-screen keyboard comes back.
+// wake to its last key, and its transport is not stopped in between, so
+// this Mac's Bluetooth link stays up and the first key goes out at once.
+// After each run the keyboard stops (no advertising, no services), so the
+// phone drops it and its on-screen keyboard comes back.
 //
 // Events carry counts, never text. Main thread only.
 
@@ -27,6 +29,10 @@ final class KeyboardControl {
     private(set) var busy = false
     /// The phone whose auto-unlock sequence holds the keyboard.
     private(set) var autoSequenceUDID: String?
+    /// The sequence's transport, stopped when the sequence ends.
+    private var autoTransport: KeyboardTransport?
+    /// True while auto-unlock is trying this phone, verify included.
+    var autoHolds: (_ udid: String) -> Bool = { _ in false }
     /// A request asked to turn auto-unlock on or off (AutoUnlockDriver).
     var onAutoRequest: ((_ udid: String, _ on: Bool) -> Void)?
     /// A clicked passcode was sent; auto-unlock checks it took.
@@ -155,6 +161,11 @@ final class KeyboardControl {
     func typePasscodeFromClick(udid: String, event: NSEvent?, file: URL) -> String {
         guard Self.isHumanClick(event?.type) else { return "Type passcode: only a click can start this." }
         guard !busy else { log(udid, .failed, .busy); return "The keyboard is busy; try again in a moment." }
+        // One lock, one file value, two tries: two wrong attempts.
+        guard !autoHolds(udid) else {
+            log(udid, .failed, .busy)
+            return "Auto-unlock is checking its own try on this phone; try again in 20 seconds."
+        }
         guard let pair = pairs().pair(for: udid) else {
             log(udid, .failed, .notPaired)
             return "Pair the keyboard first: scripts/imirror-ctl keyboard pair <device>."
@@ -181,7 +192,11 @@ final class KeyboardControl {
         }
         run(udid, chars: chars, pick: { t }) { [weak self] t in
             defer { HIDKeyboard.wipe(&steps) }
-            try await t.type(steps, to: pair)
+            do { try await t.type(steps, to: pair) } catch {
+                // Some keys may have gone out: auto-unlock must know.
+                if case .maybeSent = TypeResult(failure: Self.failure(error)) { self?.onClickTyped?(udid) }
+                throw error
+            }
             self?.onClickTyped?(udid)
             return (.typedPasscode, chars)
         }
@@ -203,18 +218,21 @@ final class KeyboardControl {
     func endAutoSequence() {
         guard autoSequenceUDID != nil else { return }
         autoSequenceUDID = nil
+        autoTransport?.stop()
+        autoTransport = nil
         busy = false
         onChange?()
     }
 
-    /// Shift only, to the paired phone only. `done` gets nil when sent.
+    /// Shift and the wake settle, to the paired phone only. `done` gets
+    /// nil when sent. The transport stays up for the passcode.
     func sendAutoWake(udid: String, done: @escaping (KeyboardFailure?) -> Void) {
         guard autoSequenceUDID == udid, let pair = pairs().pair(for: udid) else { return done(.notPaired) }
         let t = transport(for: pair)
+        autoTransport = t
         Task { @MainActor in
             var failure: KeyboardFailure?
-            do { try await t.type(HIDKeyboard.wakeOnly(), to: pair) } catch { failure = Self.failure(error) }
-            t.stop()
+            do { try await t.type(HIDKeyboard.autoWake(), to: pair) } catch { failure = Self.failure(error) }
             done(failure)
         }
     }
@@ -222,37 +240,52 @@ final class KeyboardControl {
     /// The one automatic way a passcode is typed. Only AutoUnlock.swift
     /// calls it, for a `.type` step; PasscodeCallSiteTests checks. Re-checks
     /// the approval's age and the pairing, reads the value, types it to
-    /// that phone's peer only, zeroes the buffers and logs a count.
-    func typePasscodeAutomatically(_ a: AutoTypeApproval, done: @escaping (TypeResult) -> Void) {
+    /// that phone's peer only, zeroes the buffers and logs a count. `done`
+    /// gets the reading's age at the first key (FirstKeyAge), which the
+    /// gate holds to firstKeyMaxSec.
+    func typePasscodeAutomatically(_ a: AutoTypeApproval,
+                                   done: @escaping (TypeResult, _ firstKeyAgeSec: TimeInterval?) -> Void) {
         let now = uptime()
-        guard autoSequenceUDID == a.udid, a.isFresh(now: now) else { return done(.notSent(.stale)) }
-        guard let pair = pairs().pair(for: a.udid) else { return done(.notSent(.notPaired)) }
+        guard autoSequenceUDID == a.udid, a.isFresh(now: now) else { return done(.notSent(.stale), nil) }
+        guard let pair = pairs().pair(for: a.udid) else { return done(.notSent(.notPaired), nil) }
         let secret: SecretBytes
         switch PasscodeLookup.load(udid: a.udid, alias: aliasOf(a.udid), file: passcodeFile()) {
-        case .noFile: return done(.notSent(.noFile))
-        case .noPasscode: return done(.notSent(.noPasscode))
+        case .noFile: return done(.notSent(.noFile), nil)
+        case .noPasscode: return done(.notSent(.noPasscode), nil)
         case .found(let s): secret = s
         }
         let chars = secret.count
         let steps = HIDKeyboard.passcodeAfterWake(ascii: secret.bytes)
         secret.wipe()
-        guard var steps else { return done(.notSent(.untypeable)) }
-        let t = transport(for: pair)
+        guard var steps else { return done(.notSent(.untypeable), nil) }
+        let t = autoTransport ?? transport(for: pair)
+        autoTransport = t
         let probeAgeMs = Int((now - a.readingStartedAt) * 1000)
+        let delaysMs = steps.reduce(0) { $0 + max($1.delayAfterMs, 0) }
+        let firstKey = FirstKeyMark()
+        // Rechecked at the first key where the transport sees it.
+        let clock = uptime
+        let check: FirstKeyCheck = {
+            let at = clock()
+            firstKey.at = at
+            return a.isFresh(now: at)
+        }
         Task { @MainActor in
             var failure: KeyboardFailure?
-            do { try await t.type(steps, to: pair) } catch { failure = Self.failure(error) }
+            do { try await t.type(steps, to: pair, beforeFirstKey: check) } catch { failure = Self.failure(error) }
             HIDKeyboard.wipe(&steps)
-            t.stop()
-            let sendMs = Int((self.uptime() - now) * 1000)
+            let end = self.uptime()
+            let age = FirstKeyAge.seconds(readingStartedAt: a.readingStartedAt, firstKeyAt: firstKey.at,
+                                          sendStartedAt: now, sendEndedAt: end, stepDelaysMs: delaysMs)
+            let sendMs = Int((end - now) * 1000)
             if let failure {
                 log(a.udid, .failed, failure, chars: chars, transport: t.kind)
             } else {
                 writeEvent(.keyboard(at: Date(), udid: a.udid, alias: aliasOf(a.udid) ?? "", .autoTyped,
                                      reason: nil, chars: chars, probeAgeMs: probeAgeMs, sendMs: sendMs,
-                                     transport: t.kind))
+                                     firstKeyAgeMs: Int(age * 1000), transport: t.kind))
             }
-            done(TypeResult(failure: failure))
+            done(TypeResult(failure: failure), age)
         }
     }
 
@@ -303,7 +336,14 @@ final class KeyboardControl {
         case .serviceSetupFailed?: return .setupFailed
         case .notConnected?: return .notConnected
         case .busy?: return .busy
+        case .stale?: return .stale
         case .sendFailed?, nil: return .sendFailed
         }
     }
+}
+
+/// When a transport sent its first key, if it can tell.
+@MainActor
+private final class FirstKeyMark {
+    var at: TimeInterval?
 }

@@ -345,6 +345,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSToolbarDelegate {
         manager.autoUnlockState = { [weak self] udid in
             MainActor.assumeIsolated { self?.autoUnlock.registryState(udid) }
         }
+        manager.autoUnlockMayAct = { [weak self] udid in
+            MainActor.assumeIsolated { self?.autoUnlock.mayStillAct(udid) ?? false }
+        }
+        manager.onAliasChanged = { [weak self] udid, alias in
+            MainActor.assumeIsolated { self?.autoUnlock.aliasChanged(udid, to: alias) }
+        }
         manager.onControllerChange = { [weak self] c in
             guard let self else { return }
             self.refreshDevicePicker()
