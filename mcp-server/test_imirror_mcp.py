@@ -371,7 +371,9 @@ def test_status_summarizes(mod, wda):
                    "server_version": mod.__version__,
                    "script_path": os.path.realpath(mod.__file__),
                    "target": "device", "wda_endpoint": mod.WDA,
-                   "selected_udid": os.environ.get("IMIRROR_UDID")}
+                   "selected_udid": os.environ.get("IMIRROR_UDID"), "leases": "on",
+                   "lease": {"state": "free", "holder": None, "queue": 0,
+                             "your_position": None}}
 
 
 def test_source_xml_format_truncates_large_output(mod, wda):

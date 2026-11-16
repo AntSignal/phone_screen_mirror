@@ -16,6 +16,9 @@ its self-managed transport (userspace tunnel + runwda + forward + relay).
 |------|--------------|
 | `ios_status` | WDA ready? + iOS version / device name, which server answered (`server_version`, `script_path`) and which endpoint (`target`, `wda_endpoint`, `selected_udid`); with iMirror's device file, also the app's view (`app_state`, `reason`, `state_since`, `chain_epoch`, `next_retry_at`, `last_error`) and the phone's last 5 events |
 | `ios_devices` | every device this server can drive (alias, UDID, port, ready?, the app's view as above, how its WDA sessions were got) and which one is the default |
+| `ios_reserve_device(device, agent, wait_s, hold_s)` | reserve a device for yourself, waiting in line (≤ 85 s per call) if another agent has it: `held` or `queued` (see [Sharing a device between agents](#sharing-a-device-between-agents)) |
+| `ios_release_device(device, agent)` | release it; the next agent in line gets it at once |
+| `ios_device_leases(device)` | who holds each device, since when, how long idle, and who waits |
 | `ios_recover` | ask iMirror to restart a phone's WDA chain, then wait ≤30 s: `accepted`, `cooldown` (one ran in the last minute) or `timeout` |
 | `ios_window_size` | logical screen size (points) for the current orientation |
 | `ios_screenshot` | full-res device screenshot (PNG, or JPEG on a device via `IMIRROR_SCREENSHOT_QUALITY`) — no macOS Screen Recording perm needed |
@@ -43,7 +46,42 @@ its self-managed transport (userspace tunnel + runwda + forward + relay).
 
 Every device tool also takes an optional **`device`** argument — see
 [Several devices](#several-devices). The run-report tools, `ios_devices` and
-`sim_list` / `sim_enable` / `sim_disable` don't.
+`sim_list` / `sim_enable` / `sim_disable` don't. Every tool that changes or
+inspects a device also takes an optional **`agent`** name (see below).
+
+## Sharing a device between agents
+
+Several agents (sessions, their subagents, `Testing/run.sh`) share the same
+phones and Simulators. To use a device:
+
+```
+ios_reserve_device(device="phone1", agent="<your name>")   # repeat while "queued"
+... drive it, passing agent="<your name>" on every call ...
+ios_release_device(device="phone1", agent="<your name>")
+```
+
+- **`held`** returns `lease_id` and `expires_at`. The hold lasts `hold_s`
+  (default 900, 60–3600) even while you are idle, but ends anyway after 20
+  minutes unused. Calling again while you hold it renews it.
+- **`queued`** returns your `position`, the `holder` (`agent`, `session`,
+  `since`, `idle_s`) and a `ticket`. One call waits at most `wait_s` (default
+  60, at most 85: Claude Code moves a tool call to the background at 120 s).
+  Call again with the same `agent` within 30 s to keep your place. When the
+  holder releases, the first in line gets the device at once.
+- **Without a reservation**, your first tap, type or launch on a free device
+  takes it for you; it frees after 5 idle minutes or when your session ends.
+- **`DEVICE_BUSY`** means another agent holds the device and nothing was sent.
+  Wait in line with `ios_reserve_device` or use another device; don't retry the
+  call in a loop. `ios_screenshot`, `ios_status` and `ios_device_leases` work on
+  any device.
+- **`agent`**: subagents of one session share one MCP server, so pass your own
+  name on every call. Two names are two holders. `ios_release_device` frees
+  only that name's hold. `"phone1,phone2"` reserves both or neither, and a
+  wait that would deadlock fails with `DEVICE_DEADLOCK`.
+- `ios_devices` and `ios_status` show each device's `lease`. `ios_devices`
+  lists `servers_ignoring_leases`: MCP servers on this Mac (an older install)
+  that drive devices without asking.
+- Scripts use the `imirror-lease` CLI (below), which shares the same state.
 
 ## Several devices
 
@@ -369,7 +407,7 @@ leases live sessions use. `test_devicelease.py` covers the pure rules;
 processes, also under the Mac's own `/usr/bin/python3` (3.9).
 `test_lease_hook.py` drives the tools against another agent's hold (a real
 child process) and checks nothing reaches WDA, including mid-call losses
-over real HTTP.
+over real HTTP; `test_lease_tools.py` covers reserving, queueing and releasing.
 
 ## Security
 
