@@ -735,12 +735,18 @@ def _chain_error(app: _Target, phase: str, *, idempotent: bool) -> MCPToolError:
     NEEDS_PASSCODE or DEVICE_GAVE_UP, each with what to do next."""
     a = app.alias
     if phase == "needs_passcode":
-        where = ("its Lock Screen" if app.reason == "locked"
-                 else "the 'Enable UI Automation' passcode sheet")
+        # Only a lock can be auto-unlocked; the sheet never is.
+        if app.reason == "locked":
+            what = (f"{a} is locked. If the user turned on auto-unlock for it, iMirror "
+                    "types its passcode; otherwise a person unlocks it, by hand or with "
+                    "Settings > Type passcode now.")
+        else:
+            what = (f"{a} is waiting for its passcode on the 'Enable UI Automation' "
+                    "sheet. iMirror never types that by itself: a person enters it on the "
+                    "phone or presses Settings > Type passcode now.")
         return MCPToolError(
-            f"{a} is waiting for its passcode on {where}. If auto-passcode is set up "
-            "for this phone, iMirror types it; otherwise a person must enter it on "
-            "the phone. Calls fail until then; ios_devices shows when it clears.",
+            f"{what} Do not restart or recover it, and never type a passcode yourself. "
+            "Calls fail until then; ios_devices shows when it clears.",
             kind=ErrorKind.UNREACHABLE, code="NEEDS_PASSCODE",
             fields={"reason": app.reason, "retry_after_s": 30})
     if phase == "gave_up":
