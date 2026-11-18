@@ -25,6 +25,10 @@ enum GoIOS {
 
     static let tunnelArgs = ["tunnel", "start", "--userspace"]
     static let listArgs = ["list", "--details"]
+    /// UDIDs only; works when one phone's lockdown fails.
+    static let plainListArgs = ["list"]
+
+    static func infoArgs(udid: String) -> [String] { ["info", "--udid=\(udid)"] }
 
     // --udid goes right after the subcommand (verified against the pinned
     // go-ios) so the sweep pattern below can anchor on it.
