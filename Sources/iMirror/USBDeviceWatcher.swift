@@ -22,6 +22,10 @@ final class USBDeviceWatcher {
     /// no longer answer property reads.
     private var serials: [UInt64: String] = [:]
 
+    /// Serials of the Apple USB devices plugged in now. Discovery uses it to
+    /// tell USB phones apart when `ios list --details` fails.
+    var presentSerials: Set<String> { Set(serials.values) }
+
     deinit { stop() }
 
     func start() {

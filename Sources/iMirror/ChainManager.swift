@@ -1,6 +1,7 @@
 // ChainManager — finds the phones, gives each a chain, and tells the MCP server.
 //
-// Polls `ios list --details` every 3s. A new USB phone gets its sticky port
+// Polls `ios list --details` every 3s (iMirrorCore/Discovery says what to do
+// when that fails for one phone). A new USB phone gets its sticky port
 // slot (iMirrorCore/PortSlots) and a DeviceController; a phone missing from two
 // polls in a row is torn down but keeps its slot and alias for next time. The
 // Mac's one go-ios tunnel is owned here, because restarting it drops every
@@ -40,6 +41,9 @@ final class ChainManager {
     private var missingPolls: [String: Int] = [:]
     private var pollTimer: Timer?
     private var polling = false
+    /// Last details seen per UDID, for polls where only plain `list` works.
+    private var knownDevices: [String: AttachedDevice] = [:]
+    private var listingMode = ""
     private var lastTunnelRestart: TimeInterval?
     private var writeScheduled = false
 
@@ -191,9 +195,9 @@ final class ChainManager {
         guard running, !polling, let bin, let tunnel else { return }
         polling = true
         let workDir = self.workDir
+        let known = self.knownDevices
         DispatchQueue.global(qos: .utility).async { [weak self] in
-            let listed = GoIOS.run(bin, GoIOS.listArgs, workDir: workDir)
-            let attached = GoIOSParsing.attachedDevices(fromListDetails: listed.out)
+            let listing = Self.list(bin: bin, workDir: workDir, known: known)
             let tunneled = tunnel.tunneledUDIDs()
             DispatchQueue.main.async {
                 guard let self else { return }
@@ -202,19 +206,63 @@ final class ChainManager {
                 // A lost or regained route changes a phone's reason.
                 if tunneled != self.tunnelUDIDs { self.scheduleWrite() }
                 self.tunnelUDIDs = tunneled
-                // A failed `ios list` says nothing about what's attached: never
-                // tear a phone down on it.
-                if listed.status == 0 { self.reconcile(attached.filter(\.isUSB)) }
+                self.noteListingMode(listing)
+                guard let result = Discovery.merge(listing, usbSerials: self.usbWatcher.presentSerials,
+                                                   known: self.knownDevices) else { return }
+                for d in result.learned { self.knownDevices[d.udid] = d }
+                self.reconcile(result.usb, held: Set(result.held))
             }
         }
     }
 
-    private func reconcile(_ usb: [AttachedDevice]) {
+    /// Every phone's details, best first: `list --details`, else plain
+    /// `list` plus `ios info` for unknown phones. Every call has a time
+    /// limit. Blocking: call off the main thread.
+    private static func list(bin: URL, workDir: URL, known: [String: AttachedDevice]) -> DiscoveryListing {
+        let details = GoIOS.runBounded(bin, GoIOS.listArgs, workDir: workDir,
+                                       timeout: DiscoveryTiming.detailsTimeoutSec)
+        if details.status == 0 {
+            return .details(GoIOSParsing.attachedDevices(fromListDetails: details.out))
+        }
+        let plain = GoIOS.runBounded(bin, GoIOS.plainListArgs, workDir: workDir,
+                                     timeout: DiscoveryTiming.listTimeoutSec)
+        guard plain.status == 0 else { return .failed }
+        let udids = GoIOSParsing.attachedDevices(fromListDetails: plain.out).map(\.udid)
+        let ask = Discovery.needsInfo(udids, known: known)
+        var info: [String: DeviceProduct] = [:]
+        let lock = NSLock()
+        // In parallel: a hung phone costs one timeout total.
+        DispatchQueue.concurrentPerform(iterations: ask.count) { i in
+            let r = GoIOS.runBounded(bin, GoIOS.infoArgs(udid: ask[i]), workDir: workDir,
+                                     timeout: DiscoveryTiming.infoTimeoutSec)
+            guard r.status == 0, let p = GoIOSParsing.deviceProduct(fromInfo: r.out) else { return }
+            lock.lock(); info[ask[i]] = p; lock.unlock()
+        }
+        return .udidsOnly(udids, info: info)
+    }
+
+    /// Log only when the way we list phones changes, not every 3 s.
+    private func noteListingMode(_ listing: DiscoveryListing) {
+        let mode: String
+        switch listing {
+        case .details: mode = "details"
+        case .udidsOnly(let udids, let info):
+            let unread = udids.filter { info[$0] == nil && knownDevices[$0] == nil }
+            mode = "fallback (no details for: \(unread.joined(separator: ", ")))"
+        case .failed: mode = "failed"
+        }
+        guard mode != listingMode else { return }
+        listingMode = mode
+        NSLog("iMirror: device listing is now \(mode)")
+    }
+
+    private func reconcile(_ usb: [AttachedDevice], held: Set<String> = []) {
         var changed = false
         let present = Dictionary(usb.map { ($0.udid, $0) }, uniquingKeysWith: { a, _ in a })
 
         // Gone phones: two misses in a row, so one flaky poll doesn't bounce a chain.
-        for c in controllers where present[c.udid] == nil {
+        // A held phone was seen, so it is not missing.
+        for c in controllers where present[c.udid] == nil && !held.contains(c.udid) {
             missingPolls[c.udid, default: 0] += 1
             if missingPolls[c.udid] == 1 { c.usbDetached() }   // the fallback signal
             if missingPolls[c.udid, default: 0] >= 2 {
@@ -262,7 +310,7 @@ final class ChainManager {
                 if problems[udid] != why { problems[udid] = why; changed = true }
             }
         }
-        let stale = problems.keys.filter { present[$0] == nil }
+        let stale = problems.keys.filter { present[$0] == nil && !held.contains($0) }
         if !stale.isEmpty { stale.forEach { problems[$0] = nil }; changed = true }
         if changed {
             onDevicesChanged?()

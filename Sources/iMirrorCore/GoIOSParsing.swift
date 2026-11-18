@@ -59,7 +59,7 @@ public enum GoIOSParsing {
 
     /// go-ios prints JSON log lines and its result on the same streams; take the
     /// first line that is a JSON object carrying `key`.
-    private static func firstJSONObject(in data: Data, withKey key: String) -> [String: Any]? {
+    static func firstJSONObject(in data: Data, withKey key: String) -> [String: Any]? {
         if let whole = try? JSONSerialization.jsonObject(with: data) as? [String: Any], whole[key] != nil {
             return whole
         }
