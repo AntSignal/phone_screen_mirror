@@ -17,13 +17,13 @@ HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
 # Process lookups and the audits in section 4.
 source "$HERE/lib/imirror-procs.sh"
 
-# Audit the app that is actually running (devices.json's owner), then this
-# checkout's build, then /Applications. A dev build is rarely in /Applications.
+# Audit the app that is actually running (devices.json's owner), then where
+# run.sh installs it, then /Applications. A dev build is rarely in /Applications.
 OWNER_PID="$(imirror_owner_pid)"
 OWNER_EXE="$( [[ -n "$OWNER_PID" ]] && ps -o comm= -p "$OWNER_PID" 2>/dev/null || true)"
 if [[ -n "${IMIRROR_APP:-}" ]]; then APP="$IMIRROR_APP"
 elif [[ "$OWNER_EXE" == */Contents/MacOS/iMirror ]]; then APP="${OWNER_EXE%/Contents/MacOS/iMirror}"
-elif [[ -d "$HERE/../build/iMirror.app" ]]; then APP="$(cd "$HERE/../build/iMirror.app" && pwd -P)"
+elif [[ -d "$HOME/Applications/iMirror.app" ]]; then APP="$HOME/Applications/iMirror.app"
 else APP="/Applications/iMirror.app"
 fi
 

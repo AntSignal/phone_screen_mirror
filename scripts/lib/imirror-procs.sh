@@ -60,23 +60,73 @@ imirror_guard_bundle() {
 # IMIRROR_QUIT_TIMEOUT_S (default 10) seconds.
 imirror_stop_bundle() {
     imirror_guard_bundle "$1" "$2" || return 1
-    local pid owner reply limit="${IMIRROR_QUIT_TIMEOUT_S:-10}"
+    local pid owner
     owner="$(imirror_owner_pid)"
     for pid in $(imirror_app_pids "$1"); do
-        echo "==> quitting iMirror (pid $pid)"
-        reply="$(imirror_request_quit "$pid")"
-        if [[ "$reply" != ok ]]; then
-            echo "Couldn't ask pid $pid to quit (AppKit said: $reply). Quit it from its menu and re-run." >&2
-            return 1
-        fi
-        if ! imirror_wait_exit "$pid" "$limit"; then
-            echo "iMirror (pid $pid) did not exit within $limit s; nothing was deleted." >&2
-            return 1
-        fi
-        IMIRROR_STOPPED_PIDS="$IMIRROR_STOPPED_PIDS $pid"
+        imirror_quit_pid "$pid" || return 1
         [[ "$pid" == "$owner" ]] && IMIRROR_STOPPED_OWNER=1
     done
     return 0
+}
+
+# Quits pid $1 through AppKit and waits for it to exit. Returns 1 if AppKit
+# refuses or it outlives IMIRROR_QUIT_TIMEOUT_S (default 10) seconds.
+imirror_quit_pid() {
+    local reply limit="${IMIRROR_QUIT_TIMEOUT_S:-10}"
+    echo "==> quitting iMirror (pid $1)"
+    reply="$(imirror_request_quit "$1")"
+    if [[ "$reply" != ok ]]; then
+        echo "Couldn't ask pid $1 to quit (AppKit said: $reply). Quit it from its menu and re-run." >&2
+        return 1
+    fi
+    if ! imirror_wait_exit "$1" "$limit"; then
+        echo "iMirror (pid $1) did not exit within $limit s; nothing was deleted." >&2
+        return 1
+    fi
+    IMIRROR_STOPPED_PIDS="$IMIRROR_STOPPED_PIDS $1"
+}
+
+# The executable of pid $1, as ps reports it, or nothing.
+imirror_pid_exe() {
+    ps -axo pid=,comm= | awk -v want="$1" '
+        { pid = $1; c = $0; sub(/^[[:space:]]*[0-9]+[[:space:]]+/, "", c)
+          if (pid == want) print c }'
+}
+
+# Prints the devices.json owner when it is an iMirror app running from
+# somewhere other than bundle $1. That happens once, when the app moves out
+# of build/, and whenever a bundle was deleted under the app, since ps still
+# reports the old path.
+imirror_other_owner() {
+    local owner exe
+    owner="$(imirror_owner_pid)"
+    [[ -n "$owner" ]] || return 0
+    exe="$(imirror_pid_exe "$owner")"
+    # Anything else means a stale devices.json and a reused pid.
+    if [[ "$exe" == */Contents/MacOS/iMirror && "$exe" != "$1/Contents/MacOS/iMirror" ]]; then
+        echo "$owner"
+    fi
+}
+
+# Refuses (returns 1) when another bundle's app owns devices.json and $2 is not 1.
+imirror_guard_other_owner() {
+    local pid exe; pid="$(imirror_other_owner "$1")"
+    [[ -z "$pid" || "$2" == 1 ]] && return 0
+    exe="$(imirror_pid_exe "$pid")"
+    echo "iMirror (pid $pid) owns devices.json and runs from ${exe%/Contents/MacOS/iMirror}," >&2
+    echo "not $1. Nothing was built or deleted. Re-run with --restart to quit it and" >&2
+    echo "launch $1 instead; every phone drops for about 30 s and every agent loses WDA." >&2
+    return 1
+}
+
+# Quits another bundle's devices.json owner when $2 is 1, else refuses. The
+# relaunch then waits for the new app to own devices.json.
+imirror_stop_other_owner() {
+    imirror_guard_other_owner "$1" "$2" || return 1
+    local pid; pid="$(imirror_other_owner "$1")"
+    [[ -n "$pid" ]] || return 0
+    imirror_quit_pid "$pid" || return 1
+    IMIRROR_STOPPED_OWNER=1
 }
 
 # Opens bundle $1 and waits for it to run. After a restart of the app that
