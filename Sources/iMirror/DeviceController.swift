@@ -67,9 +67,10 @@ final class DeviceController {
     var othersHealthy: () -> Bool = { false }
     /// Does the shared tunnel list a route to this phone (last poll)?
     var tunnelHasDevice: () -> Bool = { true }
-    /// Ask for the shared tunnel (and so every chain) to restart. False when
-    /// its cooldown refused, so nothing was restarted.
-    var requestTunnelRestart: () -> Bool = { false }
+    /// Ask for the shared tunnel (and so every chain) to restart, saying
+    /// why for events.jsonl. False when its cooldown refused, so nothing
+    /// was restarted.
+    var requestTunnelRestart: (_ cause: String) -> Bool = { _ in false }
     /// Runs one lock probe off main and answers on main. Nil: no go-ios.
     var probeLock: ((@escaping (LockReading) -> Void) -> Void)?
     /// Every lock reading, after this controller has noted it.
@@ -369,7 +370,7 @@ final class DeviceController {
         health = new
         switch new {
         case .connected:
-            ladder.onConnected()
+            ladder.onConnected(now: ProcessInfo.processInfo.systemUptime)
             unrecoverable = false
             usbResetPending = false
             forgetRunwdaClass()
@@ -412,7 +413,7 @@ final class DeviceController {
         case .restartTunnelAndChains where afterUnlock:
             log(.restart, detail: "unlocked")
             status("\(alias) is unlocked — resetting the USB connection…")
-            if !requestTunnelRestart() {
+            if !requestTunnelRestart("unlocked") {
                 // Cooldown refused: ask again soon, never climb to give-up.
                 chain?.restart()
                 ladder.tunnelRestartRefusedAfterUnlock(now: ProcessInfo.processInfo.systemUptime)
@@ -432,14 +433,17 @@ final class DeviceController {
             // tick() restarted the clock; onRunwdaStarted restarts it again
             // once the new runwda spawns. A chain that never gets that far
             // still ages from now toward the next stage.
-            log(.restart, detail: "ladder: this phone's chain")
+            // With no route, this replaces a tunnel restart others would pay for.
+            let heldBack = tunnelHasDevice() ? "" :
+                ", not the tunnel (other phones up; \(ladder.escalation.failures.count)/\(TunnelEscalation.failuresForTunnel) failed)"
+            log(.restart, detail: "ladder: this phone's chain" + heldBack)
             status("WebDriverAgent on \(alias) is taking longer than usual — restarting its connection…")
             chain?.restart()
             onChange?()
         case .restartTunnelAndChains:
             status("WebDriverAgent on \(alias) is taking longer than usual — resetting the USB connection…")
             // The tunnel was just restarted: restart this phone's chain instead.
-            if !requestTunnelRestart() {
+            if !requestTunnelRestart("ladder") {
                 log(.restart, detail: "ladder: tunnel busy, this phone's chain")
                 chain?.restart()
             }
@@ -458,7 +462,7 @@ final class DeviceController {
     }
 
     private func restartOwnOrTunnel(tunnelAllowed: Bool = true) {
-        if tunnelHasDevice() || !tunnelAllowed || !requestTunnelRestart() { chain?.restart() }
+        if tunnelHasDevice() || !tunnelAllowed || !requestTunnelRestart("retry") { chain?.restart() }
         onChange?()
     }
 

@@ -356,7 +356,9 @@ final class ChainManager {
             self?.controllers.contains { $0 !== c && $0.health == .connected } ?? false
         }
         c.tunnelHasDevice = { [weak self] in self?.tunnelUDIDs.contains(device.udid) ?? false }
-        c.requestTunnelRestart = { [weak self] in self?.requestTunnelRestart(coalesce: true) ?? true }
+        c.requestTunnelRestart = { [weak self, weak c] cause in
+            self?.requestTunnelRestart(coalesce: true, by: c, cause: cause) ?? true
+        }
         if let bin, chain != nil {
             c.probeLock = LockProbe.make(bin: bin, udid: device.udid, workDir: workDir)
         }
@@ -396,8 +398,11 @@ final class ChainManager {
     /// would otherwise knock each other's fresh chains down again. A request
     /// inside the cooldown restarts nothing and returns false, so the caller
     /// restarts its own chain.
+    /// `by` is the phone whose ladder asked (nil: the user's menu item);
+    /// events.jsonl names it, since every other phone pays for it.
     @discardableResult
-    func requestTunnelRestart(coalesce: Bool) -> Bool {
+    func requestTunnelRestart(coalesce: Bool, by requester: DeviceController? = nil,
+                              cause: String = "user") -> Bool {
         guard running, let tunnel else { return true }
         let now = ProcessInfo.processInfo.systemUptime
         if coalesce, !shouldRestartTunnel(lastAt: lastTunnelRestart, now: now) {
@@ -405,7 +410,12 @@ final class ChainManager {
             return false
         }
         lastTunnelRestart = now
-        NSLog("iMirror: restarting the USB tunnel and every phone's chain")
+        let others = controllers.filter { $0 !== requester && $0.health == .connected }.map(\.alias)
+        EventLog.shared.write(DeviceEvent(
+            at: Date(), udid: requester?.udid ?? "", alias: requester?.alias ?? "", event: .tunnelRestart,
+            reason: cause,
+            detail: "restarts every chain; healthy phones: \(others.isEmpty ? "none" : others.joined(separator: ", "))"))
+        NSLog("iMirror: restarting the USB tunnel and every phone's chain (\(cause), \(requester?.alias ?? "user"))")
         for c in controllers { c.chain?.stopChildren() }
         tunnel.restart { [weak self] in
             guard let self, self.running else { return }
