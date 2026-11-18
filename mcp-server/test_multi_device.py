@@ -2,9 +2,9 @@
 
 No device or WebDriverAgent needed: the iMirror app's device file is written to
 a temp dir, and every WDA call is stubbed by RoutedWDA, which records which
-device each request was meant for. The UDIDs are the two real test phones',
-which both end in 401C — exactly the collision the resolver must refuse to
-guess about.
+device each request was meant for. The UDIDs and slots are the real test
+phones'. phone1 and phone2 both end in 401C — exactly the collision the
+resolver must refuse to guess about.
 """
 from __future__ import annotations
 
@@ -21,8 +21,10 @@ import time
 import anyio
 import pytest
 
-PHONE_16E = "00008140-0006423002D3401C"
-PHONE_17 = "00008150-001928E01404401C"
+# The real slot table: aliases and ports follow the slot.
+PHONE1 = "00008150-001928E01404401C"        # iPhone 17, slot 0, :8100
+PHONE2 = "00008140-0006423002D3401C"        # iPhone 16e, slot 1, :8110
+PHONE3 = "00008020-000324610A68002E"        # iPhone XS on iOS 18, slot 2, :8120
 SIM = "5B3C1F2A-0000-4000-8000-00000000A1B2"
 PNG = b"\x89PNG\r\n\x1a\nfake"
 SAMPLE = os.path.join(os.path.dirname(__file__), "testdata", "devices.sample.json")
@@ -37,9 +39,11 @@ def entry(udid: str, alias: str, kind: str = "device", port: int = 8100, **extra
             "wda_url": f"http://127.0.0.1:{port}", "state": "ready", **extra}
 
 
-TWO_PHONES = [entry(PHONE_16E, "phone1", port=8100, product_type="iPhone17,5"),
-              entry(PHONE_17, "phone2", port=8110, product_type="iPhone18,3")]
-PHONE_AND_SIM = [entry(PHONE_16E, "phone1", port=8100),
+TWO_PHONES = [entry(PHONE1, "phone1", port=8100, product_type="iPhone18,3"),
+              entry(PHONE2, "phone2", port=8110, product_type="iPhone17,5")]
+THREE_PHONES = TWO_PHONES + [entry(PHONE3, "phone3", port=8120, product_type="iPhone11,2",
+                                   ios_version="18.6")]
+PHONE_AND_SIM = [entry(PHONE1, "phone1", port=8100),
                  entry(SIM, "sim", kind="simulator", port=8201)]
 
 
@@ -80,6 +84,13 @@ def reg(monkeypatch, tmp_path):
     r = Reg(m, path)
     r.write(TWO_PHONES)
     return r
+
+
+@pytest.fixture()
+def reg3(reg):
+    """The same module with all three real phones listed."""
+    reg.write(THREE_PHONES)
+    return reg
 
 
 class RoutedWDA:
@@ -196,9 +207,9 @@ def test_tool_names_and_required_params_are_unchanged(reg):
 
 @pytest.mark.parametrize("query,alias", [
     ("phone2", "phone2"), ("PHONE1", "phone1"),      # alias, any case
-    (PHONE_17, "phone2"), (PHONE_16E.lower(), "phone1"),  # full UDID
-    ("00008140", "phone1"), ("000081500019", "phone2"),  # unique prefix, dashes ignored
-    ("3401C", "phone1"), ("E01404401c", "phone2"),       # unique suffix
+    (PHONE2, "phone2"), (PHONE1.lower(), "phone1"),  # full UDID
+    ("00008150", "phone1"), ("000081400006", "phone2"),  # unique prefix, dashes ignored
+    ("E01404401c", "phone1"), ("3401C", "phone2"),       # unique suffix
 ])
 def test_device_resolves_by_alias_udid_prefix_or_suffix(reg, query, alias):
     assert reg.m._resolve(query).alias == alias
@@ -211,11 +222,22 @@ def test_suffix_shared_by_both_phones_is_refused(reg):
     assert "phone1" in str(e.value) and "phone2" in str(e.value)
 
 
+def test_three_phones_refuse_the_shared_suffix_and_resolve_phone3s(reg3):
+    with pytest.raises(reg3.m.MCPToolError) as e:
+        reg3.m._resolve("401C")
+    assert e.value.error_code == "DEVICE_AMBIGUOUS"
+    assert "UDID suffix of more than one device" in str(e.value)
+    assert "phone1 (" in str(e.value) and "phone2 (" in str(e.value)
+    for query in ("002E", "a68002e", "00008020", "phone3"):
+        assert reg3.m._resolve(query).alias == "phone3"
+    assert reg3.m._resolve("phone3").wda == "http://127.0.0.1:8120"
+
+
 def test_unknown_device_lists_the_choices(reg):
     with pytest.raises(reg.m.MCPToolError) as e:
         reg.m._resolve("ipad")
     assert e.value.error_code == "DEVICE_UNKNOWN"
-    assert "phone1 (iPhone17,5" in str(e.value) and "phone2 (iPhone18,3" in str(e.value)
+    assert "phone1 (iPhone18,3" in str(e.value) and "phone2 (iPhone17,5" in str(e.value)
 
 
 def test_short_fragments_do_not_match(reg):
@@ -232,7 +254,7 @@ def test_omitting_device_with_two_phones_fails_closed(reg, wda):
 
 
 def test_default_device_env_pins_the_omitted_device(reg, wda, monkeypatch):
-    monkeypatch.setenv("IMIRROR_DEFAULT_DEVICE", PHONE_17)
+    monkeypatch.setenv("IMIRROR_DEFAULT_DEVICE", PHONE2)
     reg.m.ios_tap(1, 2)
     assert wda.aliases_for("/actions") == ["phone2"]
 
@@ -263,7 +285,7 @@ def test_sim_tools_default_to_the_simulator(reg, monkeypatch):
 
 
 SIM2 = "0F1E2D3C-1111-4222-8333-444455556666"
-PHONE_AND_TWO_SIMS = [entry(PHONE_16E, "phone1", port=8100),
+PHONE_AND_TWO_SIMS = [entry(PHONE1, "phone1", port=8100),
                       entry(SIM, "iphone-17-pro", kind="simulator", port=8201),
                       entry(SIM2, "iphone-16e", kind="simulator", port=8202)]
 
@@ -276,7 +298,7 @@ def test_each_simulator_is_its_own_device_by_alias(reg, wda):
 
 
 def test_old_sim_alias_still_means_the_only_simulator(reg, wda):
-    reg.write([entry(PHONE_16E, "phone1", port=8100),
+    reg.write([entry(PHONE1, "phone1", port=8100),
                entry(SIM, "iphone-17-pro", kind="simulator", port=8201)])
     assert reg.m._resolve("sim").alias == "iphone-17-pro"
     assert reg.m._resolve("SIM").alias == "iphone-17-pro"
@@ -372,7 +394,7 @@ def test_untrustworthy_file_falls_back_to_8100(reg, bad):
 def test_a_pin_without_a_device_file_refuses_the_8100_fallback(reg, wda, monkeypatch):
     """run.sh pins each agent's server to one phone. Without a live device
     file the server only knows :8100, which may be another phone."""
-    monkeypatch.setenv("IMIRROR_DEFAULT_DEVICE", PHONE_17)
+    monkeypatch.setenv("IMIRROR_DEFAULT_DEVICE", PHONE2)
     os.remove(reg.path)
     with pytest.raises(reg.m.MCPToolError) as e:
         reg.m.ios_tap(1, 1)
@@ -384,10 +406,10 @@ def test_a_pin_without_a_device_file_refuses_the_8100_fallback(reg, wda, monkeyp
     assert out["mode"] == "fallback" and out["default"] is None
 
 
-@pytest.mark.parametrize("pin", ["default", PHONE_17])
+@pytest.mark.parametrize("pin", ["default", PHONE2])
 def test_a_pin_that_names_the_fallback_target_still_drives_it(reg, wda, monkeypatch, pin):
     monkeypatch.setenv("IMIRROR_DEFAULT_DEVICE", pin)
-    monkeypatch.setattr(reg.m._LEGACY, "udid", PHONE_17)   # as IMIRROR_UDID sets it
+    monkeypatch.setattr(reg.m._LEGACY, "udid", PHONE2)   # as IMIRROR_UDID sets it
     os.remove(reg.path)
     reg.m.ios_tap(1, 1)
     assert wda.aliases_for("/actions") == ["default"]
@@ -444,14 +466,14 @@ def test_the_unchanged_file_recheck_uses_the_uniqueid_too(reg, monkeypatch):
 
 
 def test_non_loopback_entry_is_dropped(reg):
-    evil = entry(PHONE_17, "phone2")
+    evil = entry(PHONE2, "phone2")
     evil["wda_url"] = "http://10.0.0.5:8110"
     reg.write([TWO_PHONES[0], evil])
     assert [t.alias for t in reg.m._targets()[1]] == ["phone1"]
 
 
 def test_malformed_entries_are_dropped(reg):
-    reg.write([TWO_PHONES[0], {"udid": PHONE_17}, "junk",
+    reg.write([TWO_PHONES[0], {"udid": PHONE2}, "junk",
                entry(SIM, "sim", kind="watch", port=8201)])
     assert [t.alias for t in reg.m._targets()[1]] == ["phone1"]
 
@@ -490,7 +512,8 @@ def test_pinned_mode_ignores_the_file_and_rejects_other_devices(monkeypatch, tmp
 
 
 def test_golden_sample_decodes(reg):
-    """The same file the Swift encoder test produces byte-for-byte."""
+    """The same file the Swift encoder test produces byte-for-byte. It
+    lists the 16e first; aliases follow plug-in order, so that is valid."""
     with open(SAMPLE, encoding="utf-8") as f:
         doc = json.load(f)
     doc["owner_pid"] = os.getpid()
@@ -500,8 +523,8 @@ def test_golden_sample_decodes(reg):
     got = [(t.alias, t.udid, t.kind, t.wda, t.product_type, t.ios_version, t.state)
            for t in targets]
     assert got == [
-        ("phone1", PHONE_16E, "device", "http://127.0.0.1:8100", "iPhone17,5", "26.6", "ready"),
-        ("phone2", PHONE_17, "device", "http://127.0.0.1:8110", "iPhone18,3", "26.6", "starting"),
+        ("phone1", PHONE2, "device", "http://127.0.0.1:8100", "iPhone17,5", "26.6", "ready"),
+        ("phone2", PHONE1, "device", "http://127.0.0.1:8110", "iPhone18,3", "26.6", "starting"),
         ("sim", SIM, "simulator", "http://127.0.0.1:8201", "iPhone 17 Pro", "26.0", "ready"),
     ]
     assert targets[1].detail == "waiting for WebDriverAgent"
@@ -573,7 +596,51 @@ def test_install_targets_the_phone_by_udid(reg, monkeypatch, tmp_path):
     monkeypatch.setattr(reg.m.subprocess, "run",
                         lambda args, **kw: seen.setdefault("args", args))
     reg.m.ios_install_app(str(ipa), device="phone2")
-    assert seen["args"] == ["/x/ios", "install", f"--path={ipa}", f"--udid={PHONE_17}"]
+    assert seen["args"] == ["/x/ios", "install", f"--path={ipa}", f"--udid={PHONE2}"]
+
+
+def test_install_on_phone3_names_phone3(reg3, monkeypatch, tmp_path):
+    ipa = tmp_path / "App.ipa"
+    ipa.write_bytes(b"ipa")
+    seen = {}
+    monkeypatch.setenv("IMIRROR_IOS_BIN", "/x/ios")
+    monkeypatch.setattr(reg3.m.subprocess, "run",
+                        lambda args, **kw: seen.setdefault("args", args))
+    reg3.m.ios_install_app(str(ipa), device="phone3")
+    assert seen["args"][-1] == f"--udid={PHONE3}"
+
+
+def test_a_fallback_install_without_a_udid_is_refused(reg, monkeypatch, tmp_path):
+    """Fallback mode knows only :8100. Even a stale file naming the phone
+    there is not trusted for an install: the slots may have moved."""
+    ipa = tmp_path / "App.ipa"
+    ipa.write_bytes(b"ipa")
+    ran = []
+    monkeypatch.setenv("IMIRROR_IOS_BIN", "/x/ios")
+    monkeypatch.setattr(reg.m.subprocess, "run", lambda args, **kw: ran.append(args))
+    reg.write(THREE_PHONES, owner_pid=dead_pid())
+    assert reg.m._targets()[0] == "fallback"
+    with pytest.raises(reg.m.MCPToolError) as e:
+        reg.m.ios_install_app(str(ipa))
+    assert e.value.error_code == "DEVICE_UDID_UNKNOWN"
+    assert "IMIRROR_UDID" in str(e.value) and "127.0.0.1:8100" in str(e.value)
+    assert ran == []
+    monkeypatch.setattr(reg.m._LEGACY, "udid", PHONE1)    # as IMIRROR_UDID sets it
+    reg.m.ios_install_app(str(ipa))
+    assert ran == [["/x/ios", "install", f"--path={ipa}", f"--udid={PHONE1}"]]
+
+
+def test_a_pinned_install_takes_its_udid_from_the_live_device_file(reg, monkeypatch,
+                                                                   tmp_path):
+    ipa = tmp_path / "App.ipa"
+    ipa.write_bytes(b"ipa")
+    ran = []
+    monkeypatch.setenv("IMIRROR_IOS_BIN", "/x/ios")
+    monkeypatch.setattr(reg.m.subprocess, "run", lambda args, **kw: ran.append(args))
+    monkeypatch.setattr(reg.m, "_PINNED", True)            # as IMIRROR_WDA sets it
+    monkeypatch.setattr(reg.m._LEGACY, "wda", "http://127.0.0.1:8110")
+    reg.m.ios_install_app(str(ipa))
+    assert ran[-1][-1] == f"--udid={PHONE2}"
 
 
 def test_ios_bin_comes_from_the_device_file(reg, monkeypatch, tmp_path):
@@ -588,11 +655,11 @@ def test_ios_bin_comes_from_the_device_file(reg, monkeypatch, tmp_path):
 
 def test_status_names_the_phone_in_list_mode(reg, wda):
     out = json.loads(reg.m.ios_status(device="phone2"))
-    assert out["alias"] == "phone2" and out["udid"] == PHONE_17 and out["ready"] is True
+    assert out["alias"] == "phone2" and out["udid"] == PHONE2 and out["ready"] is True
 
 
 def test_status_says_which_endpoint_answered_for_each_phone(reg, wda):
-    for alias, udid, port in (("phone1", PHONE_16E, 8100), ("phone2", PHONE_17, 8110)):
+    for alias, udid, port in (("phone1", PHONE1, 8100), ("phone2", PHONE2, 8110)):
         out = json.loads(reg.m.ios_status(device=alias))
         assert (out["target"], out["wda_endpoint"], out["selected_udid"]) == (
             "device", f"http://127.0.0.1:{port}", udid)
@@ -683,7 +750,7 @@ def test_report_shows_device_chips_and_every_device(reg, wda):
     html = open(path, encoding="utf-8").read()
     assert '<span class="dev">phone1</span>' in html
     assert '<span class="dev">phone2</span>' in html
-    assert "devices: phone1 (iPhone17,5" in html and "phone2 (iPhone18,3" in html
+    assert "devices: phone1 (iPhone18,3" in html and "phone2 (iPhone17,5" in html
 
 
 def test_steps_after_finish_are_not_recorded(reg, wda):
@@ -717,7 +784,7 @@ def test_ios_devices_lists_and_probes_every_device(reg, monkeypatch):
     assert out["mode"] == "list" and out["default"] is None
     rows = {d["alias"]: d for d in out["devices"]}
     assert rows["phone1"]["wda_ready"] is True and rows["phone2"]["wda_ready"] is False
-    assert rows["phone2"]["udid"] == PHONE_17 and rows["phone2"]["wda"].endswith(":8110")
+    assert rows["phone2"]["udid"] == PHONE2 and rows["phone2"]["wda"].endswith(":8110")
 
 
 def test_ios_devices_marks_the_default(reg, monkeypatch):

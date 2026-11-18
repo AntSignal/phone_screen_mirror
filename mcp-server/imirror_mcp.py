@@ -998,7 +998,8 @@ mcp = FastMCP("imirror", instructions=(
     "screenshot disagree, ios_alert reads a system alert covering the app. "
     "Devices are shared by several agents. To use a device: "
     "ios_reserve_device(device, agent=<your name>) — repeat while queued; "
-    "release with ios_release_device when done. A tap on a free device also "
+    "release with ios_release_device when done (device=\"all\" releases "
+    "everything you hold). A tap on a free device also "
     "takes it for you until 5 idle minutes pass. DEVICE_BUSY means another "
     "agent holds it and nothing was sent: wait in line with ios_reserve_device "
     "or use another device. Subagents: pass your own name as `agent` on every "
@@ -1193,17 +1194,45 @@ def _leases_close() -> None:
         lk.close()
 
 
+def _udid_at(wda: str, *, stale_ok: bool) -> tuple[str, bool] | None:
+    """(UDID, is_sim) that the device file gives the WDA at `wda`, or None.
+
+    The live file wins. With `stale_ok`, a file whose app is gone is read
+    too: its ports are usually still right, since a phone keeps its slot.
+    It must still be this user's, parse, and match the schema."""
+    want = wda.rstrip("/")
+    valid, targets = _REGISTRY.snapshot()
+    if valid or not stale_ok:
+        hit = next((x for x in targets if x.udid and x.wda == want), None)
+        return (hit.udid, hit.is_sim) if hit is not None else None
+    path = _devices_file()
+    try:
+        if os.stat(path).st_uid != os.getuid():
+            return None
+        with open(path, encoding="utf-8") as f:
+            doc = json.load(f)
+    except (OSError, ValueError):
+        return None
+    if not isinstance(doc, dict) or doc.get("schema") != _DEVICES_SCHEMA:
+        return None
+    hits = {(e["udid"], e.get("kind") == "simulator") for e in doc.get("devices") or []
+            if isinstance(e, dict) and isinstance(e.get("udid"), str) and e["udid"]
+            and isinstance(e.get("wda_url"), str) and _is_loopback_url(e["wda_url"])
+            and e["wda_url"].rstrip("/") == want}
+    return hits.pop() if len(hits) == 1 else None
+
+
 def _lease_key(t: _Target) -> str:
     """The lease key of `t`: always its hardware or Simulator UDID when
-    known, because aliases follow plug-in order. A pinned server finds the
-    UDID in the device file by its WDA URL; with none it locks the URL."""
+    known, because aliases follow plug-in order. A pinned or fallback
+    server finds the UDID in the device file by its WDA URL, even a file
+    left by an app that has since quit; with none it locks the URL."""
     udid, is_sim = t.udid, t.is_sim
     if not udid:
-        valid, targets = _REGISTRY.snapshot()
-        hit = next((x for x in targets if x.udid and x.wda == t.wda.rstrip("/")),
-                   None) if valid else None
+        # A URL key never clashes with UDID holds.
+        hit = _udid_at(t.wda, stale_ok=True)
         if hit is not None:
-            udid, is_sim = hit.udid, hit.is_sim
+            udid, is_sim = hit
     if udid:
         with contextlib.suppress(devicelease.UsageError):
             return (devicelease.sim_key if is_sim else devicelease.device_key)(udid)
@@ -1213,6 +1242,11 @@ def _lease_key(t: _Target) -> str:
 
 def _lease_name(t: _Target) -> str:
     return t.alias if t is not _LEGACY else _label(t)
+
+
+def _key_names() -> dict[str, str]:
+    """Each known device's lease key, mapped to the name agents use."""
+    return {_lease_key(t): _lease_name(t) for t in _targets()[1]}
 
 
 def _lease_error(e: Exception, t: _Target, key: str, *,
@@ -1229,6 +1263,9 @@ def _lease_error(e: Exception, t: _Target, key: str, *,
                             code=getattr(e, "code", "RESERVATION_STATE_ERROR"),
                             fields={"retry_after_s": 1})
     msg = str(e).replace(key, name)
+    with contextlib.suppress(Exception):     # names are a nicety, never a failure
+        for k, n in _key_names().items():
+            msg = msg.replace(k, n)          # e.g. a waiter's other phones
     code = e.code
     if mid_call and code != "DEVICE_FREED_BY_USER":
         code = "DEVICE_RESERVATION_LOST"
@@ -2434,15 +2471,35 @@ def _holder_view(h: dict[str, Any] | None) -> dict[str, Any] | None:
            "until": h.get("until")}
     if h.get("waiting"):
         out["waiting_in_line"] = True
+    if h.get("keys"):
+        names = _key_names()
+        out["devices"] = sorted(names.get(k, k) for k in h["keys"])
     return out
 
 
 def _lease_view(v: dict[str, Any] | None) -> dict[str, Any]:
-    """One device's lease, for ios_devices, ios_status and ios_device_leases."""
+    """One device's lease, for ios_devices, ios_status and ios_device_leases.
+
+    A device with no holder can still refuse other agents: an earlier
+    multi-device wait keeps it until all its devices are free. Then
+    `reserved_for` names that waiter and the other devices it waits for."""
     if not v:
         return {"state": "free", "holder": None, "queue": 0, "your_position": None}
-    return {"state": v["state"], "holder": _holder_view(v.get("holder")),
-            "queue": v.get("queue", 0), "your_position": v.get("your_position")}
+    out = {"state": v["state"], "holder": _holder_view(v.get("holder")),
+           "queue": v.get("queue", 0), "your_position": v.get("your_position")}
+    first = (v.get("waiting") or [None])[0]
+    if first and not v.get("holder") and v.get("your_position") != 1:
+        names = _key_names()
+        others = [names.get(k, k) for k in first.get("keys") or [] if k != v.get("key")]
+        who = f"agent {first['label']!r}" if first.get("label") else "an agent"
+        out["reserved_for"] = {"agent": first.get("label") or None,
+                               "purpose": first.get("purpose") or first.get("via") or "",
+                               "waiting_for": others}
+        why = (f"which is waiting for another device ({', '.join(others)}) to take "
+               "them together" if others else "first in line")
+        out["note"] = (f"free, but kept for {who}, {why}; other agents get "
+                       "DEVICE_BUSY here until then")
+    return out
 
 
 def _lease_views(targets: list[_Target], agent: str = "") -> dict[str, Any]:
@@ -2530,15 +2587,24 @@ async def ios_reserve_device(
 mcp.add_tool(ios_reserve_device, name="ios_reserve_device")
 
 
+_RELEASE_DEVICE_DOC = ("The device(s) to release: an alias or UDID from ios_devices, "
+                       "several as \"phone1,phone2\", or \"all\" for everything this "
+                       "agent holds or waits for. Omit it when only one phone is attached.")
+
+
 @_tool(per_device=False)
 def ios_release_device(
-        device: Annotated[str, Field(description=_RESERVE_DEVICE_DOC)] = "",
+        device: Annotated[str, Field(description=_RELEASE_DEVICE_DOC)] = "",
         agent: Annotated[str, Field(description=_AGENT_DOC)] = "") -> str:
     """Release a device you reserved or took automatically, so the next agent
     in line gets it at once. It also gives up your place in line. Releasing
     a device you do not hold does nothing; it never frees another agent's
-    hold, even one in this session. Returns JSON {"released": [...],
-    "not_held": [...]}."""
+    hold, even one in this session. device="all" releases every device
+    this `agent` holds and leaves every line it waits in. Returns JSON
+    {"released": [...], "not_held": [...]}; with "all", also
+    "left_queue": the device sets it stopped waiting for."""
+    if device.strip().lower() == "all":
+        return _release_all(agent)
     targets = _lease_targets(device)
     names = [_lease_name(t) for t in targets]
     lk = _leases()
@@ -2554,6 +2620,31 @@ def ios_release_device(
     done = set(out.released)
     return json.dumps({"released": [n for n, k in zip(names, keys) if k in done],
                        "not_held": [n for n, k in zip(names, keys) if k not in done]})
+
+
+def _release_all(agent: str) -> str:
+    """ios_release_device(device="all"). With several phones, naming none
+    is refused, so an agent done with its work needs this one call. It
+    keeps the per-device rule: only this caller's own identity (anchor
+    process and exact agent name) is released, never another agent's."""
+    lk = _leases()
+    if not lk.enabled:
+        return json.dumps({"released": [], "not_held": [], "left_queue": [],
+                           "leases": "off"})
+    try:
+        out = lk.attempt(devicelease.Request(op="release", keys=(), all_keys=True,
+                                             exact_label=True),
+                         devicelease.norm_label(agent))
+    except devicelease.StateError as e:
+        raise MCPToolError(f"Device leases cannot answer: {e}. Nothing was released. "
+                           "Retry shortly.", kind=ErrorKind.LEASE,
+                           code=getattr(e, "code", "RESERVATION_STATE_ERROR"),
+                           fields={"retry_after_s": 1}) from None
+    names = _key_names()
+    return json.dumps({"released": [names.get(k, k) for k in out.released],
+                       "not_held": [],
+                       "left_queue": [[names.get(k, k) for k in ks]
+                                      for ks in out.dropped_tickets]})
 
 
 @_tool(per_device=False, read_only=True)
@@ -3522,15 +3613,25 @@ def _mac_wide_install_lock():
 
 def _install_on_device(path: str) -> None:
     """Install `path` on the current device via go-ios (resolved by _ios_bin).
-    Passes --udid whenever the phone is known: without it go-ios installs on
-    whichever phone it lists first, which with two attached is a coin toss.
+    Always passes --udid, and refuses when the phone is not known: without
+    it go-ios installs on whichever phone it lists first, which with two
+    attached is a coin toss.
     Runs under the Mac-wide install lock, with an expected-reset note
     written before and after (the reset can come late)."""
-    args = [_ios_bin(), "install", f"--path={path}"]
     t = _cur_or_none()
     udid = t.udid if t is not None else None
-    if udid:
-        args.append(f"--udid={udid}")
+    if not udid and t is not None:
+        # Live file only: stale ports could name another phone.
+        hit = _udid_at(t.wda, stale_ok=False)
+        udid = hit[0] if hit is not None and not hit[1] else None
+    if not udid:
+        where = t.wda if t is not None else "no device"
+        raise MCPToolError(
+            f"Refusing to install: this server does not know which phone {where} is, "
+            "and without --udid go-ios installs on whichever phone it lists first. "
+            "Set IMIRROR_UDID for this server, or start the iMirror app so its device "
+            "file names the phone.", kind=ErrorKind.VALIDATION, code="DEVICE_UDID_UNKNOWN")
+    args = [_ios_bin(), "install", f"--path={path}", f"--udid={udid}"]
     with _mac_wide_install_lock():
         _lease_check()                 # the lock wait may have been long
         _write_expected_reset(udid)

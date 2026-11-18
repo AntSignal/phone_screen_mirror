@@ -19,8 +19,8 @@ import pytest
 
 from testsupport.fake_wda_server import FakeWDAServer
 
-PHONE = "00008140-0006423002D3401C"
-OTHER = "00008150-001928E01404401C"
+PHONE = "00008150-001928E01404401C"         # phone1, slot 0
+OTHER = "00008140-0006423002D3401C"         # phone2, slot 1
 
 
 def free_port() -> int:

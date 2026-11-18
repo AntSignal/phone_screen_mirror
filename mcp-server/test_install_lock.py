@@ -147,17 +147,16 @@ def test_install_goes_ahead_when_the_lock_never_frees(m, ipa, tmp_path, monkeypa
     assert len(calls) == 1
 
 
-def test_unknown_phone_still_locks_but_writes_no_note(monkeypatch, tmp_path, ipa):
+def test_unknown_phone_is_refused_before_the_lock_or_a_note(monkeypatch, tmp_path, ipa):
+    """Without --udid go-ios installs on whichever phone it lists first."""
     m = _load(monkeypatch, tmp_path, udid=None)
-    seen = {}
-
-    def fake_run(args, **kw):
-        seen["held"] = _lock_is_held(tmp_path / "devicectl.lock")
-        return subprocess.CompletedProcess(args, 0)
-
-    monkeypatch.setattr(m.subprocess, "run", fake_run)
-    m.ios_install_app(ipa)
-    assert seen["held"] is True
+    ran = []
+    monkeypatch.setattr(m.subprocess, "run", lambda args, **kw: ran.append(args))
+    with pytest.raises(m.MCPToolError) as e:
+        m.ios_install_app(ipa)
+    assert e.value.error_code == "DEVICE_UDID_UNKNOWN" and "IMIRROR_UDID" in str(e.value)
+    assert ran == []
+    assert not (tmp_path / "devicectl.lock").exists()
     assert not (tmp_path / "expected-resets").exists()
 
 
