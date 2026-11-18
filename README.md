@@ -183,15 +183,22 @@ Then install WebDriverAgent on the device once (Xcode):
 ```bash
 ./scripts/run.sh            # debug build → bundle (with go-ios + icon) → launch
 ./scripts/run.sh release    # optimized build
-./scripts/run.sh --restart  # build/iMirror.app is running: quit it, rebuild, relaunch
+./scripts/run.sh --restart  # iMirror is running: quit it, rebuild, relaunch
 ```
 
-`run.sh` (and `package.sh`) refuse to replace a `build/iMirror.app` that is
-running, because deleting it under the live app leaves the old binary running
-and `devices.json` pointing at a deleted bundle. `--restart` quits exactly that
-process (by pid, not bundle id — an older iMirror may share it), waits for it to
-exit, rebuilds, relaunches, and waits until the new pid owns `devices.json`.
-Every phone drops for about 30 s while it does.
+`run.sh` installs and launches the app at `~/Applications/iMirror.app`
+(`IMIRROR_APP=/path/to/iMirror.app` picks another place), not in `build/`: a
+disk-cleanup sweep deletes old `build` folders, and deleting the running app's
+bundle leaves it unable to start its bundled go-ios.
+
+`run.sh` refuses to replace that bundle while it is running, because deleting
+it under the live app leaves the old binary running and `devices.json` pointing
+at a deleted bundle. It also refuses while an iMirror from another path (such as
+an old `build/iMirror.app`) owns `devices.json`. `--restart` quits exactly
+those processes (by pid, not bundle id — an older iMirror may share it), waits
+for them to exit, rebuilds, relaunches, and waits until the new pid owns
+`devices.json`. Every phone drops for about 30 s while it does. `package.sh`
+does the same for `build/iMirror.app`, the bundle it packages.
 
 Before committing, run `swift build && swift test` and the MCP suite
 (`mcp-server/.venv/bin/python -m pytest mcp-server`); see `CLAUDE.md`.

@@ -14,7 +14,7 @@ REPO="$(cd "$HERE/../.." && pwd -P)"
 T="$(mktemp -d "${TMPDIR:-/tmp}/imirror-script-tests.XXXXXX")"
 T="$(cd "$T" && pwd -P)"
 ROOT="$T/root"
-APP="$ROOT/build/iMirror.app"
+APP="$T/home/Applications/iMirror.app"   # run.sh's default; package.sh's below
 STUBS="$T/stubs"
 STATE="$T/state"
 TEST_PATH="$STUBS:/usr/bin:/bin"
@@ -79,8 +79,8 @@ done
 
 new_case() {
     kill_fakes
-    rm -rf "$ROOT" "$STATE" "$T/devices.json"
-    mkdir -p "$ROOT/scripts/lib" "$ROOT/Resources" "$ROOT/mcp-server" "$STATE/apps"
+    rm -rf "$ROOT" "$STATE" "$T/devices.json" "$T/home"
+    mkdir -p "$ROOT/scripts/lib" "$ROOT/Resources" "$ROOT/mcp-server" "$STATE/apps" "$T/home"
     cp "$REPO/scripts/run.sh" "$REPO/scripts/package.sh" "$ROOT/scripts/"
     cp "$REPO/scripts/lib/imirror-procs.sh" "$ROOT/scripts/lib/"
     echo '<plist/>' > "$ROOT/Resources/Info.plist"
@@ -107,7 +107,7 @@ owns_devices() {
 }
 
 run_script() {   # script, args...
-    OUT="$(PATH="$TEST_PATH" HOME="$T/home" IMIRROR_DEVICES_FILE="$T/devices.json" \
+    OUT="$(PATH="$TEST_PATH" HOME="$T/home" IMIRROR_DEVICES_FILE="$T/devices.json" IMIRROR_APP="${USE_APP:-}" \
            IMIRROR_QUIT_TIMEOUT_S=1 IMIRROR_OWNER_TIMEOUT_S=2 \
            /bin/bash "$ROOT/scripts/$1" "${@:2}" 2>&1)"
     CODE=$?
@@ -123,6 +123,7 @@ check() {   # description, condition...
 }
 has() { [[ "$1" == *"$2"* ]]; }
 hasnt() { [[ "$1" != *"$2"* ]]; }
+gone() { ! kill -0 "$1" 2>/dev/null; }
 
 # ---- run.sh ----
 
@@ -130,6 +131,8 @@ new_case
 run_script run.sh
 check "run.sh, nothing running: builds and opens" [ "$CODE" = 0 ]
 check "run.sh opens with -n" has "$CALLS" "open -n $APP"
+check "run.sh installs under ~/Applications by default" [ -f "$T/home/Applications/iMirror.app/Contents/MacOS/iMirror" ]
+check "run.sh leaves build/ alone" [ ! -e "$ROOT/build" ]
 check "run.sh quits nothing when nothing runs" hasnt "$CALLS" "osascript"
 check "run.sh bundles server modules" [ -f "$APP/Contents/Resources/mcp-server/wda_bringup.py" ]
 check "run.sh leaves tests out of the bundle" [ ! -e "$APP/Contents/Resources/mcp-server/test_imirror_mcp.py" ]
@@ -180,6 +183,42 @@ check "the other iMirror is never asked to quit" hasnt "$CALLS" "osascript"
 check "the other iMirror keeps running" kill -0 "$OTHER"
 
 new_case
+USE_APP="$T/custom/Mirror.app" run_script run.sh
+check "IMIRROR_APP picks the bundle" [ -f "$T/custom/Mirror.app/Contents/MacOS/iMirror" ]
+check "IMIRROR_APP is what opens" has "$CALLS" "open -n $T/custom/Mirror.app"
+check "IMIRROR_APP leaves the default alone" [ ! -e "$APP" ]
+
+# The owner runs from build/, or from a bundle deleted under it.
+new_case; OLD="$ROOT/build/iMirror.app"; PID="$(fake_app "$OLD")"; owns_devices "$PID"
+run_script run.sh
+check "run.sh refuses while another path owns devices.json" [ "$CODE" = 1 ]
+check "that refusal names the pid and path" has "$OUT" "iMirror (pid $PID) owns devices.json and runs from $OLD"
+check "that refusal names --restart" has "$OUT" "--restart"
+check "that refusal comes before the build" hasnt "$CALLS" "swift"
+check "that refusal quits nothing" hasnt "$CALLS" "osascript"
+check "that refusal leaves the owner running" kill -0 "$PID"
+
+new_case; PID="$(fake_app "$OLD")"; owns_devices "$PID"; touch "$STATE/owner-follows"
+run_script run.sh --restart
+NEW="$(cat "$STATE/opened.pid" 2>/dev/null)"
+check "--restart moves the app off another path" [ "$CODE" = 0 ]
+check "--restart quits the other path's owner" has "$CALLS" "osascript $PID"
+check "--restart asks only that pid to quit" [ "$(grep -c '^osascript ' <<<"$CALLS")" = 1 ]
+check "the old owner is gone" gone "$PID"
+check "the new bundle opens" has "$CALLS" "open -n $APP"
+check "the new app owns devices.json" has "$OUT" "pid $NEW) and owns devices.json"
+
+new_case; PID="$(fake_app "$OLD")"; owns_devices "$PID"; echo stuck > "$STATE/quit-mode"
+run_script run.sh --restart
+check "an other-path owner that won't exit aborts" [ "$CODE" = 1 ]
+check "that abort opens nothing" hasnt "$CALLS" "open"
+
+new_case; owns_devices 1
+run_script run.sh
+check "a stale owner pid that is not iMirror is ignored" [ "$CODE" = 0 ]
+check "the stale pid is never asked to quit" hasnt "$CALLS" "osascript"
+
+new_case
 run_script run.sh --restart release
 check "release still works after --restart" has "$CALLS" "swift build -c release"
 new_case
@@ -190,6 +229,8 @@ run_script run.sh --bogus
 check "an unknown flag is a usage error" [ "$CODE" = 2 ]
 
 # ---- package.sh ----
+
+APP="$ROOT/build/iMirror.app"   # the distributable, not the live app
 
 new_case; old_bundle; PID="$(fake_app "$APP")"
 run_script package.sh

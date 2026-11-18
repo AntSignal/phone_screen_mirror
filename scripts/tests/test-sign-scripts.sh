@@ -76,7 +76,7 @@ fresh() {   # keychain lines
 }
 
 run_script() {   # script; IMIRROR_SIGN_IDENTITY comes from $SIGN_AS
-    OUT="$(PATH="$TEST_PATH" HOME="$T/home" IMIRROR_SIGN_IDENTITY="${SIGN_AS:-}" \
+    OUT="$(PATH="$TEST_PATH" HOME="$T/home" IMIRROR_SIGN_IDENTITY="${SIGN_AS:-}" IMIRROR_APP= \
         IMIRROR_DEVICES_FILE="$T/devices.json" \
         /bin/bash "$ROOT/scripts/$1" 2>&1)"
     CODE=$?
@@ -86,7 +86,7 @@ run_script() {   # script; IMIRROR_SIGN_IDENTITY comes from $SIGN_AS
 DEV="Apple Development: Dev Person (TEAMDEV001)"
 DEVID_HASH=0123456789ABCDEF0123456789ABCDEF01234567
 DEVID="  1) $DEVID_HASH \"Developer ID Application: Some Org (TEAMORG001)\""
-APP_PATH="$ROOT/build/iMirror.app"
+APP_PATH="$T/home/Applications/iMirror.app"   # run.sh's default install
 
 # ---- run.sh ----
 

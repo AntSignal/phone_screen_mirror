@@ -9,10 +9,15 @@
 #
 #   ./scripts/run.sh [debug|release] [--restart]
 #
+# The app lives at $IMIRROR_APP, default ~/Applications/iMirror.app. Not in
+# build/: a disk-cleanup job deletes old build folders under ~/Documents/Github,
+# and that took the running app's bundled go-ios with it.
+#
 # It refuses to replace a bundle that is running: deleting it under the live
 # app leaves `open` activating the old binary, and devices.json's goios path
-# points into it. --restart quits exactly that app first (every phone drops
-# for about 30 s), then relaunches and waits for it to own devices.json.
+# points into it. It also refuses while an iMirror from another path owns
+# devices.json. --restart quits those apps first (every phone drops for about
+# 30 s), then relaunches and waits for the new app to own devices.json.
 #
 # Pure Apple toolchain (swift, codec/codesign, /bin). No third-party tools.
 set -euo pipefail
@@ -34,9 +39,13 @@ for arg in "$@"; do
     esac
 done
 
-APP="$ROOT/build/iMirror.app"
+APP="${IMIRROR_APP:-$HOME/Applications/iMirror.app}"
+mkdir -p "$(dirname "$APP")"
+# Physical path, as ps reports it.
+APP="$(cd "$(dirname "$APP")" && pwd -P)/$(basename "$APP")"
 # Refuse before building; quit only after a good build.
 imirror_guard_bundle "$APP" "$RESTART" || exit 1
+imirror_guard_other_owner "$APP" "$RESTART" || exit 1
 
 echo "==> swift build ($CONFIG)"
 swift build -c "$CONFIG"
@@ -44,6 +53,7 @@ swift build -c "$CONFIG"
 BIN="$(swift build -c "$CONFIG" --show-bin-path)/iMirror"
 
 imirror_stop_bundle "$APP" "$RESTART" || exit 1
+imirror_stop_other_owner "$APP" "$RESTART" || exit 1
 
 echo "==> assembling $APP"
 rm -rf "$APP"

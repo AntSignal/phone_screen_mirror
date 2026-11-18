@@ -76,11 +76,14 @@ app's **Update**. (A registration made before this, or by hand, still runs
 whatever tree it names.) Because the server ships `devicelease.py`, the install
 also writes the `~/Library/Application Support/iMirror/bin/imirror-lease` launcher.
 
-`scripts/run.sh` and `scripts/package.sh` refuse to replace a `build/iMirror.app`
-that is running; `--restart` quits exactly that pid (every phone drops for about
-30 s), rebuilds, relaunches and waits for it to own `devices.json`. Build the app
-people actually run only at its stable path, never in a worktree that will be
-deleted: `devices.json`'s `goios` points into the bundle.
+`scripts/run.sh` installs the live app at `~/Applications/iMirror.app`
+(`IMIRROR_APP` overrides it), never under `build/`: a cleanup sweep deletes old
+`build` folders under `~/Documents/Github`, and `devices.json`'s `goios` points
+into the bundle. It refuses to replace that bundle while it runs, or while an
+iMirror from another path owns `devices.json`; `--restart` quits those pids
+(every phone drops for about 30 s), rebuilds, relaunches and waits for the new
+app to own `devices.json`. `scripts/package.sh` guards `build/iMirror.app` the
+same way; that bundle is only the distributable.
 
 ## Conventions
 
