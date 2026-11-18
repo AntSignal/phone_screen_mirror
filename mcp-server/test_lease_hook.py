@@ -20,12 +20,14 @@ import pytest
 
 import devicelease as dl
 from test_devicelease_store import decide_as, sleeper, top, wait_for, write_state  # noqa: F401
-from test_multi_device import PHONE_16E, PHONE_17, reg, tool_schemas, wda  # noqa: F401
+from test_multi_device import (PHONE1, PHONE2, PHONE3, THREE_PHONES, dead_pid,  # noqa: F401
+                               reg, reg3, tool_schemas, wda)
 from test_ride_out import dead, load  # noqa: F401
 from testsupport.fake_wda_server import FakeWDAServer
 
-K16E = dl.device_key(PHONE_16E)
-K17 = dl.device_key(PHONE_17)
+K1 = dl.device_key(PHONE1)
+K2 = dl.device_key(PHONE2)
+K3 = dl.device_key(PHONE3)
 
 OBSERVE = {"ios_status", "ios_window_size", "ios_screenshot", "ios_app_state",
            "ios_start_run"}
@@ -84,24 +86,24 @@ def test_drive_and_inspect_tools_take_an_agent_and_observe_tools_do_not(reg):
 
 def test_a_tap_on_a_free_phone_takes_a_short_automatic_hold(reg, wda):
     reg.m.ios_tap(1, 2, device="phone1", agent="Explorer")
-    h = top(K16E)
+    h = top(K1)
     assert h["mode"] == "auto" and h["label"] == "explorer"
     assert h["hold_until_mono"] == 0.0, "an automatic hold lapses when idle"
     assert h["idle_s"] in (300.0, 90.0)          # 90 when run from a bare terminal
     assert "ios_tap" in h["purpose"] and "explorer" in h["purpose"]
-    assert top(K17) is None, "the other phone is untouched"
+    assert top(K2) is None, "the other phone is untouched"
 
 
 def test_a_phone_another_agent_holds_fails_fast_and_nothing_reaches_wda(reg, wda, sleeper):
     m = reg.m
-    foreign(sleeper(), K16E)
+    foreign(sleeper(), K1)
     t0 = time.monotonic()
     with pytest.raises(m.MCPToolError) as e:
         m.ios_tap(1, 2, device="phone1")
     assert time.monotonic() - t0 < 2
     assert e.value.error_kind == "lease" and e.value.error_code == "DEVICE_BUSY"
     msg = str(e.value)
-    assert "Nothing was sent" in msg and "phone1" in msg and K16E not in msg
+    assert "Nothing was sent" in msg and "phone1" in msg and K1 not in msg
     assert "other work" in msg
     assert "ios_reserve_device(device='phone1', agent=<your name>)" in msg
     assert e.value.fields["retry_after_s"] >= 1
@@ -126,11 +128,11 @@ def test_a_phone_another_agent_holds_fails_fast_and_nothing_reaches_wda(reg, wda
 
 
 def test_an_automatic_call_never_waits_even_for_a_hold_about_to_lapse(reg, wda, sleeper):
-    foreign(sleeper(), K16E, hold_s=0)
+    foreign(sleeper(), K1, hold_s=0)
 
     def nearly_idle(st, now):
-        st["keys"][K16E]["holders"][-1]["last_used_mono"] = now - 295
-        st["keys"][K16E]["holders"][-1]["mode"] = "auto"
+        st["keys"][K1]["holders"][-1]["last_used_mono"] = now - 295
+        st["keys"][K1]["holders"][-1]["mode"] = "auto"
         return st
     write_state(nearly_idle)
     t0 = time.monotonic()
@@ -142,7 +144,7 @@ def test_an_automatic_call_never_waits_even_for_a_hold_about_to_lapse(reg, wda, 
 
 def test_inspect_on_a_free_phone_runs_without_taking_it(reg, wda):
     reg.m.ios_source(device="phone1")
-    assert top(K16E) is None
+    assert top(K1) is None
     assert any("/source" in p for _, _, p in wda.calls)
 
 
@@ -170,7 +172,7 @@ def test_named_subagents_never_both_drive_the_parents_phone(reg, wda):
             m.ios_tap(1, 2, device="phone1", agent=name)
         assert e.value.error_code == "DEVICE_BUSY" and "no agent name" in str(e.value)
         assert "ios_reserve_device(device='phone1'" in str(e.value)
-    write_state(lambda st, now: (st["keys"][K16E]["holders"][-1].update(
+    write_state(lambda st, now: (st["keys"][K1]["holders"][-1].update(
         last_used_mono=now - 31), st)[1])
     m.ios_tap(1, 2, device="phone1", agent="a")
     with pytest.raises(m.MCPToolError) as e:
@@ -182,7 +184,7 @@ def test_named_subagents_never_both_drive_the_parents_phone(reg, wda):
 def test_an_inspect_call_after_its_hold_was_lost_runs_once_with_a_warning(reg, wda, sleeper):
     m = reg.m
     m.ios_tap(1, 2, device="phone1")
-    steal(K16E, sleeper())
+    steal(K1, sleeper())
     out = m.ios_source(device="phone1")
     assert out.startswith("WARNING: Your hold on this device ended")
     with pytest.raises(m.MCPToolError) as e:
@@ -193,7 +195,7 @@ def test_an_inspect_call_after_its_hold_was_lost_runs_once_with_a_warning(reg, w
 def test_a_drive_call_after_its_hold_was_lost_says_lost_once(reg, wda, sleeper):
     m = reg.m
     m.ios_tap(1, 2, device="phone1")
-    steal(K16E, sleeper())
+    steal(K1, sleeper())
     with pytest.raises(m.MCPToolError) as e:
         m.ios_tap(1, 2, device="phone1")
     assert e.value.error_code == "DEVICE_RESERVATION_LOST"
@@ -205,7 +207,7 @@ def test_a_drive_call_after_its_hold_was_lost_says_lost_once(reg, wda, sleeper):
 
 
 def test_a_busy_call_through_fastmcp_carries_the_code(reg, wda, sleeper):
-    foreign(sleeper(), K16E)
+    foreign(sleeper(), K1)
     from mcp.server.fastmcp.exceptions import ToolError
     with pytest.raises(ToolError) as e:
         anyio.run(reg.m.mcp.call_tool, "ios_tap",
@@ -215,7 +217,7 @@ def test_a_busy_call_through_fastmcp_carries_the_code(reg, wda, sleeper):
 
 
 def test_leases_off_lets_every_call_through(reg, wda, sleeper, monkeypatch):
-    foreign(sleeper(), K16E)
+    foreign(sleeper(), K1)
     monkeypatch.setenv("IMIRROR_LEASE", "off")    # honoured only under testing here
     reg.m.ios_tap(1, 2, device="phone1")
     assert wda.aliases_for("/actions") == ["phone1"]
@@ -226,7 +228,7 @@ def test_leases_off_lets_every_call_through(reg, wda, sleeper, monkeypatch):
 def test_keys_are_udids_never_aliases(reg):
     m = reg.m
     targets = {t.alias: t for t in m._targets()[1]}
-    assert m._lease_key(targets["phone1"]) == K16E
+    assert m._lease_key(targets["phone1"]) == K1
     sim = m._Target(key="S", alias="sim", udid="5b3c1f2a-0000-4000-8000-00000000a1b2",
                     kind="simulator", wda="http://127.0.0.1:8201")
     assert m._lease_key(sim) == "sim:5B3C1F2A-0000-4000-8000-00000000A1B2"
@@ -237,9 +239,34 @@ def test_a_pinned_server_finds_its_udid_in_the_device_file_or_locks_the_url(reg,
     legacy = m._LEGACY
     monkeypatch.setattr(legacy, "udid", None)
     monkeypatch.setattr(legacy, "wda", "http://127.0.0.1:8110/")
-    assert m._lease_key(legacy) == K17
+    assert m._lease_key(legacy) == K2
     monkeypatch.setattr(legacy, "wda", "http://127.0.0.1:8300")
     assert m._lease_key(legacy) == "wda:127.0.0.1:8300"
+
+
+def test_a_fallback_server_locks_the_phone_a_stale_file_puts_on_8100(reg, wda, sleeper):
+    """The app quit, so this server drives :8100 blind. A URL key would not
+    clash with another server's UDID hold on that same phone."""
+    m = reg.m
+    reg.write(THREE_PHONES, owner_pid=dead_pid())
+    assert m._targets()[0] == "fallback"
+    assert m._lease_key(m._LEGACY) == K1
+    foreign(sleeper(), K1)
+    with pytest.raises(m.MCPToolError) as e:
+        m.ios_tap(1, 2)
+    assert e.value.error_code == "DEVICE_BUSY" and wda.calls == []
+    os.remove(reg.path)                     # nothing maps the port: lock the URL
+    assert m._lease_key(m._LEGACY) == "wda:127.0.0.1:8100"
+
+
+def test_a_stale_file_must_still_be_this_users_and_well_formed(reg, monkeypatch):
+    m = reg.m
+    reg.write(THREE_PHONES, owner_pid=dead_pid(), schema=2)
+    assert m._lease_key(m._LEGACY) == "wda:127.0.0.1:8100"
+    reg.write(THREE_PHONES, owner_pid=dead_pid())
+    uid = os.getuid()
+    monkeypatch.setattr(m.os, "getuid", lambda: uid + 1)
+    assert m._lease_key(m._LEGACY) == "wda:127.0.0.1:8100"
 
 
 # ---- mid-call: the _http choke point, sequences, recovery, installs ----------------
@@ -249,7 +276,7 @@ def wire(monkeypatch, tmp_path):
     """A server pinned to the real-HTTP fake WDA, keyed by a known UDID."""
     fake = FakeWDAServer(session="S1").start()
     monkeypatch.setenv("IMIRROR_WDA", fake.url)
-    monkeypatch.setenv("IMIRROR_UDID", PHONE_16E)
+    monkeypatch.setenv("IMIRROR_UDID", PHONE1)
     monkeypatch.setenv("IMIRROR_DEVICES_FILE", str(tmp_path / "devices.json"))
     monkeypatch.setenv("IMIRROR_RUNS_DIR", str(tmp_path / "runs"))
     for var in ("IMIRROR_TARGET", "IMIRROR_DEFAULT_DEVICE"):
@@ -270,11 +297,11 @@ def test_a_hold_taken_away_mid_call_stops_before_the_next_wda_request(wire, slee
     other = sleeper()
     fake.find_ids["OK"] = ["e1"]
     fake.delays["/session/S1/element"] = [0.6]
-    threading.Timer(0.2, steal, (K16E, other)).start()
+    threading.Timer(0.2, steal, (K1, other)).start()
     with pytest.raises(m.MCPToolError) as e:
         m.ios_find_and_tap("OK")
     assert e.value.error_code == "DEVICE_RESERVATION_LOST"
-    assert "Stopped mid-call" in str(e.value) and K16E not in str(e.value)
+    assert "Stopped mid-call" in str(e.value) and K1 not in str(e.value)
     assert fake.count("POST", "/session/S1/element") == 1
     assert fake.count("POST", "/session/S1/element/e1/click") == 0
 
@@ -284,7 +311,7 @@ def test_a_sequence_stops_at_the_step_after_its_hold_is_lost(wire, sleeper):
     quick(m)
     other = sleeper()
     fake.delays["/session/S1/actions"] = [0.6]
-    threading.Timer(0.2, steal, (K16E, other)).start()
+    threading.Timer(0.2, steal, (K1, other)).start()
     out = json.loads(m.ios_run_sequence([{"action": "tap", "x": 1, "y": 1},
                                          {"action": "tap", "x": 2, "y": 2},
                                          {"action": "tap", "x": 3, "y": 3}]))
@@ -342,7 +369,7 @@ def test_an_install_that_lost_its_hold_waiting_for_devicectl_lock_never_runs(
     """Lease first, then devicectl.lock: the order that cannot deadlock. A
     hold that ends during the lock wait stops the install before go-ios."""
     monkeypatch.setenv("IMIRROR_WDA", "http://127.0.0.1:8100")
-    monkeypatch.setenv("IMIRROR_UDID", PHONE_16E)
+    monkeypatch.setenv("IMIRROR_UDID", PHONE1)
     monkeypatch.setenv("IMIRROR_DEVICES_FILE", str(tmp_path / "devices.json"))
     monkeypatch.setenv("IMIRROR_IOS_BIN", "/x/ios")
     monkeypatch.delenv("IMIRROR_TARGET", raising=False)
@@ -367,8 +394,8 @@ def test_an_install_that_lost_its_hold_waiting_for_devicectl_lock_never_runs(
             errors.append(e)
     th = threading.Thread(target=install)
     th.start()
-    wait_for(lambda: top(K16E), what="the install's hold")
-    steal(K16E, sleeper())
+    wait_for(lambda: top(K1), what="the install's hold")
+    steal(K1, sleeper())
     time.sleep(0.3)
     os.close(fd)                                # the other install finished
     th.join(5)

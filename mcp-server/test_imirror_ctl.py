@@ -18,14 +18,14 @@ _spec = importlib.util.spec_from_loader("imirror_ctl", _loader)
 ctl = importlib.util.module_from_spec(_spec)
 _loader.exec_module(ctl)
 
-PHONE_16E = "00008140-0006423002D3401C"
-PHONE_17 = "00008150-001928E01404401C"
+PHONE1 = "00008150-001928E01404401C"        # the real slot table: slot 0
+PHONE2 = "00008140-0006423002D3401C"        # slot 1
 SIM = "5B3C1F2A-0000-4000-8000-00000000A1B2"
 NOW = datetime(2026, 11, 13, 10, 0, 0, tzinfo=timezone.utc)
 
 DEVICES = [
-    {"udid": PHONE_16E, "alias": "phone1", "kind": "device", "state": "ready", "chain_epoch": 3},
-    {"udid": PHONE_17, "alias": "phone2", "kind": "device", "state": "down", "reason": "gave_up",
+    {"udid": PHONE1, "alias": "phone1", "kind": "device", "state": "ready", "chain_epoch": 3},
+    {"udid": PHONE2, "alias": "phone2", "kind": "device", "state": "down", "reason": "gave_up",
      "state_since": "2026-11-13T09:58:00Z", "chain_epoch": 1, "next_retry_at": "2026-11-13T10:02:00Z"},
     {"udid": SIM, "alias": "sim-17", "kind": "simulator", "state": "ready"},
 ]
@@ -50,10 +50,10 @@ def ev(ts, udid, event, **kw):
 # ---- resolve: the MCP server's rules ----
 
 def test_resolve_alias_udid_prefix_suffix():
-    assert ctl.resolve("PHONE2", DEVICES)["udid"] == PHONE_17
-    assert ctl.resolve(PHONE_16E.lower(), DEVICES)["alias"] == "phone1"
-    assert ctl.resolve("00008150", DEVICES)["alias"] == "phone2"
-    assert ctl.resolve("e01404401c", DEVICES)["alias"] == "phone2"
+    assert ctl.resolve("PHONE2", DEVICES)["udid"] == PHONE2
+    assert ctl.resolve(PHONE1.lower(), DEVICES)["alias"] == "phone1"
+    assert ctl.resolve("00008140", DEVICES)["alias"] == "phone2"
+    assert ctl.resolve("02d3401c", DEVICES)["alias"] == "phone2"
 
 
 def test_resolve_refuses_a_suffix_two_phones_share():
@@ -80,19 +80,19 @@ def test_parse_since_units_and_iso():
 
 
 def test_read_events_old_file_first_skips_bad_lines_and_filters(tmp_path):
-    (tmp_path / "events.jsonl.1").write_text(ev("2026-11-13T08:00:00.000Z", PHONE_17, "restart") + "\n")
+    (tmp_path / "events.jsonl.1").write_text(ev("2026-11-13T08:00:00.000Z", PHONE2, "restart") + "\n")
     (tmp_path / "events.jsonl").write_text("\n".join([
-        ev("2026-11-13T09:30:00.000Z", PHONE_16E, "state"),
+        ev("2026-11-13T09:30:00.000Z", PHONE1, "state"),
         '{"ts": "cut off',
-        ev("2026-11-13T09:40:00.000Z", PHONE_17, "give_up"),
+        ev("2026-11-13T09:40:00.000Z", PHONE2, "give_up"),
     ]) + "\n")
-    assert [e["event"] for e in ctl.read_events(str(tmp_path), PHONE_17)] == ["restart", "give_up"]
+    assert [e["event"] for e in ctl.read_events(str(tmp_path), PHONE2)] == ["restart", "give_up"]
     since = NOW - timedelta(hours=1)
     assert [e["event"] for e in ctl.read_events(str(tmp_path), None, since)] == ["state", "give_up"]
 
 
 def test_format_event_shows_transition_and_expected():
-    line = ctl.format_event(json.loads(ev("t", PHONE_17, "state", **{"from": "ready", "to": "down",
+    line = ctl.format_event(json.loads(ev("t", PHONE2, "state", **{"from": "ready", "to": "down",
                                                                       "reason": "usb_reset"})))
     assert "state ready -> down reason=usb_reset" in line
     assert ctl.format_event({"event": "usb_reset", "expected": True}).endswith("expected")
@@ -101,10 +101,10 @@ def test_format_event_shows_transition_and_expected():
 # ---- restart requests ----
 
 def test_write_request_is_atomic_and_private(tmp_path):
-    path = ctl.write_request(str(tmp_path), PHONE_17, NOW)
-    assert os.path.basename(path) == f"restart-{PHONE_17}.json"
+    path = ctl.write_request(str(tmp_path), PHONE2, NOW)
+    assert os.path.basename(path) == f"restart-{PHONE2}.json"
     body = json.loads(open(path).read())
-    assert body == {"udid": PHONE_17, "requested_at": "2026-11-13T10:00:00.000Z",
+    assert body == {"udid": PHONE2, "requested_at": "2026-11-13T10:00:00.000Z",
                     "requested_by": "imirror-ctl"}
     assert os.listdir(tmp_path / "requests") == [os.path.basename(path)]
     assert stat.S_IMODE(os.stat(tmp_path / "requests").st_mode) == 0o700
@@ -116,11 +116,11 @@ def test_write_request_refuses_a_path_in_the_udid(tmp_path):
 
 
 def test_request_outcome_only_counts_answers_after_the_request():
-    events = [json.loads(ev("2026-11-13T09:59:00.000Z", PHONE_17, "request", detail="accepted")),
-              json.loads(ev("2026-11-13T10:00:00.500Z", PHONE_16E, "request", detail="cooldown"))]
-    assert ctl.request_outcome(events, PHONE_17, NOW) is None
-    events.append(json.loads(ev("2026-11-13T10:00:00.400Z", PHONE_17, "request", detail="cooldown")))
-    assert ctl.request_outcome(events, PHONE_17, NOW) == "cooldown"
+    events = [json.loads(ev("2026-11-13T09:59:00.000Z", PHONE2, "request", detail="accepted")),
+              json.loads(ev("2026-11-13T10:00:00.500Z", PHONE1, "request", detail="cooldown"))]
+    assert ctl.request_outcome(events, PHONE2, NOW) is None
+    events.append(json.loads(ev("2026-11-13T10:00:00.400Z", PHONE2, "request", detail="cooldown")))
+    assert ctl.request_outcome(events, PHONE2, NOW) == "cooldown"
 
 
 class FakeApp:
@@ -137,13 +137,13 @@ class FakeApp:
         self.calls += 1
         if self.calls != 1 or self.answer is None:
             return
-        req = self.folder / "requests" / f"restart-{PHONE_17}.json"
+        req = self.folder / "requests" / f"restart-{PHONE2}.json"
         assert req.exists(), "the request was written before waiting"
         req.unlink()
         with open(self.folder / "events.jsonl", "a") as f:
-            f.write(ev(ctl.iso(NOW + timedelta(seconds=1)), PHONE_17, "request", detail=self.answer) + "\n")
+            f.write(ev(ctl.iso(NOW + timedelta(seconds=1)), PHONE2, "request", detail=self.answer) + "\n")
         if self.bump:
-            devs = [dict(d, chain_epoch=2) if d["udid"] == PHONE_17 else d for d in DEVICES]
+            devs = [dict(d, chain_epoch=2) if d["udid"] == PHONE2 else d for d in DEVICES]
             write_devices(self.folder / "devices.json", devs)
 
 
@@ -173,7 +173,7 @@ def test_restart_times_out_and_withdraws_the_request(app_dir):
 # ---- main ----
 
 def test_status_one_device_prints_reason_and_events(app_dir, capsys):
-    (app_dir / "events.jsonl").write_text(ev("2026-11-13T09:58:00.000Z", PHONE_17, "give_up") + "\n")
+    (app_dir / "events.jsonl").write_text(ev("2026-11-13T09:58:00.000Z", PHONE2, "give_up") + "\n")
     assert ctl.main(["status", "phone2"]) == 0
     out = capsys.readouterr().out
     assert "gave_up" in out and "2026-11-13T10:02:00Z" in out and "give_up" in out
@@ -199,12 +199,12 @@ def test_restart_refuses_a_simulator(app_dir, capsys):
 # ---- keyboard ----
 
 def test_keyboard_request_names_the_action_and_carries_no_passcode(tmp_path):
-    path = ctl.write_keyboard_request(str(tmp_path), PHONE_16E, NOW, "test", "hello 123")
-    assert os.path.basename(path) == f"keyboard-{PHONE_16E}.json"
-    assert json.loads(open(path).read()) == {"udid": PHONE_16E, "requested_at": "2026-11-13T10:00:00.000Z",
+    path = ctl.write_keyboard_request(str(tmp_path), PHONE1, NOW, "test", "hello 123")
+    assert os.path.basename(path) == f"keyboard-{PHONE1}.json"
+    assert json.loads(open(path).read()) == {"udid": PHONE1, "requested_at": "2026-11-13T10:00:00.000Z",
                                              "requested_by": "imirror-ctl", "action": "test",
                                              "text": "hello 123"}
-    pair = json.loads(open(ctl.write_keyboard_request(str(tmp_path), PHONE_16E, NOW, "pair")).read())
+    pair = json.loads(open(ctl.write_keyboard_request(str(tmp_path), PHONE1, NOW, "pair")).read())
     assert pair["action"] == "pair" and "text" not in pair
 
 
@@ -212,32 +212,32 @@ def test_keyboard_request_names_the_action_and_carries_no_passcode(tmp_path):
                                   "a 1234", "x123456", "1a2b3c4d", "pin 12 34"])
 def test_keyboard_test_text_refuses_digits_only_and_odd_text(tmp_path, text):
     with pytest.raises(ctl.CtlError):
-        ctl.write_keyboard_request(str(tmp_path), PHONE_16E, NOW, "test", text)
+        ctl.write_keyboard_request(str(tmp_path), PHONE1, NOW, "test", text)
     assert not (tmp_path / "requests").exists() or os.listdir(tmp_path / "requests") == []
 
 
 @pytest.mark.parametrize("text", ["a", "hello 123", "1 a 2 b 3", "z" * 32])
 def test_keyboard_test_text_allows_words_with_up_to_three_digits(tmp_path, text):
-    path = ctl.write_keyboard_request(str(tmp_path), PHONE_16E, NOW, "test", text)
+    path = ctl.write_keyboard_request(str(tmp_path), PHONE1, NOW, "test", text)
     assert json.loads(open(path).read())["text"] == text
 
 
 def test_keyboard_pair_and_forget_take_no_text(tmp_path):
     with pytest.raises(ctl.CtlError, match="takes no text"):
-        ctl.write_keyboard_request(str(tmp_path), PHONE_16E, NOW, "pair", "hello")
+        ctl.write_keyboard_request(str(tmp_path), PHONE1, NOW, "pair", "hello")
     with pytest.raises(ctl.CtlError, match="unknown"):
-        ctl.write_keyboard_request(str(tmp_path), PHONE_16E, NOW, "passcode")
+        ctl.write_keyboard_request(str(tmp_path), PHONE1, NOW, "passcode")
 
 
 def test_keyboard_outcome_skips_links_other_phones_and_older_answers():
-    events = [json.loads(ev("2026-11-13T09:59:00.000Z", PHONE_16E, "keyboard", detail="paired")),
-              json.loads(ev("2026-11-13T10:00:01.000Z", PHONE_16E, "keyboard", detail="connected")),
-              json.loads(ev("2026-11-13T10:00:01.000Z", PHONE_17, "keyboard", detail="paired")),
-              json.loads(ev("2026-11-13T10:00:02.000Z", PHONE_16E, "request", detail="accepted"))]
-    assert ctl.keyboard_outcome(events, PHONE_16E, NOW, "pair") is None
-    events.append(json.loads(ev("2026-11-13T10:00:03.000Z", PHONE_16E, "keyboard", detail="timeout")))
-    assert ctl.keyboard_outcome(events, PHONE_16E, NOW, "pair")["detail"] == "timeout"
-    assert ctl.keyboard_outcome(events, PHONE_16E, NOW, "test") is None
+    events = [json.loads(ev("2026-11-13T09:59:00.000Z", PHONE1, "keyboard", detail="paired")),
+              json.loads(ev("2026-11-13T10:00:01.000Z", PHONE1, "keyboard", detail="connected")),
+              json.loads(ev("2026-11-13T10:00:01.000Z", PHONE2, "keyboard", detail="paired")),
+              json.loads(ev("2026-11-13T10:00:02.000Z", PHONE1, "request", detail="accepted"))]
+    assert ctl.keyboard_outcome(events, PHONE1, NOW, "pair") is None
+    events.append(json.loads(ev("2026-11-13T10:00:03.000Z", PHONE1, "keyboard", detail="timeout")))
+    assert ctl.keyboard_outcome(events, PHONE1, NOW, "pair")["detail"] == "timeout"
+    assert ctl.keyboard_outcome(events, PHONE1, NOW, "test") is None
 
 
 class FakeKeyboardApp:
@@ -254,22 +254,22 @@ class FakeKeyboardApp:
         self.calls += 1
         if self.calls != 1 or not self.answer:
             return
-        (self.folder / "requests" / f"keyboard-{PHONE_16E}.json").unlink()
+        (self.folder / "requests" / f"keyboard-{PHONE1}.json").unlink()
         with open(self.folder / "events.jsonl", "a") as f:
-            f.write(ev(ctl.iso(NOW + timedelta(seconds=1)), PHONE_16E, "keyboard", detail="connected") + "\n")
-            f.write(ev(ctl.iso(NOW + timedelta(seconds=2)), PHONE_16E, "keyboard", **self.answer) + "\n")
+            f.write(ev(ctl.iso(NOW + timedelta(seconds=1)), PHONE1, "keyboard", detail="connected") + "\n")
+            f.write(ev(ctl.iso(NOW + timedelta(seconds=2)), PHONE1, "keyboard", **self.answer) + "\n")
 
 
 def test_keyboard_waits_for_the_answer(tmp_path):
     fake = FakeKeyboardApp(tmp_path, detail="typed_test", chars=9)
-    answer = ctl.keyboard(PHONE_16E, str(tmp_path), "test", "hello 123", clock=fake.clock, sleep=fake.sleep,
+    answer = ctl.keyboard(PHONE1, str(tmp_path), "test", "hello 123", clock=fake.clock, sleep=fake.sleep,
                           now=NOW)
     assert answer["detail"] == "typed_test" and answer["chars"] == 9
 
 
 def test_keyboard_pair_waits_past_the_apps_window_then_withdraws(tmp_path):
     fake = FakeKeyboardApp(tmp_path)
-    assert ctl.keyboard(PHONE_16E, str(tmp_path), "pair", clock=fake.clock, sleep=fake.sleep, now=NOW) is None
+    assert ctl.keyboard(PHONE1, str(tmp_path), "pair", clock=fake.clock, sleep=fake.sleep, now=NOW) is None
     assert fake.t >= 130
     assert os.listdir(tmp_path / "requests") == []
 
@@ -283,7 +283,7 @@ def test_describe_keyboard_gives_counts_and_hints_never_text():
 
 def test_keyboard_device_falls_back_to_a_paired_udid_off_usb():
     pairs = {"00008101-AAAA": {"central": "C", "paired_at": "t"}}
-    assert ctl.keyboard_device("phone1", DEVICES, pairs)["udid"] == PHONE_16E
+    assert ctl.keyboard_device("phone1", DEVICES, pairs)["udid"] == PHONE1
     assert ctl.keyboard_device("00008101-aaaa", DEVICES, pairs)["udid"] == "00008101-AAAA"
     with pytest.raises(ctl.CtlError):
         ctl.keyboard_device("phone9", DEVICES, pairs)
@@ -291,11 +291,11 @@ def test_keyboard_device_falls_back_to_a_paired_udid_off_usb():
 
 def test_keyboard_status_prints_the_tie_and_keyboard_events_only(app_dir, capsys):
     (app_dir / "keyboard-pairs.json").write_text(json.dumps(
-        {PHONE_16E: {"central": "4F2C0D3A-0000-4000-8000-000000000001", "paired_at": "2026-11-13T09:00:00.000Z"}}))
+        {PHONE1: {"central": "4F2C0D3A-0000-4000-8000-000000000001", "paired_at": "2026-11-13T09:00:00.000Z"}}))
     (app_dir / "events.jsonl").write_text("\n".join([
-        ev("2026-11-13T09:00:00.000Z", PHONE_16E, "keyboard", detail="paired"),
-        ev("2026-11-13T09:01:00.000Z", PHONE_16E, "wake"),
-        ev("2026-11-13T09:02:00.000Z", PHONE_16E, "keyboard", detail="typed_test", chars=5),
+        ev("2026-11-13T09:00:00.000Z", PHONE1, "keyboard", detail="paired"),
+        ev("2026-11-13T09:01:00.000Z", PHONE1, "wake"),
+        ev("2026-11-13T09:02:00.000Z", PHONE1, "keyboard", detail="typed_test", chars=5),
     ]) + "\n")
     assert ctl.main(["keyboard", "status", "phone1"]) == 0
     out = capsys.readouterr().out
@@ -305,10 +305,10 @@ def test_keyboard_status_prints_the_tie_and_keyboard_events_only(app_dir, capsys
 
 def test_keyboard_status_shows_the_dongle_transport_and_peer(app_dir, capsys):
     (app_dir / "keyboard-pairs.json").write_text(json.dumps(
-        {PHONE_16E: {"transport": "dongle", "slot": "00008101aaaa", "peer": "4a:3b:2c:1d:0e:ff",
+        {PHONE1: {"transport": "dongle", "slot": "00008101aaaa", "peer": "4a:3b:2c:1d:0e:ff",
                      "paired_at": "2026-11-15T09:00:00.000Z"}}))
     (app_dir / "events.jsonl").write_text(
-        ev("2026-11-15T09:00:00.000Z", PHONE_16E, "keyboard", detail="paired", transport="dongle") + "\n")
+        ev("2026-11-15T09:00:00.000Z", PHONE1, "keyboard", detail="paired", transport="dongle") + "\n")
     assert ctl.main(["keyboard", "status", "phone1"]) == 0
     out = capsys.readouterr().out
     assert "paired via dongle, slot 00008101aaaa, peer 4a:3b:2c:1d:0e:ff" in out
@@ -340,12 +340,12 @@ def test_keyboard_refuses_a_simulator_and_a_dead_app(app_dir, capsys):
 
 def test_keyboard_auto_requests_carry_only_the_action(tmp_path):
     for action in ("auto_on", "auto_off"):
-        path = ctl.write_keyboard_request(str(tmp_path), PHONE_16E, NOW, action)
+        path = ctl.write_keyboard_request(str(tmp_path), PHONE1, NOW, action)
         body = json.loads(open(path).read())
-        assert body == {"udid": PHONE_16E, "requested_at": "2026-11-13T10:00:00.000Z",
+        assert body == {"udid": PHONE1, "requested_at": "2026-11-13T10:00:00.000Z",
                         "requested_by": "imirror-ctl", "action": action}
     with pytest.raises(ctl.CtlError):
-        ctl.write_keyboard_request(str(tmp_path), PHONE_16E, NOW, "auto_on", "222222")
+        ctl.write_keyboard_request(str(tmp_path), PHONE1, NOW, "auto_on", "222222")
 
 
 class FakeAutoApp:
@@ -355,12 +355,12 @@ class FakeAutoApp:
         self.folder, self.answer, self.seen = folder, answer, None
 
     def sleep(self, _s):
-        req = self.folder / "requests" / f"keyboard-{PHONE_16E}.json"
+        req = self.folder / "requests" / f"keyboard-{PHONE1}.json"
         if self.seen is None and req.exists():
             self.seen = json.loads(req.read_text())
             req.unlink()
             with open(self.folder / "events.jsonl", "a") as f:
-                f.write(ev(ctl.iso(datetime.now(timezone.utc) + timedelta(seconds=1)), PHONE_16E, "keyboard",
+                f.write(ev(ctl.iso(datetime.now(timezone.utc) + timedelta(seconds=1)), PHONE1, "keyboard",
                            **self.answer) + "\n")
 
 
@@ -393,16 +393,16 @@ def test_keyboard_auto_on_reports_a_refusal(app_dir, monkeypatch, capsys):
 
 def test_an_auto_request_is_answered_only_by_its_own_events():
     def k(detail, reason):
-        return json.loads(ev("2026-11-13T10:00:01.000Z", PHONE_16E, "keyboard", detail=detail, reason=reason))
+        return json.loads(ev("2026-11-13T10:00:01.000Z", PHONE1, "keyboard", detail=detail, reason=reason))
     # An automatic try's failure, or a click's, answers neither.
-    assert ctl.keyboard_outcome([k("failed", "busy"), k("failed", "send_failed")], PHONE_16E, NOW, "auto_on") is None
+    assert ctl.keyboard_outcome([k("failed", "busy"), k("failed", "send_failed")], PHONE1, NOW, "auto_on") is None
     # A failed click logs auto_off still_locked: not this request's answer.
-    assert ctl.keyboard_outcome([k("auto_off", "still_locked")], PHONE_16E, NOW, "auto_off") is None
-    assert ctl.keyboard_outcome([k("auto_off", "renamed")], PHONE_16E, NOW, "auto_off") is None
-    assert ctl.keyboard_outcome([k("auto_on", "request")], PHONE_16E, NOW, "auto_on")["detail"] == "auto_on"
-    assert ctl.keyboard_outcome([k("auto_on", "settings")], PHONE_16E, NOW, "auto_on") is None
+    assert ctl.keyboard_outcome([k("auto_off", "still_locked")], PHONE1, NOW, "auto_off") is None
+    assert ctl.keyboard_outcome([k("auto_off", "renamed")], PHONE1, NOW, "auto_off") is None
+    assert ctl.keyboard_outcome([k("auto_on", "request")], PHONE1, NOW, "auto_on")["detail"] == "auto_on"
+    assert ctl.keyboard_outcome([k("auto_on", "settings")], PHONE1, NOW, "auto_on") is None
     for why in ("not_paired", "not_attached", "no_passcode", "no_file", "untypeable", "stale"):
-        assert ctl.keyboard_outcome([k("failed", why)], PHONE_16E, NOW, "auto_on")["reason"] == why
+        assert ctl.keyboard_outcome([k("failed", why)], PHONE1, NOW, "auto_on")["reason"] == why
 
 
 def test_keyboard_auto_off_writes_auto_off(app_dir, monkeypatch):
@@ -414,10 +414,10 @@ def test_keyboard_auto_status_writes_nothing_and_prints_the_field(app_dir, capsy
     devices = [dict(DEVICES[0], auto_unlock="off_after_failure", reason="locked")] + DEVICES[1:]
     write_devices(app_dir / "devices.json", devices)
     (app_dir / "events.jsonl").write_text("\n".join([
-        ev("2026-11-13T09:00:00.000Z", PHONE_16E, "keyboard", detail="auto_wake"),
-        ev("2026-11-13T09:00:01.000Z", PHONE_16E, "keyboard", detail="typed_test", chars=5),
-        ev("2026-11-13T09:00:02.000Z", PHONE_16E, "lock", detail="locked"),
-        ev("2026-11-13T09:00:20.000Z", PHONE_16E, "keyboard", detail="auto_failed", reason="still_locked"),
+        ev("2026-11-13T09:00:00.000Z", PHONE1, "keyboard", detail="auto_wake"),
+        ev("2026-11-13T09:00:01.000Z", PHONE1, "keyboard", detail="typed_test", chars=5),
+        ev("2026-11-13T09:00:02.000Z", PHONE1, "lock", detail="locked"),
+        ev("2026-11-13T09:00:20.000Z", PHONE1, "keyboard", detail="auto_failed", reason="still_locked"),
     ]) + "\n")
     assert ctl.main(["keyboard", "auto", "status", "phone1"]) == 0
     out = capsys.readouterr().out

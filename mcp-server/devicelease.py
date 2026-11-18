@@ -575,10 +575,12 @@ def _summary(e: Dict[str, Any], now: float, cfg: Config) -> Dict[str, Any]:
     """The holder as other agents see it (contract C1's `holder`)."""
     frozen = bool(e.get("frozen"))
     if "seq" in e:                          # a waiting ticket, not a hold
+        # Lets a message name the waiter and its other devices.
         return {"purpose": e.get("purpose") or "", "via": e.get("via") or "",
                 "cwd": e.get("cwd") or "", "pid": _anchor(e).pid, "kind": e.get("kind") or "",
                 "since": e.get("since") or "", "idle_s": 0, "until": None, "eta_s": None,
-                "waiting": True}
+                "waiting": True, "label": e.get("label") or "",
+                "keys": list(e.get("keys") or [])}
     if frozen:                              # what it gets back when restored
         left = float((e.get("frozen") or {}).get("hold_left_s") or 0)
         exp = now + max(left, float(e.get("idle_s") or cfg.idle_s))
@@ -807,6 +809,7 @@ class Outcome:
     position: Optional[int] = None
     ticket: Optional[str] = None
     released: List[str] = dataclasses.field(default_factory=list)
+    dropped_tickets: List[List[str]] = dataclasses.field(default_factory=list)
     message: str = ""
     changed: bool = False
     wall_offset: float = 0.0
@@ -1300,10 +1303,11 @@ def _do_release(st: Dict[str, Any], req: Request, me: Caller, now: float,
                                          pid=me.anchor.pid))
             elif _anchor(top) in set(me.chain):
                 covered = True
-    before = len(st["tickets"])
-    st["tickets"] = [t for t in st["tickets"]
-                     if not (mine(t) and (req.all_keys or set(t["keys"]) & set(keys)))]
-    dropped = before - len(st["tickets"])
+    gone_t = [t for t in st["tickets"]
+              if mine(t) and (req.all_keys or set(t["keys"]) & set(keys))]
+    st["tickets"] = [t for t in st["tickets"] if all(t is not g for g in gone_t)]
+    dropped = len(gone_t)
+    out.dropped_tickets = [list(t["keys"]) for t in gone_t]
     if out.released or dropped:
         out.status = "released"
         out.changed = True
@@ -1442,7 +1446,15 @@ def describe(out: Outcome, *, now: float, cfg: Config, names: Optional[Dict[str,
         lead = (f"Nothing was sent. {name} is held by a named agent in this session "
                 f"(\"{h.get('label', '')}\"); pass agent=<your name> on every call.")
     elif reason == "ticket-ahead":
-        lead = f"Nothing was sent. {name} is reserved for an agent waiting in line ({who})."
+        owner = f"agent \"{h['label']}\"" if h.get("label") else "an agent"
+        others = [_name(k, names) for k in h.get("keys") or [] if k != first["key"]]
+        if others:
+            # The usual case: a multi-device wait keeps this free one.
+            lead = (f"Nothing was sent. {name} is free but kept for {owner} ({who}), "
+                    f"which is waiting for another device ({', '.join(others)}) and "
+                    f"will take them all at once.")
+        else:
+            lead = f"Nothing was sent. {name} is reserved for {owner} waiting in line ({who})."
     elif reason == "depth":
         lead = f"Nothing was sent. {name} has too many nested reservations."
     else:

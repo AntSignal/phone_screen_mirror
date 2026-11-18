@@ -17,7 +17,7 @@ its self-managed transport (userspace tunnel + runwda + forward + relay).
 | `ios_status` | WDA ready? + iOS version / device name, which server answered (`server_version`, `script_path`) and which endpoint (`target`, `wda_endpoint`, `selected_udid`); with iMirror's device file, also the app's view (`app_state`, `reason`, `state_since`, `chain_epoch`, `next_retry_at`, `last_error`) and the phone's last 5 events |
 | `ios_devices` | every device this server can drive (alias, UDID, port, ready?, the app's view as above, how its WDA sessions were got) and which one is the default |
 | `ios_reserve_device(device, agent, wait_s, hold_s)` | reserve a device for yourself, waiting in line (≤ 85 s per call) if another agent has it: `held` or `queued` (see [Sharing a device between agents](#sharing-a-device-between-agents)) |
-| `ios_release_device(device, agent)` | release it; the next agent in line gets it at once |
+| `ios_release_device(device, agent)` | release it; the next agent in line gets it at once. `device="all"` releases every device that `agent` holds or waits for |
 | `ios_device_leases(device)` | who holds each device, since when, how long idle, and who waits |
 | `ios_recover` | ask iMirror to restart a phone's WDA chain, then wait ≤30 s: `accepted`, `cooldown` (one ran in the last minute) or `timeout` |
 | `ios_window_size` | logical screen size (points) for the current orientation |
@@ -76,8 +76,11 @@ ios_release_device(device="phone1", agent="<your name>")
   any device.
 - **`agent`**: subagents of one session share one MCP server, so pass your own
   name on every call. Two names are two holders. `ios_release_device` frees
-  only that name's hold. `"phone1,phone2"` reserves both or neither, and a
-  wait that would deadlock fails with `DEVICE_DEADLOCK`.
+  only that name's hold; `device="all"` frees all of them and leaves every
+  line it waits in. `"phone1,phone2"` reserves both or neither, and a
+  wait that would deadlock fails with `DEVICE_DEADLOCK`. While it waits for a
+  busy phone2, the free phone3 is kept for it: other agents get `DEVICE_BUSY`
+  there naming the waiter, and the `lease` shows it as `reserved_for`.
 - `ios_devices` and `ios_status` show each device's `lease`. `ios_devices`
   lists `servers_ignoring_leases`: MCP servers on this Mac (an older install)
   that drive devices without asking.

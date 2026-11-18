@@ -2080,8 +2080,10 @@ def test_install_app_invokes_go_ios(mod, monkeypatch, tmp_path):
         class R: returncode = 0; stderr = ""
         return R()
     monkeypatch.setattr(mod.subprocess, "run", fake_run)
+    monkeypatch.setattr(mod._LEGACY, "udid", "00008140-0006423002D3401C")  # IMIRROR_UDID
     out = mod.ios_install_app(str(ipa))
     assert seen["args"][1] == "install" and f"--path={ipa}" in seen["args"]
+    assert "--udid=00008140-0006423002D3401C" in seen["args"]
     assert "installed" in out
 
 
@@ -2096,6 +2098,7 @@ def test_install_app_reports_go_ios_failure(mod, monkeypatch, tmp_path):
     def boom(args, **kw):
         raise subprocess.CalledProcessError(1, args, stderr="device locked")
     monkeypatch.setattr(mod.subprocess, "run", boom)
+    monkeypatch.setattr(mod._LEGACY, "udid", "00008140-0006423002D3401C")  # IMIRROR_UDID
     with pytest.raises(RuntimeError, match="install failed: device locked"):
         mod.ios_install_app(str(ipa))
 
