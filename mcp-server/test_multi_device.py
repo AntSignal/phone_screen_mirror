@@ -737,6 +737,33 @@ def test_ios_devices_in_fallback_mode_explains_why(reg, monkeypatch):
     assert out["devices"][0]["wda"] == "http://127.0.0.1:8100"
 
 
+def test_ios_devices_shows_the_apps_problems(reg, monkeypatch):
+    monkeypatch.setattr(reg.m, "_probe_status", lambda t: {"wda_ready": True})
+    unslotted = "00008020-000324610A68002E"
+    reg.write(TWO_PHONES, problems=[
+        {"reason": "app_bundle_missing", "message": "run scripts/run.sh --restart"},
+        {"udid": unslotted, "reason": "slots_full", "message": "x" * 500},
+        {"reason": "no_message"},                        # skipped: not readable
+        "junk",
+    ])
+    out = json.loads(reg.m.ios_devices())
+    assert out["problems"][0] == {"reason": "app_bundle_missing",
+                                  "message": "run scripts/run.sh --restart"}
+    assert out["problems"][1]["udid"] == unslotted
+    assert len(out["problems"][1]["message"]) == 300
+    assert len(out["problems"]) == 2
+    assert len(out["devices"]) == 2                     # the phones still list
+
+
+def test_ios_devices_tolerates_an_app_that_writes_no_problems(reg, monkeypatch):
+    monkeypatch.setattr(reg.m, "_probe_status", lambda t: {"wda_ready": True})
+    assert json.loads(reg.m.ios_devices())["problems"] == []
+    reg.write(TWO_PHONES, problems={"not": "a list"})
+    assert json.loads(reg.m.ios_devices())["problems"] == []
+    os.remove(reg.path)                                  # fallback: none either
+    assert json.loads(reg.m.ios_devices())["problems"] == []
+
+
 def test_only_tools_that_never_change_the_device_are_marked_read_only(reg):
     """Claude Code sends several calls from one message at once only when the
     tools are read-only (measured: two ios_wait_for calls went out 0.3s apart

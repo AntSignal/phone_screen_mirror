@@ -32,7 +32,10 @@ final class ChainManager {
     /// Attached phones with a chain, by slot.
     private(set) var controllers: [DeviceController] = []
     /// Attached phones that could NOT get a chain, and why (a port in use…).
-    private(set) var problems: [String: String] = [:]
+    private var slotProblems: [String: RegistryProblem] = [:]
+    var problems: [String: String] { slotProblems.mapValues(\.message) }
+    /// Is the go-ios binary (inside the app bundle) still on disk?
+    private var bundleWatch = AppBundleWatch()
     private(set) var running = false
     /// UDIDs the shared tunnel had a route to at the last poll.
     private(set) var tunnelUDIDs: Set<String> = []
@@ -67,6 +70,8 @@ final class ChainManager {
     var autoUnlockState: (String) -> String? = { _ in nil }
     /// Could auto-unlock still type for this locked phone? (PowerPolicy)
     var autoUnlockMayAct: (String) -> Bool = { _ in false }
+    /// The app's go-ios binary vanished (its path). Called once per run.
+    var onAppBundleMissing: ((String) -> Void)?
     /// A phone's alias changed; its passcode key changed with it.
     var onAliasChanged: ((_ udid: String, _ alias: String) -> Void)?
 
@@ -182,7 +187,7 @@ final class ChainManager {
         sleepAssertion.set(false)
         for c in controllers { c.stop() }
         controllers = []
-        problems = [:]
+        slotProblems = [:]
         missingPolls = [:]
         tunnel?.stop()
         registry.remove()
@@ -193,6 +198,7 @@ final class ChainManager {
 
     private func poll() {
         guard running, !polling, let bin, let tunnel else { return }
+        guard bundleStillThere(bin) else { return }
         polling = true
         let workDir = self.workDir
         let known = self.knownDevices
@@ -202,7 +208,7 @@ final class ChainManager {
             DispatchQueue.main.async {
                 guard let self else { return }
                 self.polling = false
-                guard self.running else { return }
+                guard self.running, !self.bundleWatch.missing else { return }
                 // A lost or regained route changes a phone's reason.
                 if tunneled != self.tunnelUDIDs { self.scheduleWrite() }
                 self.tunnelUDIDs = tunneled
@@ -293,7 +299,7 @@ final class ChainManager {
             saveTable()
             switch result {
             case .assigned(let slot, let alias, _):
-                problems[udid] = nil
+                slotProblems[udid] = nil
                 guard let bin else { continue }
                 let chain = DeviceChain(udid: udid, slot: slot, bin: bin, workDir: workDir)
                 if let tunnel {
@@ -302,16 +308,13 @@ final class ChainManager {
                 NSLog("iMirror: \(alias) (\(udid)) attached — slot \(slot.index), WDA on :\(slot.relayPort)")
                 add(makeController(device, slot: slot, alias: alias, chain: chain))
                 changed = true
-            case .conflict(let slot, let port):
-                let why = "port \(port) (its slot \(slot.index)) is held by another process"
-                if problems[udid] != why { problems[udid] = why; changed = true }
-            case .full:
-                let why = "all \(PortSlot.maxSlots) port slots belong to attached phones"
-                if problems[udid] != why { problems[udid] = why; changed = true }
+            case .conflict, .full:
+                let problem = RegistryProblem.slot(result, udid: udid)
+                if slotProblems[udid] != problem { slotProblems[udid] = problem; changed = true }
             }
         }
-        let stale = problems.keys.filter { present[$0] == nil && !held.contains($0) }
-        if !stale.isEmpty { stale.forEach { problems[$0] = nil }; changed = true }
+        let stale = slotProblems.keys.filter { present[$0] == nil && !held.contains($0) }
+        if !stale.isEmpty { stale.forEach { slotProblems[$0] = nil }; changed = true }
         if changed {
             onDevicesChanged?()
             scheduleWrite()
@@ -478,7 +481,30 @@ final class ChainManager {
         return DeviceRegistryFile(ownerPid: getpid(), ownerUniqueID: ProcessIdentity.ownUniqueID,
                                   appVersion: version,
                                   updatedAt: DeviceRegistryCodec.timestamp(Date()),
-                                  goios: bin?.path, devices: devices)
+                                  goios: bin?.path, devices: devices,
+                                  problems: RegistryProblem.list(bundle: bundleProblem, phones: slotProblems))
+    }
+
+    private var bundleProblem: RegistryProblem? {
+        guard bundleWatch.missing, let bin else { return nil }
+        return .appBundleMissing(goios: bin.path)
+    }
+
+    /// One stat per poll. A deleted bundle (a worktree removed, a rebuild
+    /// elsewhere) takes go-ios with it, and every spawn would then fail
+    /// silently. Say so in devices.json and once to the user, and spawn
+    /// nothing until it is back.
+    private func bundleStillThere(_ bin: URL) -> Bool {
+        let wasMissing = bundleWatch.missing
+        if bundleWatch.check(binaryExists: FileManager.default.isExecutableFile(atPath: bin.path)) {
+            onAppBundleMissing?(bin.path)
+        }
+        if bundleWatch.missing != wasMissing {
+            NSLog("iMirror: go-ios at \(bin.path) is \(bundleWatch.missing ? "gone" : "back")")
+            onDevicesChanged?()
+            scheduleWrite()
+        }
+        return !bundleWatch.missing
     }
 
     // MARK: Ports

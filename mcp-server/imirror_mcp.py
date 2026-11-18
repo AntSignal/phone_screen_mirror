@@ -349,6 +349,8 @@ class _Registry:
         self._owner_uniqueid: int | None = None
         self.goios: str | None = None
         self.problem = "no device file yet"
+        # The file's `problems` (phones with no slot, a deleted app bundle).
+        self.problems: list[dict[str, str]] = []
 
     def snapshot(self) -> tuple[bool, list[_Target]]:
         """(valid, targets). `valid` is False when the file is missing, stale
@@ -359,12 +361,19 @@ class _Registry:
                 return False, []
             return True, [self._by_udid[u] for u in self._order]
 
+    def app_problems(self) -> list[dict[str, str]]:
+        """A copy of the live file's `problems`; none when it is not live."""
+        with self._lock:
+            self._refresh_locked()
+            return [dict(p) for p in self.problems] if self._owner is not None else []
+
     def _invalidate(self, problem: str) -> None:
         self._owner = None
         self._owner_uniqueid = None
         self._order = []
         self.goios = None
         self.problem = problem
+        self.problems = []
 
     def _refresh_locked(self) -> None:
         path = _devices_file()
@@ -413,6 +422,7 @@ class _Registry:
         self._order = order
         goios = doc.get("goios")
         self.goios = goios if isinstance(goios, str) and goios else None
+        self.problems = _parse_problems(doc.get("problems"))
         self.problem = ""
 
     def _apply_entry(self, e: Any) -> _Target | None:
@@ -453,6 +463,24 @@ class _Registry:
         t.chain_epoch = (epoch if isinstance(epoch, int) and not isinstance(epoch, bool)
                          else None)
         return t
+
+
+def _parse_problems(raw: Any) -> list[dict[str, str]]:
+    """devices.json `problems`. Older apps write none, so anything that is
+    not a list is none; an entry without a string reason and message is
+    skipped, and the list and each text are capped."""
+    if not isinstance(raw, list):
+        return []
+    out: list[dict[str, str]] = []
+    for p in raw[:20]:
+        if not (isinstance(p, dict) and isinstance(p.get("reason"), str)
+                and isinstance(p.get("message"), str)):
+            continue
+        item = {"reason": p["reason"][:60], "message": p["message"][:300]}
+        if isinstance(p.get("udid"), str) and p["udid"]:
+            item["udid"] = p["udid"][:64]
+        out.append(item)
+    return out
 
 
 _REGISTRY = _Registry()
@@ -2318,7 +2346,7 @@ def ios_devices() -> str:
     """List the devices this server can drive, and whether each one answers.
 
     Returns JSON {"mode", "default", "server_version", "script_path",
-    "devices": [{"alias", "udid", "kind", "product_type", "ios", "wda",
+    "problems", "devices": [{"alias", "udid", "kind", "product_type", "ios", "wda",
     "app_state", "reason", "state_since", "chain_epoch", "next_retry_at",
     "last_error", "events", "wda_ready", "is_default", "session", "lease"}]}.
     `lease`: who holds it (see ios_device_leases). `reason`
@@ -2331,6 +2359,10 @@ def ios_devices() -> str:
     when IMIRROR_WDA fixes one target, and "fallback" when neither (then only
     127.0.0.1:8100 is known). `default` is the device a call without `device`
     goes to, or null when several are attached and you must choose.
+    `problems` ([{"udid"?, "reason", "message"}]) is what the app says keeps
+    a phone, or every phone, from starting: a phone with no free port slot
+    (it has no entry in `devices`), or a deleted app bundle. Tell the user;
+    restarting a device does not fix these.
     """
     mode, targets = _targets()
     try:
@@ -2355,7 +2387,9 @@ def ios_devices() -> str:
             **({"error": p["error"]} if "error" in p else {}),
         })
     out: dict[str, Any] = {"mode": mode, "default": default, **_server_identity(),
-                           **_leases_state(), "devices": devices}
+                           **_leases_state(),
+                           "problems": _REGISTRY.app_problems() if mode == "list" else [],
+                           "devices": devices}
     if _leases().enabled:
         ignoring = _leases().unlocked_servers()
         if ignoring:

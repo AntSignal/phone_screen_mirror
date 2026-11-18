@@ -15,7 +15,7 @@ its self-managed transport (userspace tunnel + runwda + forward + relay).
 | Tool | What it does |
 |------|--------------|
 | `ios_status` | WDA ready? + iOS version / device name, which server answered (`server_version`, `script_path`) and which endpoint (`target`, `wda_endpoint`, `selected_udid`); with iMirror's device file, also the app's view (`app_state`, `reason`, `state_since`, `chain_epoch`, `next_retry_at`, `last_error`) and the phone's last 5 events |
-| `ios_devices` | every device this server can drive (alias, UDID, port, ready?, the app's view as above, how its WDA sessions were got) and which one is the default |
+| `ios_devices` | every device this server can drive (alias, UDID, port, ready?, the app's view as above, how its WDA sessions were got), which one is the default, and the app's `problems` (a phone with no free port slot, a deleted app bundle) |
 | `ios_reserve_device(device, agent, wait_s, hold_s)` | reserve a device for yourself, waiting in line (≤ 85 s per call) if another agent has it: `held` or `queued` (see [Sharing a device between agents](#sharing-a-device-between-agents)) |
 | `ios_release_device(device, agent)` | release it; the next agent in line gets it at once |
 | `ios_device_leases(device)` | who holds each device, since when, how long idle, and who waits |

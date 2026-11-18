@@ -369,6 +369,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSToolbarDelegate {
             self.setStatus(text)
         }
         manager.onBlocked = { [weak self] text in self?.setStatus(text) }
+        manager.onAppBundleMissing = { [weak self] path in
+            AppDelegate.notify("iMirror's app bundle was deleted", "Run scripts/run.sh --restart. (\(path) is gone.)")
+            self?.setStatus("iMirror's app bundle was deleted — run scripts/run.sh --restart.")
+        }
         updateHealthDot()        // grey — automation off
         // Automation now drives the entire mirror (WDA-MJPEG frames replace camera
         // capture), so it always starts on launch instead of waiting for an opt-in.

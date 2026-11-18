@@ -185,6 +185,45 @@ def test_status_all_lists_every_device(app_dir, capsys):
     assert "phone1" in out and "phone2" in out and "sim-17" in out
 
 
+PROBLEMS = [
+    {"reason": "app_bundle_missing", "message": "go-ios is gone; run scripts/run.sh --restart"},
+    {"udid": "00008020-000324610A68002E", "reason": "slots_full",
+     "message": "all 8 port slots belong to attached phones"},
+    {"reason": 7, "message": "skipped: not a string reason"},
+    "not a dict",
+]
+
+
+def write_with_problems(path, problems):
+    path.write_text(json.dumps({"schema": 1, "owner_pid": os.getpid(), "devices": DEVICES,
+                                "problems": problems}))
+
+
+def test_status_all_shows_problems(app_dir, capsys):
+    write_with_problems(app_dir / "devices.json", PROBLEMS)
+    assert ctl.main(["status"]) == 0
+    out = capsys.readouterr().out
+    assert "problem: iMirror: go-ios is gone; run scripts/run.sh --restart (app_bundle_missing)" in out
+    assert "problem: 00008020-000324610A68002E: all 8 port slots" in out
+    assert "skipped" not in out
+
+
+def test_status_one_device_shows_only_its_own_and_app_wide_problems(app_dir, capsys):
+    write_with_problems(app_dir / "devices.json", PROBLEMS)
+    assert ctl.main(["status", "phone2", "--json"]) == 0
+    doc = json.loads(capsys.readouterr().out)
+    assert [p["reason"] for p in doc["problems"]] == ["app_bundle_missing"]
+
+
+def test_status_json_list_is_unchanged_and_no_problems_key_is_fine(app_dir, capsys):
+    assert ctl.main(["status"]) == 0                   # the fixture writes none
+    assert "problem" not in capsys.readouterr().out
+    write_with_problems(app_dir / "devices.json", PROBLEMS)
+    assert ctl.main(["status", "--json"]) == 0
+    assert isinstance(json.loads(capsys.readouterr().out), list)
+    assert ctl.read_problems({"problems": "nope"}) == []
+
+
 def test_restart_refuses_a_dead_app(app_dir, capsys):
     write_devices(app_dir / "devices.json", DEVICES, pid=999_999)
     assert ctl.main(["restart", "phone2"]) == 1
