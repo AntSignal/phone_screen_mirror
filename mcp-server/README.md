@@ -245,6 +245,10 @@ top-level README). A call that cannot reach WDA reads that file, never
 - **`NEEDS_PASSCODE`** (`reason` `needs_passcode` or `locked`): fails at once.
   iMirror types the passcode if auto-passcode is set up for that phone;
   otherwise a person must.
+- **`RUNNER_MISSING`** (`reason` `runner_missing`): fails at once. The phone
+  has no WebDriverAgent runner and the app has none bundled to install; the
+  message names the `build-wda.sh` and `ios install` commands a person runs.
+  The app looks again every 30 s, so no restart is needed afterwards.
 - **`DEVICE_GAVE_UP`**: the app has stopped retrying; `next_retry_at` says
   when it tries again by itself. `ios_recover` asks for a retry now.
 - The app checks WDA every 3 s, so a call can fail before the file says
@@ -273,7 +277,8 @@ install|launch` takes, so two sessions never install at once and reset each
 other. It waits up to 15 minutes, then goes ahead. While it holds the lock it
 writes `expected-resets/<udid>.json` (`{"until": now+90 s, "by": "go-ios
 install"}`) before and after go-ios runs, so iMirror logs the reset that follows
-as expected. A Simulator install takes neither.
+as expected. A Simulator install takes neither. The iMirror app takes the same
+lock around its own runner installs (up to 5 minutes, then it goes ahead).
 
 ## Setup
 

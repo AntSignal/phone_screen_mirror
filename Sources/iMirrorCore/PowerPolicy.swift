@@ -51,6 +51,7 @@ public enum SleepPolicy {
     public static func isRecovering(_ reason: DeviceReason?, gaveUp: Bool, lockMayClear: Bool = false) -> Bool {
         guard let reason, !gaveUp else { return false }
         if reason == .locked { return lockMayClear }
-        return reason != .gaveUp && reason != .macAsleep
+        // A missing runner waits for a person, like a give-up.
+        return reason != .gaveUp && reason != .macAsleep && reason != .runnerMissing
     }
 }

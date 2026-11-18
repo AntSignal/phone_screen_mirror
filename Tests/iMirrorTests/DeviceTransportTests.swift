@@ -155,3 +155,49 @@ final class DeviceRegistryWriterTests: XCTestCase {
         XCTAssertNil(writer.foreignOwner(), "a dead owner's file is stale, not a live instance")
     }
 }
+
+/// The app's installs share devicectl.lock with the MCP server and
+/// antsignalctl. flock is per open file, so a second fd in this process
+/// stands in for another tool holding it.
+final class MacInstallLockTests: XCTestCase {
+    private var url: URL!
+
+    override func setUpWithError() throws {
+        let dir = FileManager.default.temporaryDirectory
+            .appendingPathComponent("imirror-lock-\(UUID().uuidString)", isDirectory: true)
+        url = dir.appendingPathComponent(InstallLockPolicy.fileName)
+    }
+
+    override func tearDownWithError() throws {
+        try? FileManager.default.removeItem(at: url.deletingLastPathComponent())
+    }
+
+    func testAFreeLockIsTakenAndHeldUntilReleased() throws {
+        let lock = try XCTUnwrap(MacInstallLock.acquire(udid: "u", url: url, abandon: { false }))
+        let other = open(url.path, O_RDWR)
+        defer { close(other) }
+        XCTAssertNotEqual(flock(other, LOCK_EX | LOCK_NB), 0, "held while the install runs")
+        lock.release()
+        XCTAssertEqual(flock(other, LOCK_EX | LOCK_NB), 0, "free once released")
+    }
+
+    func testAHeldLockIsWaitedForThenGivenUpOn() {
+        try? FileManager.default.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
+        let holder = open(url.path, O_CREAT | O_RDWR, 0o644)
+        defer { close(holder) }
+        XCTAssertEqual(flock(holder, LOCK_EX), 0)
+        let start = Date()
+        XCTAssertNil(MacInstallLock.acquire(udid: "u", url: url, waitSec: 1.5, abandon: { false }))
+        XCTAssertGreaterThanOrEqual(Date().timeIntervalSince(start), 1.5)
+    }
+
+    func testAMovedOnChainStopsWaiting() {
+        try? FileManager.default.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
+        let holder = open(url.path, O_CREAT | O_RDWR, 0o644)
+        defer { close(holder) }
+        XCTAssertEqual(flock(holder, LOCK_EX), 0)
+        let start = Date()
+        XCTAssertNil(MacInstallLock.acquire(udid: "u", url: url, abandon: { true }))
+        XCTAssertLessThan(Date().timeIntervalSince(start), 1)
+    }
+}
