@@ -433,7 +433,7 @@ final class DeviceController {
             // tick() restarted the clock; onRunwdaStarted restarts it again
             // once the new runwda spawns. A chain that never gets that far
             // still ages from now toward the next stage.
-            // With no route, this replaces a tunnel restart others would pay for.
+            // No route: this stands in for a tunnel restart.
             let heldBack = tunnelHasDevice() ? "" :
                 ", not the tunnel (other phones up; \(ladder.escalation.failures.count)/\(TunnelEscalation.failuresForTunnel) failed)"
             log(.restart, detail: "ladder: this phone's chain" + heldBack)
