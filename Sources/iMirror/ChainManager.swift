@@ -1,6 +1,7 @@
 // ChainManager — finds the phones, gives each a chain, and tells the MCP server.
 //
-// Polls `ios list --details` every 3s. A new USB phone gets its sticky port
+// Polls `ios list --details` every 3s (iMirrorCore/Discovery says what to do
+// when that fails for one phone). A new USB phone gets its sticky port
 // slot (iMirrorCore/PortSlots) and a DeviceController; a phone missing from two
 // polls in a row is torn down but keeps its slot and alias for next time. The
 // Mac's one go-ios tunnel is owned here, because restarting it drops every
@@ -11,6 +12,7 @@
 //
 // Main thread only.
 
+import AppKit
 import Darwin
 import Foundation
 import iMirrorCore
@@ -20,11 +22,20 @@ final class ChainManager {
     private let workDir: URL
     private let tunnel: TunnelSupervisor?
     private let registry = DeviceRegistryWriter()
+    private let usbWatcher = USBDeviceWatcher()
+    private lazy var requests = RestartRequestWatcher(
+        dir: registry.url.deletingLastPathComponent().appendingPathComponent("requests", isDirectory: true))
+    private var requestGate = RestartRequestGate()
+    private let sleepAssertion = SleepAssertion()
+    private var powerTimer: Timer?
 
     /// Attached phones with a chain, by slot.
     private(set) var controllers: [DeviceController] = []
     /// Attached phones that could NOT get a chain, and why (a port in use…).
-    private(set) var problems: [String: String] = [:]
+    private var slotProblems: [String: RegistryProblem] = [:]
+    var problems: [String: String] { slotProblems.mapValues(\.message) }
+    /// Is the go-ios binary (inside the app bundle) still on disk?
+    private var bundleWatch = AppBundleWatch()
     private(set) var running = false
     /// UDIDs the shared tunnel had a route to at the last poll.
     private(set) var tunnelUDIDs: Set<String> = []
@@ -33,6 +44,9 @@ final class ChainManager {
     private var missingPolls: [String: Int] = [:]
     private var pollTimer: Timer?
     private var polling = false
+    /// Last details seen per UDID, for polls where only plain `list` works.
+    private var knownDevices: [String: AttachedDevice] = [:]
+    private var listingMode = ""
     private var lastTunnelRestart: TimeInterval?
     private var writeScheduled = false
 
@@ -46,8 +60,20 @@ final class ChainManager {
     var onControllerChange: ((DeviceController) -> Void)?
     var onControllerHealth: ((DeviceController, DeviceController.Health, DeviceController.Health) -> Void)?
     var onControllerStatus: ((DeviceController, String) -> Void)?
+    /// A keyboard request file arrived (KeyboardControl acts on it).
+    var onKeyboardRequest: ((KeyboardRequestFile.Read) -> Void)?
     /// Automation can't start (another iMirror owns the phones).
     var onBlocked: ((String) -> Void)?
+    /// Auto-unlock's hooks (AutoUnlock.swift); see DeviceController.
+    var onLockReading: ((DeviceController, LockReading, TimeInterval) -> Void)?
+    var unlockCause: (String) -> String = { _ in "other" }
+    var autoUnlockState: (String) -> String? = { _ in nil }
+    /// Could auto-unlock still type for this locked phone? (PowerPolicy)
+    var autoUnlockMayAct: (String) -> Bool = { _ in false }
+    /// The app's go-ios binary vanished (its path). Called once per run.
+    var onAppBundleMissing: ((String) -> Void)?
+    /// A phone's alias changed; its passcode key changed with it.
+    var onAliasChanged: ((_ udid: String, _ alias: String) -> Void)?
 
     private static let slotsKey = "imirror.deviceSlots"
 
@@ -65,6 +91,39 @@ final class ChainManager {
         } else {
             table = SlotTable()
         }
+        // Tunnel starts reset every phone's USB; those resets are ours.
+        tunnel?.onSpawn = { [weak self] in
+            DispatchQueue.main.async { self?.controllers.forEach { $0.noteOwnUSBChange() } }
+        }
+        watchPower()
+    }
+
+    /// Sleep marks every phone mac_asleep; wake restarts every chain at
+    /// once, since sleep dropped their USB.
+    private func watchPower() {
+        let nc = NSWorkspace.shared.notificationCenter
+        nc.addObserver(forName: NSWorkspace.willSleepNotification, object: nil, queue: .main) { [weak self] _ in
+            guard let self else { return }
+            self.controllers.forEach { $0.macWillSleep() }
+            // Write now: the Mac may sleep within 0.25 s.
+            if self.running, self.canSelfManage { self.registry.write(self.snapshot()) }
+        }
+        nc.addObserver(forName: NSWorkspace.didWakeNotification, object: nil, queue: .main) { [weak self] _ in
+            self?.controllers.forEach { $0.macDidWake() }
+            self?.updateSleepAssertion()
+        }
+    }
+
+    /// Hold the Mac awake only while a client drives a phone or one is
+    /// recovering (iMirrorCore/PowerPolicy.swift).
+    private func updateSleepAssertion() {
+        let now = ProcessInfo.processInfo.systemUptime
+        let lastTraffic = controllers.compactMap { $0.sampleTraffic(now: now) }.max()
+        let recovering = controllers.contains {
+            SleepPolicy.isRecovering($0.reason, gaveUp: $0.ladder.hardStopped, lockMayClear: autoUnlockMayAct($0.udid))
+        }
+        sleepAssertion.set(SleepPolicy.keepAwake(automationOn: running, lastTrafficAt: lastTraffic,
+                                                 recovering: recovering, now: now))
     }
 
     /// True if the go-ios binary was found, so the app runs WDA itself. If
@@ -102,6 +161,11 @@ final class ChainManager {
             DispatchQueue.main.async {
                 guard let self, self.running else { return }
                 self.tunnel?.start()
+                self.watchUSB()
+                self.watchRequests()
+                let power = Timer(timeInterval: 15, repeats: true) { [weak self] _ in self?.updateSleepAssertion() }
+                RunLoop.main.add(power, forMode: .common)
+                self.powerTimer = power
                 self.poll()
                 let t = Timer(timeInterval: 3, repeats: true) { [weak self] _ in self?.poll() }
                 RunLoop.main.add(t, forMode: .common)
@@ -116,9 +180,14 @@ final class ChainManager {
         running = false
         pollTimer?.invalidate()
         pollTimer = nil
+        usbWatcher.stop()
+        requests.stop()
+        powerTimer?.invalidate()
+        powerTimer = nil
+        sleepAssertion.set(false)
         for c in controllers { c.stop() }
         controllers = []
-        problems = [:]
+        slotProblems = [:]
         missingPolls = [:]
         tunnel?.stop()
         registry.remove()
@@ -129,31 +198,79 @@ final class ChainManager {
 
     private func poll() {
         guard running, !polling, let bin, let tunnel else { return }
+        guard bundleStillThere(bin) else { return }
         polling = true
         let workDir = self.workDir
+        let known = self.knownDevices
         DispatchQueue.global(qos: .utility).async { [weak self] in
-            let listed = GoIOS.run(bin, GoIOS.listArgs, workDir: workDir)
-            let attached = GoIOSParsing.attachedDevices(fromListDetails: listed.out)
+            let listing = Self.list(bin: bin, workDir: workDir, known: known)
             let tunneled = tunnel.tunneledUDIDs()
             DispatchQueue.main.async {
                 guard let self else { return }
                 self.polling = false
-                guard self.running else { return }
+                guard self.running, !self.bundleWatch.missing else { return }
+                // A lost or regained route changes a phone's reason.
+                if tunneled != self.tunnelUDIDs { self.scheduleWrite() }
                 self.tunnelUDIDs = tunneled
-                // A failed `ios list` says nothing about what's attached: never
-                // tear a phone down on it.
-                if listed.status == 0 { self.reconcile(attached.filter(\.isUSB)) }
+                self.noteListingMode(listing)
+                guard let result = Discovery.merge(listing, usbSerials: self.usbWatcher.presentSerials,
+                                                   known: self.knownDevices) else { return }
+                for d in result.learned { self.knownDevices[d.udid] = d }
+                self.reconcile(result.usb, held: Set(result.held))
             }
         }
     }
 
-    private func reconcile(_ usb: [AttachedDevice]) {
+    /// Every phone's details, best first: `list --details`, else plain
+    /// `list` plus `ios info` for unknown phones. Every call has a time
+    /// limit. Blocking: call off the main thread.
+    private static func list(bin: URL, workDir: URL, known: [String: AttachedDevice]) -> DiscoveryListing {
+        let details = GoIOS.runBounded(bin, GoIOS.listArgs, workDir: workDir,
+                                       timeout: DiscoveryTiming.detailsTimeoutSec)
+        if details.status == 0 {
+            return .details(GoIOSParsing.attachedDevices(fromListDetails: details.out))
+        }
+        let plain = GoIOS.runBounded(bin, GoIOS.plainListArgs, workDir: workDir,
+                                     timeout: DiscoveryTiming.listTimeoutSec)
+        guard plain.status == 0 else { return .failed }
+        let udids = GoIOSParsing.attachedDevices(fromListDetails: plain.out).map(\.udid)
+        let ask = Discovery.needsInfo(udids, known: known)
+        var info: [String: DeviceProduct] = [:]
+        let lock = NSLock()
+        // In parallel: a hung phone costs one timeout total.
+        DispatchQueue.concurrentPerform(iterations: ask.count) { i in
+            let r = GoIOS.runBounded(bin, GoIOS.infoArgs(udid: ask[i]), workDir: workDir,
+                                     timeout: DiscoveryTiming.infoTimeoutSec)
+            guard r.status == 0, let p = GoIOSParsing.deviceProduct(fromInfo: r.out) else { return }
+            lock.lock(); info[ask[i]] = p; lock.unlock()
+        }
+        return .udidsOnly(udids, info: info)
+    }
+
+    /// Log only when the way we list phones changes, not every 3 s.
+    private func noteListingMode(_ listing: DiscoveryListing) {
+        let mode: String
+        switch listing {
+        case .details: mode = "details"
+        case .udidsOnly(let udids, let info):
+            let unread = udids.filter { info[$0] == nil && knownDevices[$0] == nil }
+            mode = "fallback (no details for: \(unread.joined(separator: ", ")))"
+        case .failed: mode = "failed"
+        }
+        guard mode != listingMode else { return }
+        listingMode = mode
+        NSLog("iMirror: device listing is now \(mode)")
+    }
+
+    private func reconcile(_ usb: [AttachedDevice], held: Set<String> = []) {
         var changed = false
         let present = Dictionary(usb.map { ($0.udid, $0) }, uniquingKeysWith: { a, _ in a })
 
         // Gone phones: two misses in a row, so one flaky poll doesn't bounce a chain.
-        for c in controllers where present[c.udid] == nil {
+        // A held phone was seen, so it is not missing.
+        for c in controllers where present[c.udid] == nil && !held.contains(c.udid) {
             missingPolls[c.udid, default: 0] += 1
+            if missingPolls[c.udid] == 1 { c.usbDetached() }   // the fallback signal
             if missingPolls[c.udid, default: 0] >= 2 {
                 NSLog("iMirror: \(c.alias) (\(c.udid)) detached — stopping its chain")
                 c.stop()
@@ -166,9 +283,13 @@ final class ChainManager {
         // their slots in a repeatable order.
         for device in usb where present[device.udid] == device {
             let udid = device.udid
+            let missedAPoll = missingPolls[udid] != nil
             missingPolls[udid] = nil
             if let c = controller(udid) {
                 c.attached = device                   // e.g. an iOS update
+                // Gone for one poll, then back: a USB reset (the 16e does
+                // this under load), which may have killed the forwards.
+                if missedAPoll { c.usbReattached() }
                 continue
             }
             // New (or still-blocked) phone: try to give it its slot.
@@ -178,7 +299,7 @@ final class ChainManager {
             saveTable()
             switch result {
             case .assigned(let slot, let alias, _):
-                problems[udid] = nil
+                slotProblems[udid] = nil
                 guard let bin else { continue }
                 let chain = DeviceChain(udid: udid, slot: slot, bin: bin, workDir: workDir)
                 if let tunnel {
@@ -187,20 +308,48 @@ final class ChainManager {
                 NSLog("iMirror: \(alias) (\(udid)) attached — slot \(slot.index), WDA on :\(slot.relayPort)")
                 add(makeController(device, slot: slot, alias: alias, chain: chain))
                 changed = true
-            case .conflict(let slot, let port):
-                let why = "port \(port) (its slot \(slot.index)) is held by another process"
-                if problems[udid] != why { problems[udid] = why; changed = true }
-            case .full:
-                let why = "all \(PortSlot.maxSlots) port slots belong to attached phones"
-                if problems[udid] != why { problems[udid] = why; changed = true }
+            case .conflict, .full:
+                let problem = RegistryProblem.slot(result, udid: udid)
+                if slotProblems[udid] != problem { slotProblems[udid] = problem; changed = true }
             }
         }
-        let stale = problems.keys.filter { present[$0] == nil }
-        if !stale.isEmpty { stale.forEach { problems[$0] = nil }; changed = true }
+        let stale = slotProblems.keys.filter { present[$0] == nil && !held.contains($0) }
+        if !stale.isEmpty { stale.forEach { slotProblems[$0] = nil }; changed = true }
         if changed {
             onDevicesChanged?()
             scheduleWrite()
         }
+    }
+
+    /// IOKit's view of resets: faster than the poll, which stays as a fallback.
+    private func watchUSB() {
+        usbWatcher.onDetached = { [weak self] serial in self?.usbController(serial)?.usbDetached() }
+        usbWatcher.onAttached = { [weak self] serial in self?.usbController(serial)?.usbReattached() }
+        usbWatcher.start()
+    }
+
+    /// Clients' restart requests (README, "Files other tools read").
+    private func watchRequests() {
+        requests.onRequest = { [weak self] r in self?.handle(r) }
+        requests.onKeyboard = { [weak self] r in self?.onKeyboardRequest?(r) }
+        requests.start()
+    }
+
+    private func handle(_ r: RestartRequest) {
+        let c = controller(r.udid)
+        let outcome = requestGate.decide(r, attached: c?.chain != nil, wallNow: Date(),
+                                         uptime: ProcessInfo.processInfo.systemUptime)
+        NSLog("iMirror: restart request for \(r.udid) from \(r.requestedBy): \(outcome.rawValue)")
+        if let c {
+            c.restartRequested(outcome)
+        } else {
+            EventLog.shared.write(DeviceEvent(at: Date(), udid: r.udid, alias: "", event: .request,
+                                              detail: outcome.rawValue))
+        }
+    }
+
+    private func usbController(_ serial: String) -> DeviceController? {
+        controllers.first { usbSerial(serial, matchesUDID: $0.udid) }
     }
 
     private func makeController(_ device: AttachedDevice, slot: PortSlot, alias: String,
@@ -210,7 +359,18 @@ final class ChainManager {
             self?.controllers.contains { $0 !== c && $0.health == .connected } ?? false
         }
         c.tunnelHasDevice = { [weak self] in self?.tunnelUDIDs.contains(device.udid) ?? false }
-        c.requestTunnelRestart = { [weak self] in self?.requestTunnelRestart(coalesce: true) }
+        c.requestTunnelRestart = { [weak self, weak c] cause in
+            self?.requestTunnelRestart(coalesce: true, by: c, cause: cause) ?? true
+        }
+        if let bin, chain != nil {
+            c.probeLock = LockProbe.make(bin: bin, udid: device.udid, workDir: workDir)
+        }
+        c.onLockReading = { [weak self, weak c] r, at in
+            guard let self, let c else { return }
+            self.onLockReading?(c, r, at)
+        }
+        c.unlockCause = { [weak self] in self?.unlockCause(device.udid) ?? "other" }
+        c.autoUnlockState = { [weak self] in self?.autoUnlockState(device.udid) }
         c.onChange = { [weak self, weak c] in
             guard let self, let c else { return }
             self.scheduleWrite()
@@ -239,16 +399,26 @@ final class ChainManager {
     /// Restart the tunnel and, with it, every phone's chain. From a phone's
     /// ladder this is rate-limited: two phones reaching their grace together
     /// would otherwise knock each other's fresh chains down again. A request
-    /// inside the cooldown restarts only that phone's chain.
-    func requestTunnelRestart(coalesce: Bool) {
-        guard running, let tunnel else { return }
+    /// inside the cooldown restarts nothing and returns false, so the caller
+    /// restarts its own chain.
+    /// `by` is the phone whose ladder asked (nil: the user's menu item);
+    /// events.jsonl names it, since every other phone pays for it.
+    @discardableResult
+    func requestTunnelRestart(coalesce: Bool, by requester: DeviceController? = nil,
+                              cause: String = "user") -> Bool {
+        guard running, let tunnel else { return true }
         let now = ProcessInfo.processInfo.systemUptime
         if coalesce, !shouldRestartTunnel(lastAt: lastTunnelRestart, now: now) {
             NSLog("iMirror: tunnel restarted \(Int(now - (lastTunnelRestart ?? now)))s ago — not again yet")
-            return
+            return false
         }
         lastTunnelRestart = now
-        NSLog("iMirror: restarting the USB tunnel and every phone's chain")
+        let others = controllers.filter { $0 !== requester && $0.health == .connected }.map(\.alias)
+        EventLog.shared.write(DeviceEvent(
+            at: Date(), udid: requester?.udid ?? "", alias: requester?.alias ?? "", event: .tunnelRestart,
+            reason: cause,
+            detail: "restarts every chain; healthy phones: \(others.isEmpty ? "none" : others.joined(separator: ", "))"))
+        NSLog("iMirror: restarting the USB tunnel and every phone's chain (\(cause), \(requester?.alias ?? "user"))")
         for c in controllers { c.chain?.stopChildren() }
         tunnel.restart { [weak self] in
             guard let self, self.running else { return }
@@ -257,7 +427,11 @@ final class ChainManager {
                 c.chain?.start()
             }
         }
+        return true
     }
+
+    /// Something devices.json shows changed outside a controller.
+    func refreshDeviceFile() { scheduleWrite() }
 
     // MARK: Aliases
 
@@ -266,9 +440,11 @@ final class ChainManager {
     func rename(_ c: DeviceController, to alias: String) -> AliasProblem? {
         if let problem = validateAlias(alias, forUDID: c.udid, in: table) { return problem }
         if reservedAliases().contains(alias.lowercased()) { return .taken(byUDID: "simulator") }
+        let changed = table.entries[c.udid]?.alias != alias
         table.entries[c.udid]?.alias = alias
         saveTable()
         c.alias = alias
+        if changed { onAliasChanged?(c.udid, alias) }
         onDevicesChanged?()
         scheduleWrite()
         return nil
@@ -298,18 +474,37 @@ final class ChainManager {
     }
 
     private func snapshot() -> DeviceRegistryFile {
-        var devices = controllers.map { c in
-            RegisteredDevice(udid: c.udid, alias: c.alias, kind: .device,
-                             productType: c.attached.productType, iosVersion: c.attached.productVersion,
-                             connection: c.attached.connection, slot: c.slot.index,
-                             wdaURL: c.slot.relayURL, mjpegPort: Int(c.slot.mjpegPort),
-                             state: c.registryState, detail: c.detail)
-        }
+        let now = Date()
+        var devices = controllers.map { $0.registryEntry(now: now) }
         devices.append(contentsOf: simulatorEntries)
         let version = Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "dev"
-        return DeviceRegistryFile(ownerPid: getpid(), appVersion: version,
+        return DeviceRegistryFile(ownerPid: getpid(), ownerUniqueID: ProcessIdentity.ownUniqueID,
+                                  appVersion: version,
                                   updatedAt: DeviceRegistryCodec.timestamp(Date()),
-                                  goios: bin?.path, devices: devices)
+                                  goios: bin?.path, devices: devices,
+                                  problems: RegistryProblem.list(bundle: bundleProblem, phones: slotProblems))
+    }
+
+    private var bundleProblem: RegistryProblem? {
+        guard bundleWatch.missing, let bin else { return nil }
+        return .appBundleMissing(goios: bin.path)
+    }
+
+    /// One stat per poll. A deleted bundle (a worktree removed, a rebuild
+    /// elsewhere) takes go-ios with it, and every spawn would then fail
+    /// silently. Say so in devices.json and once to the user, and spawn
+    /// nothing until it is back.
+    private func bundleStillThere(_ bin: URL) -> Bool {
+        let wasMissing = bundleWatch.missing
+        if bundleWatch.check(binaryExists: FileManager.default.isExecutableFile(atPath: bin.path)) {
+            onAppBundleMissing?(bin.path)
+        }
+        if bundleWatch.missing != wasMissing {
+            NSLog("iMirror: go-ios at \(bin.path) is \(bundleWatch.missing ? "gone" : "back")")
+            onDevicesChanged?()
+            scheduleWrite()
+        }
+        return !bundleWatch.missing
     }
 
     // MARK: Ports

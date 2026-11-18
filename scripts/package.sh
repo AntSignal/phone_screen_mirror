@@ -5,6 +5,8 @@
 # - Signs with a Developer ID Application identity if one is installed (hardened
 #   runtime + camera entitlement, nested go-ios signed too); otherwise falls back
 #   to ad-hoc signing (works locally, will warn under Gatekeeper elsewhere).
+#   IMIRROR_SIGN_IDENTITY overrides both: a development identity, so this
+#   Mac's Bluetooth and Documents grants survive a rebuild. Not notarizable.
 # - Builds a DMG via hdiutil.
 # - Notarizes + staples if a notarytool keychain profile is provided via
 #   NOTARY_PROFILE; otherwise prints the exact commands to run.
@@ -13,21 +15,40 @@
 #   ./scripts/package.sh                 # auto-detect signing identity
 #   NOTARY_PROFILE=imirror ./scripts/package.sh   # also notarize + staple
 #   WITH_WDA=build/WebDriverAgent.ipa ./scripts/package.sh
+#   ./scripts/package.sh --restart       # build/iMirror.app is running: quit it,
+#                                        # rebuild, relaunch it (see run.sh)
+#   IMIRROR_SIGN_IDENTITY="Apple Development: …" ./scripts/package.sh
 #
 # One-time notary profile setup (per machine):
 #   xcrun notarytool store-credentials imirror \
 #       --apple-id you@example.com --team-id HOMEKARETEAMID --password <app-specific-pw>
 set -euo pipefail
-ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+# -P: running apps report physical paths; compare those.
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd -P)"
 cd "$ROOT"
+source "$ROOT/scripts/lib/imirror-procs.sh"
+
+RESTART=0
+for arg in "$@"; do
+    case "$arg" in
+        --restart) RESTART=1 ;;
+        -h|--help) echo "usage: $0 [--restart]"; exit 0 ;;
+        *) echo "usage: $0 [--restart]" >&2; exit 2 ;;
+    esac
+done
 
 APP="$ROOT/build/iMirror.app"
 DMG="$ROOT/build/iMirror.dmg"
 ENT="$ROOT/Resources/iMirror.entitlements"
 
+# Like run.sh: never delete the bundle under a running app.
+imirror_guard_bundle "$APP" "$RESTART" || exit 1
+
 echo "==> swift build (release, universal2: arm64 + x86_64)"
 swift build -c release --arch arm64 --arch x86_64
 BIN="$(swift build -c release --arch arm64 --arch x86_64 --show-bin-path)/iMirror"
+
+imirror_stop_bundle "$APP" "$RESTART" || exit 1
 
 echo "==> assembling app"
 rm -rf "$APP"; mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
@@ -62,7 +83,7 @@ mkdir -p "$APP/Contents/Resources/mcp-server"
 # Every server module, not just imirror_mcp.py: it imports wda_bringup, and a
 # bundle missing that file fails at import. Tests stay out of the app.
 for py in "$ROOT"/mcp-server/*.py; do
-    case "$(basename "$py")" in test_*) continue ;; esac
+    case "$(basename "$py")" in test_*|conftest.py) continue ;; esac
     cp "$py" "$APP/Contents/Resources/mcp-server/" 2>/dev/null || true
 done
 [[ -f "$ROOT/mcp-server/requirements.txt" ]] && \
@@ -92,6 +113,8 @@ if [[ -d "$ROOT/tools/WebDriverAgent" ]]; then
     # staged copy). rsync ships with macOS.
     rsync -a --exclude='.git' "$ROOT/tools/WebDriverAgent/" "$APP/Contents/Resources/tools/WebDriverAgent/"
     cp "$ROOT/scripts/sim-wda-up.sh"      "$APP/Contents/Resources/scripts/"
+    mkdir -p "$APP/Contents/Resources/scripts/lib"
+    cp "$ROOT/scripts/lib/wda-patches.sh" "$APP/Contents/Resources/scripts/lib/"
     cp "$ROOT/scripts/make_ios_icon.swift" "$APP/Contents/Resources/scripts/"
 fi
 
@@ -103,7 +126,13 @@ IDENTITY="$(security find-identity -v -p codesigning 2>/dev/null \
 IDENTITY_NAME="$(security find-identity -v -p codesigning 2>/dev/null \
             | grep "Developer ID Application" | head -1 | grep -oE '"[^"]+"' | tr -d '"' || true)"
 
-if [[ -n "$IDENTITY" ]]; then
+if [[ -n "${IMIRROR_SIGN_IDENTITY:-}" ]]; then
+    echo "==> signing with: $IMIRROR_SIGN_IDENTITY (development, this Mac only)"
+    [[ -f "$APP/Contents/Resources/ios" ]] && \
+        codesign --force --sign "$IMIRROR_SIGN_IDENTITY" --timestamp=none "$APP/Contents/Resources/ios"
+    codesign --force --sign "$IMIRROR_SIGN_IDENTITY" --timestamp=none --entitlements "$ENT" "$APP"
+    SIGNED=dev
+elif [[ -n "$IDENTITY" ]]; then
     echo "==> signing with: $IDENTITY_NAME [$IDENTITY] (hardened runtime)"
     # Sign nested helper first, then the app (deep is discouraged; sign inside-out).
     [[ -f "$APP/Contents/Resources/ios" ]] && \
@@ -117,6 +146,12 @@ else
     [[ -f "$APP/Contents/Resources/ios" ]] && codesign --force --sign - "$APP/Contents/Resources/ios"
     codesign --force --sign - --entitlements "$ENT" "$APP"
     SIGNED=0
+fi
+
+# Relaunch what --restart quit, before the slow DMG steps.
+if [[ -n "$IMIRROR_STOPPED_PIDS" ]]; then
+    echo "==> relaunching"
+    imirror_launch_bundle "$APP" || exit 1
 fi
 
 echo "==> building DMG"
@@ -144,6 +179,8 @@ if [[ "$SIGNED" == 1 ]]; then
 (see header of this script for one-time store-credentials setup)
 EOF
     fi
+elif [[ "$SIGNED" == dev ]]; then
+    echo "==> development-signed DMG built (for this Mac; not notarizable)."
 else
     echo "==> ad-hoc DMG built (opens locally; other Macs will see a Gatekeeper warning)."
     echo "    For distribution, install a 'Developer ID Application' cert and re-run."

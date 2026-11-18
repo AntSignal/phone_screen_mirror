@@ -14,6 +14,7 @@
 import AppKit
 import iMirrorCore
 import os
+import UserNotifications
 
 /// Unified-logging channel. NSLog output was not reaching `log show`, which made
 /// field reports (black mirror on a user's Mac) undiagnosable without a debugger.
@@ -290,6 +291,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSToolbarDelegate {
     // it's on screen, so an agent driving phone2 doesn't depend on this window.
     // The window renders the selected phone; `wda`/`health` below are its.
     private let manager = ChainManager()
+    /// The Bluetooth keyboard: request files and Settings drive it.
+    /// AppKit calls this class on the main thread only, hence assumeIsolated.
+    private lazy var keyboardControl: KeyboardControl = MainActor.assumeIsolated {
+        KeyboardControl(dir: EventLog.shared.url.deletingLastPathComponent())
+    }
+    /// Types a locked phone's passcode by itself, for phones a person opted in.
+    private lazy var autoUnlock: AutoUnlockDriver = MainActor.assumeIsolated {
+        AutoUnlockDriver(keyboard: keyboardControl, notify: { title, body in AppDelegate.notify(title, body) })
+    }
     private var selectedUDID: String? = UserDefaults.standard.string(forKey: "imirror.selectedDevice")
     private var selected: DeviceController? { manager.controller(selectedUDID) }
     private var wda: WDAClient? { selected?.wda }
@@ -297,19 +307,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSToolbarDelegate {
     private var controlEnabled = false
     private var automationEnabled = false
 
-    // MJPEG partial-wedge watchdog (see nextMjpegRecoveryAction in
-    // iMirrorCore): WDA's /status can stay healthy while the MJPEG stream has
-    // silently died, so `health == .connected` alone isn't proof frames are
-    // still arriving.
+    // MJPEG watchdog (see nextMjpegRecoveryAction in iMirrorCore): WDA's
+    // /status can stay healthy while the MJPEG stream has silently died, so
+    // `health == .connected` alone isn't proof frames are still arriving.
     private var mjpegLastFrameAt: TimeInterval?
-    private var mjpegBounced = false
+    /// When the forward was last bounced for this stall; nil after a frame.
+    private var mjpegBouncedAt: TimeInterval?
     private let mjpegNoFrameThresholdSec: TimeInterval = 20
-    /// Counts `.escalate` outcomes for the current connected session, reset
-    /// ONLY when a real frame arrives (not on every `setHealth(.connected)`,
-    /// which fires on every probe tick once connected). Past 2, a chain
-    /// restart clearly isn't bringing the stream back — stop looping and
-    /// surface a terminal state instead of restarting forever.
-    private var mjpegEscalationCount = 0
 
     // MARK: Lifecycle
 
@@ -319,6 +323,34 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSToolbarDelegate {
         // The phones' controllers report here; only the selected phone drives
         // the window, but any phone's change refreshes the picker and Settings.
         manager.onDevicesChanged = { [weak self] in self?.devicesChanged() }
+        MainActor.assumeIsolated {
+            keyboardControl.aliasOf = { [weak self] udid in self?.manager.controller(udid)?.alias }
+            keyboardControl.onChange = { [weak self] in self?.rebuildDeviceRows() }
+        }
+        manager.onKeyboardRequest = { [weak self] r in
+            MainActor.assumeIsolated { self?.keyboardControl.handle(r) }
+        }
+        MainActor.assumeIsolated {
+            autoUnlock.onChange = { [weak self] in
+                self?.manager.refreshDeviceFile()
+                self?.rebuildDeviceRows()
+            }
+        }
+        manager.onLockReading = { [weak self] c, r, at in
+            MainActor.assumeIsolated { self?.autoUnlock.reading(c, r, startedAt: at) }
+        }
+        manager.unlockCause = { [weak self] udid in
+            MainActor.assumeIsolated { self?.autoUnlock.unlockCause(udid) ?? "other" }
+        }
+        manager.autoUnlockState = { [weak self] udid in
+            MainActor.assumeIsolated { self?.autoUnlock.registryState(udid) }
+        }
+        manager.autoUnlockMayAct = { [weak self] udid in
+            MainActor.assumeIsolated { self?.autoUnlock.mayStillAct(udid) ?? false }
+        }
+        manager.onAliasChanged = { [weak self] udid, alias in
+            MainActor.assumeIsolated { self?.autoUnlock.aliasChanged(udid, to: alias) }
+        }
         manager.onControllerChange = { [weak self] c in
             guard let self else { return }
             self.refreshDevicePicker()
@@ -337,6 +369,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSToolbarDelegate {
             self.setStatus(text)
         }
         manager.onBlocked = { [weak self] text in self?.setStatus(text) }
+        manager.onAppBundleMissing = { [weak self] path in
+            AppDelegate.notify("iMirror's app bundle was deleted", "Run scripts/run.sh --restart. (\(path) is gone.)")
+            self?.setStatus("iMirror's app bundle was deleted — run scripts/run.sh --restart.")
+        }
         updateHealthDot()        // grey — automation off
         // Automation now drives the entire mirror (WDA-MJPEG frames replace camera
         // capture), so it always starts on launch instead of waiting for an opt-in.
@@ -883,51 +919,34 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSToolbarDelegate {
     /// user explicitly asking the selected phone to retry.
     @objc private func forceProbe() {
         guard let c = selected else { return }
-        if c.ladder.hardStopped {
-            // Give the user's retry its own two-strike video allowance.
-            mjpegEscalationCount = 0
-            mjpegBounced = false
-        }
         c.userRetry()
     }
 
     private func resetMjpegWatchdog() {
         mjpegLastFrameAt = nil
-        mjpegBounced = false
-        mjpegEscalationCount = 0
+        mjpegBouncedAt = nil
     }
 
-    /// MJPEG partial-wedge watchdog, for the phone on screen (only its stream is
-    /// open): WDA's HTTP session can be healthy while the video underneath has
-    /// silently died. Cheapest fix first (bounce that phone's MJPEG forward);
-    /// escalate to restarting that phone's chain only if frames don't return.
+    /// MJPEG watchdog, for the phone on screen (only its stream is open):
+    /// WDA's HTTP side can be healthy while the video underneath has died.
+    /// It only bounces that phone's MJPEG forward, and only while /status
+    /// answers; it never restarts a WDA that agents may be driving.
     private func checkMjpegWatchdog() {
         guard let c = selected, health == .connected, mjpeg != nil, let lastFrame = mjpegLastFrameAt else { return }
-        // With an external WDA there's no chain to bounce; once hard-stopped,
-        // this watchdog goes quiet until the user retries.
-        guard c.chain != nil, !c.ladder.hardStopped else { return }
-        let noFrameFor = ProcessInfo.processInfo.systemUptime - lastFrame
-        switch nextMjpegRecoveryAction(noFrameForSec: noFrameFor, alreadyBounced: mjpegBounced, thresholdSec: mjpegNoFrameThresholdSec) {
+        // With an external WDA there's no chain to bounce.
+        guard c.chain != nil else { return }
+        let now = ProcessInfo.processInfo.systemUptime
+        let noFrameFor = now - lastFrame
+        switch nextMjpegRecoveryAction(noFrameForSec: noFrameFor,
+                                       sinceBounceSec: mjpegBouncedAt.map { now - $0 },
+                                       statusAnswers: c.statusAnswers,
+                                       thresholdSec: mjpegNoFrameThresholdSec) {
         case .wait:
             break
         case .bounceForward:
-            mjpegBounced = true
+            mjpegBouncedAt = now
             NSLog("iMirror: no MJPEG frames from \(c.alias) for \(Int(noFrameFor))s — bouncing its MJPEG forward")
             c.bounceMJPEGForward()
-        case .escalate:
-            mjpegEscalationCount += 1
-            if mjpegEscalationCount >= 2 {
-                // Two restarts with no real frame in between: restarting isn't
-                // fixing this. Stop looping and surface a terminal state.
-                NSLog("iMirror: MJPEG from \(c.alias) still stalled after \(mjpegEscalationCount) restarts — giving up")
-                c.hardStopForStalledVideo()
-                return
-            }
-            // Restart the no-frame clock so this doesn't fire again on the next
-            // tick before health actually flips to .down.
-            mjpegLastFrameAt = ProcessInfo.processInfo.systemUptime
-            mjpegBounced = false
-            c.restartForStalledVideo()
         }
     }
 
@@ -1013,11 +1032,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSToolbarDelegate {
             DispatchQueue.main.async {
                 guard let self, self.selectedUDID == udid else { return }
                 self.mjpegLastFrameAt = ProcessInfo.processInfo.systemUptime
-                // A real frame arrived — earlier escalations no longer count
-                // toward the two-strike give-up.
-                self.mjpegEscalationCount = 0
+                self.mjpegBouncedAt = nil       // this stall is over
                 self.lastFrame = cg
+                let previous = self.previewView.lastFrameSize
                 self.previewView.setFrame(cg)
+                // Rotated: taps must not use the old shape's size.
+                if videoShapeChanged(previous: previous, current: CGSize(width: cg.width, height: cg.height)) {
+                    c.wda.refreshDisplayGeometry()
+                }
                 if !self.mirroring {
                     self.mirroring = true
                     self.setEmptyState(hidden: true)
@@ -1039,7 +1061,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSToolbarDelegate {
         // Seed the no-frame clock at start so the watchdog measures from
         // "stream just opened," not from an already-ancient nil baseline.
         mjpegLastFrameAt = ProcessInfo.processInfo.systemUptime
-        mjpegBounced = false
+        mjpegBouncedAt = nil
         client.start()
     }
 
@@ -1238,6 +1260,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSToolbarDelegate {
         tunnelButton.controlSize = .small
         tunnelButton.toolTip = "Every phone rides one go-ios tunnel; this restarts it and every phone's WebDriverAgent."
         stack.addArrangedSubview(tunnelButton)
+
+        // Where "Type passcode now" reads each phone's passcode.
+        stack.addArrangedSubview(smallLabel("Passcode file (e.g. PHONE2_PASSCODE=…, read on a click or by auto-unlock):"))
+        let fileField = NSTextField(string: UserDefaults.standard.string(forKey: PasscodeFile.defaultsKey) ?? "")
+        fileField.placeholderString = PasscodeFile.defaultPath
+        fileField.font = .systemFont(ofSize: 11)
+        fileField.target = self
+        fileField.action = #selector(passcodeFileEdited(_:))
+        fileField.widthAnchor.constraint(equalToConstant: 268).isActive = true
+        stack.addArrangedSubview(fileField)
         rebuildDeviceRows()
 
         // MCP server section — one-click register with Claude Code / Claude Desktop.
@@ -1385,10 +1417,129 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSToolbarDelegate {
             row.orientation = .vertical
             row.alignment = .leading
             row.spacing = 2
+            if let kb = keyboardRow(c.udid) { row.addArrangedSubview(kb) }
             devicesStack.addArrangedSubview(row)
         }
         for (udid, why) in manager.problems.sorted(by: { $0.key < $1.key }) {
             devicesStack.addArrangedSubview(smallLabel("\(shortUDID(udid)): not started — \(why)."))
+        }
+        devicesStack.addArrangedSubview(smallLabel(dongleLine()))
+    }
+
+    /// Whether the USB keyboard dongle answers. Without it, pairing falls
+    /// back to this Mac's Bluetooth, which phones on its iCloud hide.
+    private func dongleLine() -> String {
+        MainActor.assumeIsolated {
+            switch keyboardControl.dongle.state {
+            case .connected: return "Keyboard: dongle connected"
+            case .notFound: return "Keyboard: dongle not found"
+            case .unknown: return "Keyboard: looking for the dongle…"
+            }
+        }
+    }
+
+    /// "Keyboard: paired" and the passcode button, for a paired phone only.
+    private func keyboardRow(_ udid: String) -> NSView? {
+        MainActor.assumeIsolated {
+            guard let pair = keyboardControl.pairs().pair(for: udid) else { return nil }
+            let type = NSButton(title: "Type passcode now", target: self, action: #selector(typePasscodeClicked(_:)))
+            type.bezelStyle = .rounded
+            type.controlSize = .small
+            type.identifier = NSUserInterfaceItemIdentifier(udid)
+            type.isEnabled = !keyboardControl.busy
+            type.toolTip = "Wakes the phone and types its passcode over the paired Bluetooth keyboard. "
+                + "Use only while the phone shows a passcode prompt: otherwise the keys go to the focused field."
+            let via = pair.transport == .dongle ? "dongle" : "this Mac"
+            let top = NSStackView(views: [smallLabel("Keyboard: paired (\(via))"), type])
+            top.orientation = .horizontal
+            top.spacing = 6
+            let auto = NSButton(checkboxWithTitle: "Unlock by itself when locked (types the passcode while WDA is down)",
+                                target: self, action: #selector(autoUnlockToggled(_:)))
+            auto.controlSize = .small
+            auto.font = .systemFont(ofSize: 11)
+            auto.identifier = NSUserInterfaceItemIdentifier(udid)
+            auto.state = autoUnlock.record(udid).enabled ? .on : .off
+            let alias = manager.controller(udid)?.alias ?? udid
+            let row = NSStackView(views: [top, auto])
+            if let line = autoUnlock.statusText(udid, alias: alias) { row.addArrangedSubview(smallLabel(line)) }
+            row.orientation = .vertical
+            row.alignment = .leading
+            row.spacing = 2
+            return row
+        }
+    }
+
+    /// The auto-unlock checkbox. On needs a person's click, a confirm and
+    /// a value in the passcode file; off needs nothing.
+    @objc private func autoUnlockToggled(_ sender: NSButton) {
+        guard let udid = sender.identifier?.rawValue else { return }
+        MainActor.assumeIsolated {
+            guard sender.state == .on else {
+                autoUnlock.setEnabled(udid, false, by: .settings)
+                return
+            }
+            sender.state = .off   // stays off unless every check passes
+            guard KeyboardControl.isHumanClick(NSApp.currentEvent?.type) else { return }
+            let alias = manager.controller(udid)?.alias ?? udid
+            let alert = NSAlert()
+            alert.messageText = "Let iMirror unlock \(alias) by itself?"
+            alert.informativeText = "When \(alias) is locked and WebDriverAgent is down, iMirror wakes it, checks it "
+                + "is still locked, and types its passcode from the passcode file over the paired keyboard. "
+                + "It tries once per lock, at most 3 times an hour. A try that leaves the phone locked turns "
+                + "this off again, because a wrong passcode counts toward the phone's lockout."
+            alert.addButton(withTitle: "Turn On")
+            alert.addButton(withTitle: "Cancel")
+            guard alert.runModal() == .alertFirstButtonReturn else { return }
+            if let why = keyboardControl.autoOnPrecheck(udid: udid) {
+                let key = PasscodeLookup.suggestedKey(udid: udid, alias: alias)
+                setStatus(why == .noFile ? "Can't read the passcode file."
+                          : "The passcode file has no usable \(key); auto-unlock stays off.")
+                keyboardControl.log(udid, .failed, why)
+                return
+            }
+            autoUnlock.setEnabled(udid, true, by: .settings)
+            sender.state = .on
+            AppDelegate.askToNotify()
+        }
+    }
+
+    /// A packaged app can post notifications; a bare `swift run` binary
+    /// has no bundle and UNUserNotificationCenter would crash it.
+    private static var canNotify: Bool { Bundle.main.bundleURL.pathExtension == "app" }
+
+    static func askToNotify() {
+        guard canNotify else { return }
+        UNUserNotificationCenter.current().requestAuthorization(options: [.alert, .sound]) { _, _ in }
+    }
+
+    /// Without permission the event and the Settings line still say it.
+    static func notify(_ title: String, _ body: String) {
+        NSLog("iMirror: \(title): \(body)")
+        guard canNotify else { return }
+        let content = UNMutableNotificationContent()
+        content.title = title
+        content.body = body
+        UNUserNotificationCenter.current().add(UNNotificationRequest(identifier: UUID().uuidString,
+                                                                     content: content, trigger: nil))
+    }
+
+    /// The only caller of typePasscodeFromClick: a button's action.
+    @objc private func typePasscodeClicked(_ sender: NSButton) {
+        guard let udid = sender.identifier?.rawValue else { return }
+        let file = PasscodeFile.url(stored: UserDefaults.standard.string(forKey: PasscodeFile.defaultsKey))
+        let line = MainActor.assumeIsolated {
+            keyboardControl.typePasscodeFromClick(udid: udid, event: NSApp.currentEvent, file: file)
+        }
+        setStatus(line)
+        rebuildDeviceRows()
+    }
+
+    @objc private func passcodeFileEdited(_ sender: NSTextField) {
+        let path = sender.stringValue.trimmingCharacters(in: .whitespaces)
+        if path.isEmpty {
+            UserDefaults.standard.removeObject(forKey: PasscodeFile.defaultsKey)
+        } else {
+            UserDefaults.standard.set(path, forKey: PasscodeFile.defaultsKey)
         }
     }
 

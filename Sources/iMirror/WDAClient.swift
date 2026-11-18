@@ -7,7 +7,7 @@
 // 127.0.0.1; the initialiser refuses anything else.
 //
 // Robustness: WDA sessions are fragile (the runner can drop, restart, or expire).
-// `probe()` validates the live session and reports one of three states so the UI
+// `probe()` validates the live session and reports one of four states so the UI
 // can auto-reconnect. Input calls self-invalidate the session on a 404 so the
 // next probe transparently recreates it.
 //
@@ -22,13 +22,17 @@ final class WDAClient {
     /// Result of a health probe.
     enum Health {
         case down          // WDA/relay unreachable
+        case timedOut      // /status gave no answer in time (maybe just busy)
         case needsSession  // WDA is up but we have no valid session — create one
         case alive         // session valid, ready to drive
     }
 
     let base: URL
     private(set) var sessionId: String?
-    private(set) var deviceSize: CGSize?   // logical points (portrait)
+    private(set) var deviceSize: CGSize?   // current orientation's logical points
+    /// Bumped when the picture changes shape (a rotation). A window-size
+    /// reply sent before the bump describes the old shape and is dropped.
+    private var geometryRevision = 0
 
     init(base: URL = URL(string: "http://127.0.0.1:8100")!) {
         precondition(base.host == "127.0.0.1" || base.host == "localhost",
@@ -81,69 +85,95 @@ final class WDAClient {
     private func applyMJPEGSettings(sid: String) {
         send("POST", "/session/\(sid)/appium/settings",
              ["settings": ["mjpegServerFramerate": 30,
+                           // Frames follow the screen's rotation, as touches do.
+                           "mjpegFixOrientation": true,
                            "mjpegServerScreenshotQuality": 60,
                            "mjpegScalingFactor": 100]]) { _, _, _ in }
     }
 
     private func fetchWindowSize(completion: @escaping (Result<CGSize, Error>) -> Void) {
         guard let sid = sessionId else { completion(.failure(WDAError.notConnected)); return }
+        let revision = geometryRevision
         send("GET", "/session/\(sid)/window/size", nil) { [weak self] _, json, error in
+            guard let self, self.isCurrent(revision: revision, sid: sid) else {
+                completion(.failure(WDAError.superseded))
+                return
+            }
             if let error { completion(.failure(error)); return }
             guard let size = WDAParse.windowSize(json) else {
                 completion(.failure(WDAError.badResponse("no window size")))
                 return
             }
-            self?.deviceSize = size
+            self.deviceSize = size
             completion(.success(size))
         }
     }
 
+    private func isCurrent(revision: Int, sid: String) -> Bool {
+        geometryRevision == revision && sessionId == sid
+    }
+
+    /// The video changed shape (a rotation): the cached size would map taps
+    /// to the wrong place, so drop it now and ask WDA again. From upstream
+    /// fed3fb9. Main thread.
+    func refreshDisplayGeometry(completion: @escaping (Result<CGSize, Error>) -> Void = { _ in }) {
+        geometryRevision += 1
+        deviceSize = nil
+        fetchWindowSize(completion: completion)
+    }
+
     // MARK: Health
 
-    /// Validates the current session (if any) and reports health. If a session
-    /// call fails, falls back to /status to distinguish a dead session (WDA up)
-    /// from WDA being unreachable.
+    /// Reports health, asking /status first: it is what decides whether WDA
+    /// is up. The session check after it only picks or makes a session, so a
+    /// slow session call on a busy WDA is never read as WDA being down.
     func probe(completion: @escaping (Health) -> Void) {
-        if let sid = sessionId {
-            send("GET", "/session/\(sid)/window/size", nil) { [weak self] code, json, error in
+        send("GET", "/status", nil) { [weak self] _, json, error in
+            guard let self else { return }
+            if let error {
+                completion((error as? URLError)?.code == .timedOut ? .timedOut : .down)
+                return
+            }
+            guard WDAParse.ready(json) else { completion(.down); return }
+            guard let sid = self.sessionId else { self.adopt(statusJSON: json, completion); return }
+            let revision = self.geometryRevision
+            self.send("GET", "/session/\(sid)/window/size", nil) { [weak self] code, sizeJSON, error in
                 guard let self else { return }
                 if error == nil, let code, (200..<300).contains(code),
-                   let size = WDAParse.windowSize(json) {
-                    self.deviceSize = size
+                   let size = WDAParse.windowSize(sizeJSON) {
+                    // Sent before a rotation: the size is the old shape's.
+                    if self.isCurrent(revision: revision, sid: sid) { self.deviceSize = size }
                     completion(.alive)
+                } else if error != nil {
+                    completion(.alive)                         // /status answered; just slow
                 } else {
-                    self.sessionId = nil                       // session gone
-                    self.statusOrAdopt(completion)
+                    self.sessionId = nil                       // WDA says the session is gone
+                    self.adopt(statusJSON: json, completion)
                 }
             }
-        } else {
-            statusOrAdopt(completion)
         }
     }
 
-    /// No usable session of our own: read /status. WDA allows ONE session per
-    /// phone and creating one silently ends the old one — so if an agent (the
-    /// MCP server) already has a session, join it instead of reporting
+    /// No usable session of our own. WDA allows ONE session per phone and
+    /// creating one silently ends the old one — so if an agent (the MCP
+    /// server) already has a session, join it instead of reporting
     /// `.needsSession`, which would make the app create its own and yank the
     /// agent's out from under it mid-flow.
-    private func statusOrAdopt(_ completion: @escaping (Health) -> Void) {
-        send("GET", "/status", nil) { [weak self] _, json, error in
-            guard let self else { return }
-            guard error == nil, WDAParse.ready(json) else { completion(.down); return }
-            guard let active = WDAParse.activeSessionId(json) else { completion(.needsSession); return }
-            self.sessionId = active
-            // The mirror's MJPEG tuning is WDA-wide, so it must be re-applied
-            // when joining a session someone else created, or the stream drops
-            // to WDA's low defaults. The gesture settings match the MCP's own.
-            self.applyFastGestureSettings(sid: active)
-            self.applyMJPEGSettings(sid: active)
-            self.fetchWindowSize { result in
-                switch result {
-                case .success: completion(.alive)
-                case .failure:
-                    self.sessionId = nil
-                    completion(.needsSession)
-                }
+    private func adopt(statusJSON json: [String: Any]?, _ completion: @escaping (Health) -> Void) {
+        guard let active = WDAParse.activeSessionId(json) else { completion(.needsSession); return }
+        sessionId = active
+        // The mirror's MJPEG tuning is WDA-wide, so it must be re-applied
+        // when joining a session someone else created, or the stream drops
+        // to WDA's low defaults. The gesture settings match the MCP's own.
+        applyFastGestureSettings(sid: active)
+        applyMJPEGSettings(sid: active)
+        fetchWindowSize { [weak self] result in
+            switch result {
+            // A rotation raced the join; the session itself is fine.
+            case .success, .failure(WDAError.superseded): completion(.alive)
+            case .failure:
+                self?.sessionId = nil
+                completion(.needsSession)
             }
         }
     }
@@ -257,9 +287,16 @@ final class WDAClient {
 
     // MARK: HTTP core (fresh connection per request)
 
+    private let sentLock = NSLock()
+    private var _requestsSent = 0
+    /// Requests this client has sent. Counted before sending, so the relay
+    /// never sees one of ours that isn't counted yet (RelayTrafficMeter).
+    var requestsSent: Int { sentLock.lock(); defer { sentLock.unlock() }; return _requestsSent }
+
     private func send(_ method: String, _ path: String, _ body: [String: Any]?,
                       timeout: TimeInterval = 8,
                       completion: @escaping (Int?, [String: Any]?, Error?) -> Void) {
+        sentLock.lock(); _requestsSent += 1; sentLock.unlock()
         var req = URLRequest(url: base.appendingPathComponent(path))
         req.httpMethod = method
         if let body {
@@ -293,11 +330,14 @@ final class WDAClient {
 enum WDAError: LocalizedError {
     case notConnected
     case badResponse(String)
+    /// A rotation or new session made this reply out of date.
+    case superseded
 
     var errorDescription: String? {
         switch self {
         case .notConnected: return "WDA not connected"
         case .badResponse(let s): return "WDA bad response: \(s)"
+        case .superseded: return "WDA reply out of date (display or session changed)"
         }
     }
 }

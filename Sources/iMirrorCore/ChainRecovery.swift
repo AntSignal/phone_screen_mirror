@@ -46,26 +46,106 @@ public func chainRecoveryGraceSec(stage: Int, postConnectionOutage: Bool) -> Tim
     (stage == 0 && postConnectionOutage) ? 30 : 90
 }
 
-/// What the MJPEG partial-wedge watchdog should do. WDA's `/status` can stay
-/// healthy while its MJPEG stream has silently died, so `health == .connected`
-/// alone doesn't guarantee frames are actually arriving.
+/// What the MJPEG watchdog should do when the video stops. WDA's `/status`
+/// can stay healthy while its MJPEG stream has silently died, so a healthy
+/// health dot doesn't prove frames are arriving.
 public enum MjpegRecoveryAction: Equatable {
-    /// Still within the no-frame threshold — could just be a quiet screen.
     case wait
-    /// Past the threshold for the first time: bounce the cheap thing first,
-    /// the `forward` child carrying the MJPEG port.
+    /// Bounce the cheap thing: the `forward` child carrying the MJPEG port.
     case bounceForward
-    /// Still no frames after the bounce: this is more than a dropped forward
-    /// socket — escalate to a full chain-level recovery.
-    case escalate
 }
 
-/// `noFrameForSec` is how long it's been since the last MJPEG frame arrived,
-/// on a monotonic clock. `alreadyBounced` is whether `bounceForward` already
-/// fired for this stall. `thresholdSec` is how long to wait before acting.
-public func nextMjpegRecoveryAction(noFrameForSec: TimeInterval, alreadyBounced: Bool, thresholdSec: TimeInterval) -> MjpegRecoveryAction {
-    guard noFrameForSec >= thresholdSec else { return .wait }
-    return alreadyBounced ? .escalate : .bounceForward
+/// How long between forward bounces while the video stays stalled.
+public let mjpegRebounceSec: TimeInterval = 60
+
+/// Only ever bounces the MJPEG forward, and only while `/status` answers.
+/// It used to restart, then hard-stop, a WDA agents were still driving; a
+/// WDA that doesn't answer belongs to the ladder. `sinceBounceSec` is nil
+/// before this stall's first bounce.
+public func nextMjpegRecoveryAction(noFrameForSec: TimeInterval, sinceBounceSec: TimeInterval?,
+                                    statusAnswers: Bool, thresholdSec: TimeInterval,
+                                    rebounceSec: TimeInterval = mjpegRebounceSec) -> MjpegRecoveryAction {
+    guard statusAnswers, noFrameForSec >= thresholdSec else { return .wait }
+    guard let since = sinceBounceSec else { return .bounceForward }
+    return since >= rebounceSec ? .bounceForward : .wait
+}
+
+// MARK: - Health probes
+
+/// How one health probe of `/status` ended.
+public enum ProbeOutcome: Equatable, Sendable {
+    case answered
+    /// Refused, reset, not ready, or any error other than a timeout.
+    case failed
+    case timedOut
+}
+
+/// Turns probe outcomes into a health call. One timed-out probe behind an
+/// agent's slow `/source` used to mark a phone down and get its WDA
+/// restarted. Now down takes two failures in a row, and a timeout while
+/// other requests wait on WDA is "busy", which counts for nothing.
+public struct ProbeStrikes: Equatable, Sendable {
+    public enum Call: Equatable, Sendable {
+        case up
+        /// No verdict: WDA is serving someone else. Keep the current health.
+        case busy
+        /// One failure. Keep the current health and look again.
+        case suspect
+        case down
+    }
+
+    public static let failuresForDown = 2
+    /// Busy longer than this is stuck, not slow. The MCP's longest wait is 60 s.
+    public static let maxBusySec: TimeInterval = 75
+
+    public private(set) var failures = 0
+    /// When the current busy run began; nil when the last probe wasn't busy.
+    public private(set) var busySince: TimeInterval?
+
+    public init() {}
+
+    /// `inFlightAtSend` is how many requests were waiting on WDA through the
+    /// relay when the probe was sent, not counting the probe itself.
+    public mutating func record(_ outcome: ProbeOutcome, inFlightAtSend: Int,
+                                now: TimeInterval) -> Call {
+        switch outcome {
+        case .answered:
+            failures = 0
+            busySince = nil
+            return .up
+        case .timedOut where inFlightAtSend > 0:
+            let since = busySince ?? now
+            busySince = since
+            if now - since < Self.maxBusySec { return .busy }
+            return strike()
+        case .timedOut, .failed:
+            busySince = nil
+            return strike()
+        }
+    }
+
+    private mutating func strike() -> Call {
+        failures += 1
+        return failures >= Self.failuresForDown ? .down : .suspect
+    }
+}
+
+/// Which connections through one phone's relay have a request waiting on WDA.
+/// A request waits from the client's bytes until WDA's first reply bytes,
+/// which holds for HTTP/1.1 with or without keep-alive. Connection ids are
+/// the relay's own.
+public struct InFlightRequests: Equatable, Sendable {
+    private var waiting: Set<Int> = []
+
+    public init() {}
+
+    public var count: Int { waiting.count }
+    /// Requests ever started; the sleep policy tells clients' from ours.
+    public private(set) var started = 0
+
+    public mutating func clientSent(_ id: Int) { if waiting.insert(id).inserted { started += 1 } }
+    public mutating func backendSent(_ id: Int) { waiting.remove(id) }
+    public mutating func closed(_ id: Int) { waiting.remove(id) }
 }
 
 // MARK: - Several phones
@@ -84,20 +164,27 @@ public enum DeviceRecoveryAction: Equatable, Sendable {
     case restartDeviceChain
     /// Restart the shared tunnel, then every phone's chain.
     case restartTunnelAndChains
-    /// Stop retrying this phone until the user asks.
+    /// Stop the children for a while; the ladder retries later by itself.
     case giveUp
+    /// A give-up's wait is over: restart this phone's chain and try again.
+    case autoRetry
+    /// The phone is locked: stop this phone's children (the relay stays)
+    /// and wait. Restarts can't help, and each tunnel restart costs every
+    /// other phone its WDA.
+    case holdForLock
 }
 
 /// The per-phone ladder. `stage` is 0 before any restart for this outage, 1
-/// after this phone's own chain restart, 2 after a tunnel restart. With one
-/// phone attached it reproduces the single-phone ladder exactly: one full
-/// restart (stage 0 → 2), then give up.
+/// after this phone's own chain restart, 2 after a tunnel restart. Its own
+/// chain goes first whenever the tunnel lists the phone, even with no other
+/// phone up: the tunnel is rarely at fault then, and its restart is slower
+/// and resets the phone's USB once more.
 public func nextDeviceRecoveryAction(downForSec: TimeInterval, graceSec: TimeInterval, stage: Int,
                                      othersHealthy: Bool, tunnelHasDevice: Bool) -> DeviceRecoveryAction {
     guard downForSec >= graceSec else { return .wait }
     switch stage {
     case ...0:
-        return (othersHealthy && tunnelHasDevice) ? .restartDeviceChain : .restartTunnelAndChains
+        return tunnelHasDevice ? .restartDeviceChain : .restartTunnelAndChains
     case 1:
         return (!tunnelHasDevice || !othersHealthy) ? .restartTunnelAndChains : .giveUp
     default:
@@ -114,6 +201,68 @@ public func shouldRestartTunnel(lastAt: TimeInterval?, now: TimeInterval,
     return now - lastAt >= minInterval
 }
 
+/// When a phone the tunnel cannot reach may restart the shared tunnel while
+/// other phones are up. That restart costs every healthy phone its WDA and
+/// bumps its chain_epoch, so their agents' calls fail. So the phone first
+/// restarts only its own chain, and the tunnel goes only after
+/// `failuresForTunnel` of those failed. Within one outage every failure
+/// counts; a reconnect forgets only failures older than `windowSec`, so a
+/// flap clears nothing recent. `settleSec` of health clears it all. Each
+/// phone may cost the others one tunnel restart per settle.
+public struct TunnelEscalation: Equatable, Sendable {
+    public static let failuresForTunnel = 3
+    public static let windowSec: TimeInterval = 300
+    /// Twice the window. A phone that flaps every few minutes never stays
+    /// up this long; one that does has recovered, so its old failures and
+    /// its spent tunnel restart no longer say anything about it.
+    public static let settleSec: TimeInterval = 600
+
+    public enum Choice: Equatable, Sendable { case ownChain, tunnel, giveUp }
+
+    /// When this phone's own-chain restarts were judged failed.
+    public private(set) var failures: [TimeInterval] = []
+    /// An own-chain restart has not yet been followed by a settle.
+    public private(set) var pending = false
+    /// This phone already cost the others a tunnel restart.
+    public private(set) var tunnelSpent = false
+    /// Since when health has been green without a break.
+    public private(set) var upSince: TimeInterval?
+
+    public init() {}
+
+    /// The ladder decided to restart again, so the last own restart failed.
+    public mutating func restartDecided(now: TimeInterval) {
+        if pending { failures.append(now) }
+        pending = false
+    }
+
+    /// The ladder wants the tunnel and other phones are up.
+    public func choose() -> Choice {
+        if failures.count < Self.failuresForTunnel { return .ownChain }
+        return tunnelSpent ? .giveUp : .tunnel
+    }
+
+    public mutating func ownChainRestarted() { pending = true }
+
+    /// `costOthers`: other phones were up, so this spent its one go.
+    public mutating func tunnelRestarted(costOthers: Bool) {
+        failures = []
+        pending = false
+        if costOthers { tunnelSpent = true }
+    }
+
+    /// Called on every green probe. Pruning only here means a long
+    /// outage still reaches the tunnel, however slow each attempt is.
+    public mutating func connected(now: TimeInterval) {
+        if upSince == nil { failures.removeAll { now - $0 > Self.windowSec } }
+        let since = upSince ?? now
+        upSince = since
+        if now - since >= Self.settleSec { self = TunnelEscalation(); upSince = since }
+    }
+
+    public mutating func down() { upSince = nil }
+}
+
 /// One phone's recovery-ladder state, lifted out of the app delegate so each
 /// phone carries its own. Times are monotonic seconds (systemUptime), never
 /// wall-clock, so a Mac sleep can't skew them.
@@ -121,27 +270,91 @@ public struct ChainLadderState: Equatable, Sendable {
     /// When this outage's grace clock started. Nil = nothing to measure yet.
     public private(set) var wedgeSince: TimeInterval?
     public private(set) var stage = 0
-    /// Set on give-up: no automatic retries until the user asks (forceRetry).
+    /// Set on give-up. The ladder retries by itself after a backoff, whether
+    /// or not the phone ever worked; a user retry acts at once.
     public private(set) var hardStopped = false
+    public private(set) var hardStoppedAt: TimeInterval?
+    /// Give-ups since WDA last answered; sets the backoff.
+    public private(set) var giveUps = 0
     /// Once WDA has been up, an outage is a mid-session wedge: it gets the
     /// short grace, and its clock starts when health drops (a hung runwda
     /// never respawns, so nothing else would start it).
     public private(set) var hadSuccessfulConnection = false
+    /// The ladder holds for a lock and has stopped the children.
+    public private(set) var lockHeld = false
+    /// When the phone was seen unlocked; the next tick restarts it.
+    public private(set) var unlockedAt: TimeInterval?
+    /// Ask for a refused post-unlock tunnel restart again then.
+    public private(set) var unlockTunnelRetryAt: TimeInterval?
+    private var unlockTunnelRefusals = 0
+    /// Holds back tunnel restarts while other phones are up.
+    public private(set) var escalation = TunnelEscalation()
+
+    /// How long each give-up lasts: 2 min, 5 min, then 10 min for good. Most
+    /// outages (a USB reset, a crashed runner, a passcode sheet the user
+    /// answers) are gone by then, and an agent has nobody to tap retry.
+    public static let autoRetryBackoffSec: [TimeInterval] = [120, 300, 600]
+
+    /// The wait after the `giveUps`-th give-up in a row (1-based).
+    public static func autoRetryDelay(afterGiveUps giveUps: Int) -> TimeInterval {
+        let i = min(max(giveUps, 1), autoRetryBackoffSec.count) - 1
+        return autoRetryBackoffSec[i]
+    }
+
+    /// After a give-up, the ladder may restart the shared tunnel only while
+    /// no other phone is up. Otherwise a phone that keeps failing where the
+    /// tunnel can't reach it would cost a working phone its WDA every few
+    /// minutes, for good. The first climb, before any give-up, still may.
+    public static func retryMayRestartTunnel(giveUps: Int, othersHealthy: Bool) -> Bool {
+        giveUps == 0 || !othersHealthy
+    }
+
+    /// When the ladder will retry by itself; nil unless it has given up.
+    public var nextAutoRetryAt: TimeInterval? {
+        guard hardStopped, let at = hardStoppedAt else { return nil }
+        return at + Self.autoRetryDelay(afterGiveUps: giveUps)
+    }
 
     public init() {}
 
     /// Health went green: the next outage starts a fresh stage-0 grace.
-    public mutating func onConnected() {
+    /// `now` lets the tunnel escalation see how long health has held; nil
+    /// leaves it alone.
+    public mutating func onConnected(now: TimeInterval? = nil) {
+        if let now { escalation.connected(now: now) }
         wedgeSince = nil
         stage = 0
         hardStopped = false
+        hardStoppedAt = nil
+        giveUps = 0
         hadSuccessfulConnection = true
+        lockHeld = false
+        clearUnlock()
+    }
+
+    private mutating func clearUnlock() {
+        unlockedAt = nil
+        unlockTunnelRetryAt = nil
+        unlockTunnelRefusals = 0
+    }
+
+    /// The lock probe saw the phone unlock (by auto-unlock, a click or a
+    /// person). The next tick brings the chain back at once instead of
+    /// waiting out a give-up's backoff.
+    public mutating func noteUnlocked(now: TimeInterval) {
+        clearUnlock()
+        unlockedAt = now
+        giveUps = 0
+        hardStopped = false
+        hardStoppedAt = nil
+        lockHeld = false
     }
 
     /// Health went red. Only a mid-session outage starts the clock here —
     /// during first boot, runwda starting does (onRunwdaStarted), so tunnel
     /// and install time don't count against WDA's own boot grace.
     public mutating func onDown(now: TimeInterval) {
+        escalation.down()
         if hadSuccessfulConnection, wedgeSince == nil { wedgeSince = now }
     }
 
@@ -151,37 +364,152 @@ public struct ChainLadderState: Equatable, Sendable {
 
     /// Automation turned on or off: start clean.
     public mutating func reset() {
+        escalation = TunnelEscalation()
         wedgeSince = nil
         stage = 0
         hardStopped = false
+        hardStoppedAt = nil
+        giveUps = 0
+        lockHeld = false
+        clearUnlock()
     }
 
-    /// The user tapped retry after a give-up.
+    /// After an unlock the tunnel restart was refused (its cooldown), so
+    /// only this phone's chain restarted, which can't reach a phone the
+    /// tunnel doesn't list. Ask again soon instead of climbing to a
+    /// give-up and a 2-10 min backoff. Bounded by unlockTunnelRetries.
+    public mutating func tunnelRestartRefusedAfterUnlock(now: TimeInterval) {
+        guard unlockTunnelRefusals < AutoUnlockTiming.unlockTunnelRetries else { return }
+        unlockTunnelRefusals += 1
+        unlockedAt = now
+        unlockTunnelRetryAt = now + AutoUnlockTiming.unlockTunnelRetrySec
+    }
+
+    /// A retry (the user's or the ladder's own) is restarting the chain now.
+    /// That restart is this outage's stage-0 step, so the new chain gets the
+    /// full boot grace and the next step is the tunnel, not another restart.
     public mutating func forceRetry(now: TimeInterval) {
         hardStopped = false
-        stage = 0
+        hardStoppedAt = nil
+        stage = 1
         wedgeSince = now
+        lockHeld = false   // a still-locked phone is held again
     }
 
-    /// Something outside the ladder (the MJPEG watchdog) restarted the chain.
-    public mutating func noteOutsideRestart() { stage = max(stage, 1) }
+    /// Something outside the ladder (a USB-reset restart) restarted the
+    /// chain. The new runner needs the full boot grace; stage 0's 30 s
+    /// would restart it again mid-boot. Its clock starts now (beginRestart).
+    public mutating func noteOutsideRestart(now: TimeInterval) {
+        stage = max(stage, 1)
+        lockHeld = false   // a still-locked phone is held again
+        beginRestart(now: now)
+    }
 
-    public mutating func hardStop() { hardStopped = true }
+    /// The shared tunnel restarted, and with it this phone's chain, even
+    /// when another phone asked for it. A given-up phone retries now; any
+    /// other phone is treated as an outside restart. Its old clock would
+    /// restart the new chain while it boots.
+    public mutating func noteTunnelRestart(now: TimeInterval) {
+        if hardStopped { forceRetry(now: now) } else { noteOutsideRestart(now: now) }
+    }
+
+    /// A restart gets a fresh grace from the moment it is asked for, as
+    /// upstream's ChainRecoveryClock does. The clock used to keep the old
+    /// outage's start, so the next 3 s probe found the grace already spent
+    /// and escalated (or gave up) before the new runwda could spawn.
+    /// runwda's start reseeds it again, for WDA's own boot.
+    private mutating func beginRestart(now: TimeInterval) { wedgeSince = now }
+
+    public mutating func hardStop(now: TimeInterval) {
+        hardStopped = true
+        hardStoppedAt = now
+        giveUps += 1
+    }
 
     /// Decide what to do now. Call only while this phone's health is down.
+    /// `held`: runwda waits on the passcode sheet (PasscodeHold); a restart
+    /// would only raise the sheet again, so the climb pauses.
+    /// `locked`: a recent lock probe says locked. The ladder holds once,
+    /// then waits, with no give-up and no backoff, until an unlock. While
+    /// the tunnel still lists the phone, the stage's grace runs first: a
+    /// health blip there may heal by itself.
     public mutating func tick(now: TimeInterval, othersHealthy: Bool,
-                              tunnelHasDevice: Bool) -> DeviceRecoveryAction {
-        guard !hardStopped, let since = wedgeSince else { return .wait }
+                              tunnelHasDevice: Bool, held: Bool = false, locked: Bool = false) -> DeviceRecoveryAction {
+        if locked {
+            clearUnlock()
+            hardStopped = false
+            hardStoppedAt = nil
+            // The sheet means runwda is up and waiting: keep it.
+            if held || lockHeld { return .wait }
+            if tunnelHasDevice, let since = wedgeSince,
+               now - since < chainRecoveryGraceSec(stage: stage, postConnectionOutage: hadSuccessfulConnection) {
+                return .wait
+            }
+            lockHeld = true
+            return .holdForLock
+        }
+        lockHeld = false
+        if let at = unlockedAt { return afterUnlock(at: at, now: now, othersHealthy: othersHealthy,
+                                                    tunnelHasDevice: tunnelHasDevice) }
+        if held, !hardStopped { return .wait }
+        if hardStopped {
+            guard let at = nextAutoRetryAt, now >= at else { return .wait }
+            forceRetry(now: now)
+            return .autoRetry
+        }
+        guard let since = wedgeSince else { return .wait }
         let grace = chainRecoveryGraceSec(stage: stage, postConnectionOutage: hadSuccessfulConnection)
-        let action = nextDeviceRecoveryAction(downForSec: now - since, graceSec: grace, stage: stage,
+        var action = nextDeviceRecoveryAction(downForSec: now - since, graceSec: grace, stage: stage,
                                               othersHealthy: othersHealthy,
                                               tunnelHasDevice: tunnelHasDevice)
+        if action == .restartDeviceChain || action == .restartTunnelAndChains {
+            escalation.restartDecided(now: now)
+        }
+        if action == .restartTunnelAndChains, othersHealthy {
+            if !Self.retryMayRestartTunnel(giveUps: giveUps, othersHealthy: othersHealthy) {
+                action = .giveUp
+            } else {
+                switch escalation.choose() {
+                case .ownChain: action = .restartDeviceChain
+                case .tunnel: break
+                case .giveUp: action = .giveUp
+                }
+            }
+        }
         switch action {
         case .wait: break
-        case .restartDeviceChain: stage = 1
-        case .restartTunnelAndChains: stage = 2
-        case .giveUp: hardStopped = true
+        case .restartDeviceChain: stage = 1; escalation.ownChainRestarted(); beginRestart(now: now)
+        case .restartTunnelAndChains:
+            stage = 2
+            escalation.tunnelRestarted(costOthers: othersHealthy)
+            beginRestart(now: now)
+        case .giveUp: hardStop(now: now)
+        case .autoRetry, .holdForLock: break
         }
+        return action
+    }
+
+    /// The first ticks after an unlock. Its own chain when the tunnel
+    /// lists the phone; the tunnel at once when no other phone would
+    /// lose WDA; else give go-ios a short while to retry by itself, since
+    /// it backs a locked phone off for up to 5 min.
+    private mutating func afterUnlock(at: TimeInterval, now: TimeInterval, othersHealthy: Bool,
+                                      tunnelHasDevice: Bool) -> DeviceRecoveryAction {
+        let action: DeviceRecoveryAction
+        if tunnelHasDevice {
+            action = .restartDeviceChain
+        } else if let retry = unlockTunnelRetryAt {
+            guard now >= retry else { return .wait }
+            action = .restartTunnelAndChains
+        } else if !othersHealthy || now - at >= AutoUnlockTiming.unlockTunnelWaitSec {
+            action = .restartTunnelAndChains
+        } else {
+            return .wait
+        }
+        unlockedAt = nil
+        unlockTunnelRetryAt = nil
+        stage = action == .restartDeviceChain ? 1 : 2
+        beginRestart(now: now)
         return action
     }
 }

@@ -48,7 +48,11 @@ Features:
 - **Auto-installs the runner** — on connect, the app checks whether the
   WebDriverAgent app is on the connected iPhone and installs the bundled build if
   it's missing, with progress and actionable errors (e.g. "not signed for this
-  iPhone — re-sign for this device"). A pre-provisioned device just works.
+  iPhone — re-sign for this device"). A pre-provisioned device just works. A
+  runner older than the bundled one (its `CFBundleShortVersionString`, which
+  `build-wda.sh` stamps) is reinstalled; a newer one is kept, and a failed
+  upgrade keeps the old runner running. The new runner may ask for the
+  phone's passcode once ("Enable UI Automation").
 - **iOS Simulator support** — no physical phone required: enable any number of
   simulators (from **Settings (⚙) → iOS Simulator**, a shell, or the MCP server's
   `sim_enable`) and iMirror brings WebDriverAgent up on each, so an agent can drive
@@ -125,8 +129,8 @@ exact commits and scan results:
 
 ```bash
 mkdir -p tools && cd tools
-git clone --depth 1 --branch v1.1.0 https://github.com/danielpaulus/go-ios
-git clone --depth 1 --branch v9.9.0 https://github.com/appium/WebDriverAgent
+git clone --depth 1 --branch v1.3.2 https://github.com/danielpaulus/go-ios
+git clone --depth 1 --branch v16.14.2 https://github.com/appium/WebDriverAgent
 
 # (optional but recommended) scan before building:
 osv-scanner scan source -r --no-ignore --include-git-root go-ios
@@ -134,7 +138,8 @@ osv-scanner scan source -r --no-ignore --include-git-root WebDriverAgent
 
 # build the go-ios CLI from source as a universal2 (arm64 + x86_64) binary,
 # patching vulnerable transitive deps — one helper that runs on both Intel and
-# Apple Silicon, so the packaged DMG does too:
+# Apple Silicon, so the packaged DMG does too. It refuses any go-ios revision
+# but the audited v1.3.2:
 cd ..            # back to repo root
 ./scripts/build-go-ios.sh
 ```
@@ -162,7 +167,14 @@ Then install WebDriverAgent on the device once (Xcode):
    re-sign). So it installs as a first-class "iMirror" app under your own identity
    rather than `com.facebook.*`. Run it with your paid Team:
    `DEVELOPMENT_TEAM=<TEAMID> ./scripts/build-wda.sh`, then install with
-   `tools/go-ios/bin/ios install --path=build/WebDriverAgent.ipa`. See the
+   `tools/go-ios/bin/ios install --udid=<UDID> --path=build/WebDriverAgent.ipa`.
+   The re-sign uses the certificate Xcode signed with (or `WDA_SIGN_IDENTITY=<sha1>`),
+   and the script stops unless the runner and its `.xctest` both report
+   `TeamIdentifier=$DEVELOPMENT_TEAM`, so a Mac with two "Apple Development"
+   identities can no longer produce an ipa iOS refuses (0xe8008015). It also
+   stamps the WDA release (from `package.json`) into the runner's
+   `CFBundleShortVersionString`, and patches WDA so typed text is redacted
+   (`scripts/lib/wda-patches.sh`; `sim-wda-up.sh` applies the same patch). See the
    [rebrand design](docs/2026-07-03-rebrand-wda-and-improvements-design.md) for the
    why/how. (The macOS app's `runwda` is already wired to launch the branded id.)
 
@@ -171,7 +183,40 @@ Then install WebDriverAgent on the device once (Xcode):
 ```bash
 ./scripts/run.sh            # debug build → bundle (with go-ios + icon) → launch
 ./scripts/run.sh release    # optimized build
+./scripts/run.sh --restart  # iMirror is running: quit it, rebuild, relaunch
 ```
+
+`run.sh` installs and launches the app at `~/Applications/iMirror.app`
+(`IMIRROR_APP=/path/to/iMirror.app` picks another place), not in `build/`: a
+disk-cleanup sweep deletes old `build` folders, and deleting the running app's
+bundle leaves it unable to start its bundled go-ios.
+
+`run.sh` refuses to replace that bundle while it is running, because deleting
+it under the live app leaves the old binary running and `devices.json` pointing
+at a deleted bundle. It also refuses while an iMirror from another path (such as
+an old `build/iMirror.app`) owns `devices.json`. `--restart` quits exactly
+those processes (by pid, not bundle id — an older iMirror may share it), waits
+for them to exit, rebuilds, relaunches, and waits until the new pid owns
+`devices.json`. Every phone drops for about 30 s while it does. `package.sh`
+does the same for `build/iMirror.app`, the bundle it packages.
+
+Before committing, run `swift build && swift test` and the MCP suite
+(`mcp-server/.venv/bin/python -m pytest mcp-server`); see `CLAUDE.md`.
+
+#### Signing for development
+
+`run.sh` signs ad hoc unless `IMIRROR_SIGN_IDENTITY` is set. An ad hoc
+signature changes with every build, so macOS forgets iMirror's Bluetooth and
+Documents permissions and asks again. With a stable identity they stay:
+
+```bash
+security find-identity -v -p codesigning     # pick an "Apple Development: …" name
+export IMIRROR_SIGN_IDENTITY="Apple Development: Your Name (TEAMID)"
+./scripts/run.sh
+```
+
+`package.sh` uses it too, ahead of any Developer ID (no hardened runtime, no
+timestamp, not notarizable: for this Mac only).
 
 On launch the app connects to the iPhone and brings up WebDriverAgent
 automatically (health dot green within ~30 s) — the phone stays unlocked and
@@ -245,12 +290,40 @@ it skips the CFNetwork relay entirely — only the WDA HTTP path needs the relay
 Children run with a writable working dir (`~/Library/Application Support/iMirror`)
 and auto-restart on crash. `runwda` carries a readiness deadline: if WDA isn't
 serving within ~40 s the runner is killed and respawned, since a wedged runner
-otherwise never exits on its own. If that keeps failing, an escalation ladder
-does a full chain restart (fresh tunnel, runner, and both forwards); if the
-chain still won't come up, the app stops retrying and shows a "tap WDA to
-retry" state instead of looping forever. A separate MJPEG no-frame watchdog
-covers the case where WDA is healthy but no video frames arrive — it bounces
-the MJPEG forward first, then escalates the same way. Before each bring-up the
+otherwise never exits on its own. Each child's output is kept in a 16 KB ring
+(`IMIRROR_DEBUG=1` also writes it to `<label>.log`), and runwda's is read line
+by line: "cannot initiate a IDE session … Timed out" means the XCTest "Enable UI
+Automation" passcode sheet is up (`reason: needs_passcode`). Restarting the
+runner then only raises the sheet again, so for up to 10 minutes the readiness
+kill and the ladder's restarts pause, and runwda retries every 15 s so WDA comes
+up soon after someone enters the passcode. A locked or untrusting phone is
+named the same way (`locked`, `untrusted`). While a phone's WDA is down,
+iMirror also asks lockdown every 5 s whether it is locked (`ios lockdown get
+PasswordProtected`, which works over usbmux while the tunnel is down). A
+locked phone gets `reason: locked`, and the ladder stops that phone's
+children once (after the stage's grace if the tunnel still lists the phone)
+and then waits: no restarts, no give-up, no `next_retry_at`,
+because every tunnel restart would cost the other phones their WDA. A locked
+phone keeps the Mac awake only while auto-unlock could still act on it, and
+for at most 10 min of the lock. When the
+phone reads unlocked again (by hand, a click or auto-unlock, below), its
+chain restarts at once; if the tunnel cannot reach it yet and another phone
+is up, iMirror gives go-ios 20 s to retry, then restarts the tunnel. If the
+tunnel's 2 min cooldown refuses that restart, it asks again every 15 s (up to
+10 times) instead of climbing to a give-up. A phone is called down only after two
+failed health probes in a row, and a probe that times out while other requests
+(say an agent's slow `/source`) are already waiting on WDA counts as busy, not
+failed. If WDA stays down, a ladder restarts that phone's own chain first, then
+the shared tunnel; each restart gets its full grace from the moment it starts.
+While another phone is working, a phone the tunnel cannot reach restarts only
+its own chain until three of those restarts have failed (a brief reconnect in
+between does not wipe the count; 10 min of health does), and then may cost the
+others one tunnel restart. If it still won't come up, the app stops the chain and
+retries by itself after 2 min, then 5 min, then every 10 min; tapping the WDA
+dot retries at once. Those retries never restart the shared tunnel while
+another phone is working. A separate MJPEG no-frame watchdog covers the case where
+WDA is healthy but no video frames arrive: it bounces the MJPEG forward (at
+most once a minute) and never restarts a WDA that still answers `/status`. Before each bring-up the
 app also sweeps any stray go-ios children left by a previously crashed
 instance — most often a tunnel reparented to `launchd` that would otherwise
 keep holding the device's RSD state and port 60105 and pin the dot on red. The
@@ -262,6 +335,323 @@ clients work). The loopback relay normalises the connection, keeping the USB
 transport and loopback-only security. If the bundled go-ios is ever missing,
 `scripts/wda-up.sh` + `scripts/wda_relay.py` are a manual fallback.
 
+## Files other tools read
+
+The app shares state with the MCP server and with test harnesses (such as
+`antsignalctl` and `run.sh`) through these files. All live in
+`~/Library/Application Support/iMirror/` (with `IMIRROR_DEVICES_FILE` set, next
+to that file instead). Times are ISO-8601 in UTC. None of them ever holds a
+passcode or other secret.
+
+**`devices.json`** — every phone and Simulator the app drives, rewritten
+atomically on each change (format: `Sources/iMirrorCore/DeviceRegistry.swift`).
+Top level: `schema` (1), `owner_pid`, `owner_uniqueid` (the app's kernel
+`p_uniqueid`, never reused within a boot: a reader that finds a live `owner_pid`
+with a different uniqueid knows the file is stale), `app_version`, `updated_at`,
+`goios`, `devices`, and `problems` (absent in older builds, so treat a missing
+key as none): `[{"udid"?, "reason", "message"}]`, what keeps a phone or every
+phone from starting. `reason` is `slot_conflict` (the phone's port is held by
+another process), `slots_full`, or `app_bundle_missing` (no `udid`: the app's
+go-ios binary is gone, so nothing new starts until `scripts/run.sh --restart`;
+the app also posts one notification). A phone with a slot problem has no
+`devices` entry. Accept reasons you don't know. Each device has `udid`, `alias`, `kind`, `wda_url`, `state`
+(`starting|installing|ready|down|failed`), `detail`, and:
+
+| key | meaning |
+|---|---|
+| `reason` | absent/null when ready; else one of `usb_reset`, `wda_wedged`, `needs_passcode`, `locked`, `tunnel_down`, `mac_asleep`, `gave_up`, `recovering`, `booting`, `untrusted` (the phone doesn't trust this Mac, or WDA's developer), `runner_missing` (no runner on the phone and none bundled; `state` is `failed`, `detail` names the commands to install one, and the app looks again every 30 s). Accept values you don't know. |
+| `state_since` | UTC ISO-8601: when `state` or `reason` last changed |
+| `chain_epoch` | +1 each time the phone's chain (runwda + forwards) starts |
+| `last_error` | go-ios's last error line for this phone (`msg: error`, ≤200 chars), or absent |
+| `next_retry_at` | UTC ISO-8601 while the ladder has given up: when it retries by itself |
+| `auto_unlock` | only for a phone with a keyboard pairing: `on`, `off`, or `off_after_failure` (a try left the phone locked, or iMirror stopped mid-try; a person must turn it on again). Accept values you don't know. |
+
+`reason: locked` means a lock probe in the last 15 s said the phone is
+locked. The state is then `starting` or `down`, never `failed`.
+
+**`events.jsonl`** — one JSON object per line, appended; at 5 MB it moves to
+`events.jsonl.1` (one old file kept). Keys: `ts` (UTC ISO-8601 with ms),
+`udid`, `alias`, `event`, and optionally `from`, `to`, `reason`, `detail`,
+`expected` (bool). `event` is one of `state` (`from`/`to` are states),
+`restart`, `give_up`, `auto_retry`, `usb_reset` (a reset the app is checking),
+`usb_reset_ignored` (its own start/stop did it, or WDA was not up), `request`,
+`wake`, `sleep`, `passcode`, `runner_upgrade` (the phone's WebDriverAgent
+runner is older than the bundled one and is reinstalled; `from`/`to` are
+versions; the new runner may raise the passcode sheet once), `lock`
+(`detail` `locked` or `unlocked`; an unlock has `reason` `auto`, `click` or
+`other`; while WDA is down a `restart` with `detail` `unlocked` follows),
+`tunnel_restart` (the shared tunnel restarted, so every phone's chain did;
+`udid`/`alias` name the phone that asked, empty when a person used the menu;
+`reason` is `ladder`, `unlocked`, `retry` or `user`; `detail` lists the phones
+that were healthy), `keyboard` (see
+below). The same lines go to the unified log, subsystem
+`com.local.imirror`, category `events`, in the clear.
+
+A `keyboard` event is about iMirror's Bluetooth keyboard. It has `transport`
+(`dongle` or `corebluetooth`, below) when the app knows which. `detail` is one of
+`paired`, `ambiguous` (more than one new Bluetooth central subscribed, so none
+was trusted), `timeout` (the 120 s pairing window closed with no new phone),
+`connected`, `disconnected`, `typed_test`, `typed_passcode`, `failed`,
+`forgotten`, or one of auto-unlock's (below): `auto_on`, `auto_off` (`reason`
+`settings`, `request`, `renamed` when the phone's alias changed, or
+`still_locked` when a clicked passcode left the
+phone locked), `auto_wake`, `auto_typed`, `auto_unlocked`, `auto_failed`
+(`reason` `still_locked`, `unverified`, `interrupted`, `unlocked_late` (it
+unlocked more than 5 s after typing, maybe by Face ID) or `slow_keyboard` (the
+first key may have left more than 4.5 s after the approving reading);
+auto-unlock is now off) and `auto_aborted` (no digit was sent; `reason`
+`unlocked_before_typing`, `lock_unknown`, `probe_timeout`, `disabled`,
+`sheet`, `wda_up`, `keyboard_busy`, `click_checking`, `send_stuck`, `stale`
+(this Mac's Bluetooth saw the first key come too late), or a keyboard failure
+such as `dongle_unavailable`). A
+typing line has `chars`: how many characters were typed, never what they
+were. `auto_typed` also has `probe_age_ms` (how old the lock reading was when
+typing began), `send_ms` (how long the SEND took) and `first_key_age_ms` (how
+old it was at the first key; for the dongle an upper bound, from the SEND's
+end less its own delays), numbers only. A `failed` line has a `reason`: `bad_request`,
+`unknown_action`, `bad_text`, `stale`, `not_attached`, `not_paired`, `busy`,
+`bluetooth_unavailable`, `setup_failed`, `not_connected`, `send_failed`,
+`dongle_unavailable` (the phone is paired with the dongle and none answers on
+USB), `dongle_error` (the dongle gave no answer in time, or one iMirror cannot
+read), and for "Type passcode now" `no_file`, `no_passcode` or `untypeable`.
+
+**`expected-resets/<udid>.json`** — written by a client, not the app. Before
+`devicectl device install|launch`, write `{"until": <now + 90 s, ISO-8601>,
+"by": "devicectl install"}`. A USB reset of that phone before `until` is logged
+with `"expected": true`. Recovery still runs as usual; the note only stops the
+reset reading as a fault. A note more than 10 min ahead is ignored.
+
+**`requests/restart-<udid>.json`** — written by a client to restart a phone's
+chain: `{"udid", "requested_at": ISO-8601, "requested_by": "<short name>"}`.
+Write a temp file and rename it in; other names in the folder are ignored. The
+app deletes the file, then logs an event `request` whose `detail` is
+`accepted` (the chain restarts now; `chain_epoch` goes up), `cooldown` (a
+request for this phone was honoured in the last 60 s, so nothing happens),
+`stale` (`requested_at` more than 2 min off) or `not_attached`. A request acts
+like Settings → Restart: this phone's chain only, never the shared tunnel. It
+never types a passcode. While the phone shows `needs_passcode`, don't send one:
+a new runner raises the sheet again.
+
+**`requests/keyboard-<udid>.json`** — written by a client to drive iMirror's
+Bluetooth keyboard for one phone: `{"udid", "requested_at", "requested_by",
+"action": "pair"|"forget"|"test"|"auto_on"|"auto_off", "text"}`. Write it like a restart request.
+- `pair` opens a 120 s pairing window: iMirror advertises as "iMirror Keyboard",
+  and the one phone that connects while it is open is tied to this UDID. The
+  phone must be attached by USB. When the keyboard dongle (below) answers
+  `HELLO`, it does the advertising; otherwise this Mac does, over
+  CoreBluetooth. A phone signed in to this Mac's iCloud account never lists
+  the Mac's own keyboard (iOS shows it as "my Mac"), so those phones need the
+  dongle.
+- `test` types `text` into that phone only, over the transport it was paired with: 1–32 of `a-z`, `0-9` and space,
+  with at least one letter and at most three digits, so it can never be a
+  passcode attempt. `text` is refused on any other action.
+- `forget` removes the tie at once, and the dongle's bond for it when the
+  dongle answers.
+- `auto_on` turns auto-unlock (below) on for that phone. It needs the phone
+  on USB, a pairing, and a typeable value for it in the passcode file
+  (otherwise `failed` with `not_attached`, `not_paired`, `no_file`,
+  `no_passcode` or `untypeable`). Answered by `auto_on` with `reason`
+  `request`. Settings then says "on (turned on by a request)", so a person
+  can see an agent did it.
+- `auto_off` turns it off, always (even for a phone not on USB). Answered by
+  `auto_off` with `reason` `request`.
+
+Any other action, or any other key in the file, is refused (event `keyboard`,
+`detail` `failed`). A file can turn auto-unlock on or off, never carry or
+type a passcode: the only value ever typed is the one in the app's own
+passcode file. After each run iMirror
+stops advertising and drops its Bluetooth services, so the phone gets its
+on-screen keyboard back.
+
+**`keyboard-pairs.json`** — written by the app, mode 0600. Each phone is
+`{"transport": "corebluetooth", "central": "<CoreBluetooth central UUID>",
+"paired_at": ISO-8601}` or `{"transport": "dongle", "slot": "<slot>", "peer":
+"<phone's Bluetooth identity address>", "paired_at": ISO-8601}`. An entry with
+no `transport` was written before the dongle and is `corebluetooth`. Accept
+transports you don't know.
+
+Settings → iPhones ends with "Keyboard: dongle connected" or "Keyboard:
+dongle not found". iMirror checks USB every 5 s and says `HELLO` only when an
+Espressif port (vendor `0x303A`) comes or goes. It opens the port for each
+job and closes it after, so the firmware can be flashed between jobs.
+
+**Keyboard dongle serial protocol, v1.** An ESP32-S3 on the Mac's USB acting
+as a BLE keyboard with its own Bluetooth address (a phone on the Mac's iCloud
+account hides the Mac's own keyboard as "my Mac"). Firmware and the same
+contract: `esp32-s3/BLE_KEYBOARD_DONGLE.md` in AntSignal/device-firmware.
+Code: `Sources/iMirrorCore/DongleProtocol.swift`.
+- Link: the S3's built-in USB-Serial/JTAG (USB vendor `0x303A`), any baud.
+  ASCII lines ending `\n`. The host sends commands; the dongle replies. Lines
+  starting `#` are logs and never hold report bytes, slot payloads or anything
+  typed. Every command gets exactly one final line, `OK …` or `ERR <code>`.
+- Slots: `[a-z0-9-]{1,32}`. iMirror uses the phone's UDID lower-cased without
+  dashes (`000081400006423002d3401c`); a 40-character UDID keeps its first 32.
+- `HELLO` → `OK HELLO imirror-kbd 1 <dongle-bt-addr>`
+- `STATUS` → `OK STATUS bonds=<n> conns=<n> adv=<0|1>`
+- `BONDS` → zero or more `BOND <slot> <peer-identity-addr>`, then `OK BONDS <n>`
+- `PAIR <slot> <seconds 10..600>` advertises as "iMirror Keyboard" (16-bit
+  `0x1812`, appearance `0x03C1`), Just Works bonding. Exactly one new peer that
+  bonds and subscribes to the keyboard input report → stored, disconnected,
+  `OK PAIRED <slot> <peer-identity-addr>`. A second new peer → `ERR AMBIGUOUS`
+  (both new bonds deleted). Nobody → `ERR TIMEOUT`. Re-pairing a slot replaces
+  its old bond.
+- `FORGET <slot>` → `OK FORGOT <slot>` or `ERR UNKNOWN_SLOT`.
+- `SEND <slot> <hex>`: 1–128 steps of 10 bytes, each an 8-byte boot-keyboard
+  input report then a 2-byte big-endian delay (0–2000 ms) to wait after it.
+  The dongle lets only that slot's peer connect, waits up to 15 s for it to
+  connect, encrypt and subscribe, waits 1 s, sends a key-up report, the
+  steps, another key-up, then disconnects and stops advertising →
+  `OK SENT <steps>`, or `ERR UNKNOWN_SLOT`, `ERR NOT_CONNECTED`, `ERR BADARG`.
+  Neither side ever logs the hex. iMirror splits longer text into several
+  SENDs, each ending after a key-up.
+- `DISCONNECT` → drops every connection, stops advertising → `OK DISCONNECTED`.
+- Between commands the dongle neither advertises nor holds a connection, so
+  bonded phones keep their on-screen keyboards. One command at a time: another
+  arriving meanwhile gets `ERR BUSY`. A phone other than the target never gets
+  a report.
+- iMirror's timeouts, write to final line: `HELLO` 2 s, `PAIR` its window +
+  10 s, `SEND` 30 s plus its steps' delays, others 5 s.
+
+**Settings → iPhones → "Type passcode now"** shows on each paired phone. A
+click reads that phone's passcode from the passcode file (the field under the
+phone list; default `~/Documents/Github/Purpose/Purpose-iOS/Testing/.env.local`,
+stored as `defaults` key `imirror.passcodeFile`). The file is dotenv style
+(`KEY=VALUE`, optional `export`, quotes, `#` comments). The key is the
+phone's alias in capitals plus `_PASSCODE`, such as `PHONE2_PASSCODE=...`
+(a `-` in the alias becomes `_`). An alias belongs to one phone at a time, so
+the key cannot reach another phone. Failing that, it tries
+`IMIRROR_PASSCODE_<UDID without dashes, upper case>`, then
+`ANTSIGNAL_TEST_DEVICE_PASSCODE`, but only when the file's
+`ANTSIGNAL_DEVICE_UDID` is this phone. iMirror then presses Shift to wake the
+phone, waits 600 ms, presses Backspace to open the keypad (on the lock
+screen the first real key only opens it, so a digit there was lost), waits
+800 ms, presses Backspace 8 more times (or the code's length plus one, if
+longer) to clear a half-typed code, and types
+the passcode to that phone only (Return
+too, unless it is a 4- or 6-digit code), zeroes its copy and logs `keyboard`
+`typed_passcode` with `chars`. Nothing but that click starts it; a test
+(`PasscodeCallSiteTests`) fails if any other code calls it. The only other
+path that types a passcode is auto-unlock (below), which a person must turn
+on for each phone. A file under
+`~/Documents` makes macOS ask once for access to Documents.
+
+If the phone is already unlocked, or Face ID unlocks it as Shift wakes it,
+the Backspaces delete text in whatever field has focus. Click it only while the phone shows a passcode prompt (check the mirror or a
+screenshot first). iMirror cannot tell what the phone shows: on an unlocked
+phone the keys go to whatever has focus, and the Return after a non-numeric
+code may send them. A click posted by another program (cliclick, an agent's
+computer use) also counts as a click.
+
+**Settings → iPhones → "Unlock by itself when locked"** (auto-unlock) is a
+checkbox on each paired phone, off for every phone until a person ticks it.
+Turning it on takes a click, a confirmation, and a typeable value in the
+passcode file; turning it off takes nothing. The line under it says
+"Auto-unlock: on · last unlocked 01:10", or "off after a failed try at 01:12.
+Check PHONE2_PASSCODE, then turn it on again." The setting is kept in
+`defaults` key `imirror.autoUnlock` (no secrets), and `imirror-ctl keyboard
+auto on|off` writes the same requests. When a phone with it on is locked,
+its WDA is down, the Mac is awake, its runwda shows no passcode sheet and the
+keyboard is free:
+
+1. The phone must have read locked for at least 20 s (so a person unlocking
+   it wins), this lock must not have had a try yet, the last try must be
+   2 min ago or more, and there must be fewer than 3 tries in the past hour.
+   A try counts from the wake, and the history is kept across restarts. A
+   clicked "Type passcode now" counts as a try too (it reads the same file),
+   and spends the lock's try when the phone was being read as locked; while
+   a click is being checked, nothing is typed automatically, and while an
+   automatic try (its check included) runs, the click is refused.
+2. iMirror sends Shift and waits 600 ms (`auto_wake`), which is harmless on
+   any screen. The keyboard is held from here to the last key, and this
+   Mac's Bluetooth is not stopped in between.
+3. It probes the lock again. Only a reading taken after the wake, at most
+   2 s old, lets it type. Unlocked (Face ID, or a person) or unknown, or no
+   reading within 5 s, ends the try with nothing typed (`auto_aborted`).
+4. It sends Backspace to open the keypad, Backspaces to clear it, and the
+   passcode, to that phone's peer only (`auto_typed`). This Mac's Bluetooth
+   checks the reading is still at most 2 s old right before the first key,
+   or sends nothing (`stale`). The dongle can't: it reconnects inside the
+   SEND (up to 15 s, then a 1 s settle). So iMirror bounds the reading's
+   age at the first key from the SEND's timing, and over 4.5 s the try
+   counts as failed (`slow_keyboard`) even if the phone unlocked.
+5. For 15 s it probes about once a second. An unlocked reading that started
+   within 5 s of the end of typing is success (`auto_unlocked`, then `lock`
+   `unlocked` and a chain restart). A later one may be a person's Face ID, so
+   it proves nothing (`unlocked_late`). Otherwise (`still_locked`, or
+   `unverified` if no reading could tell) auto-unlock turns itself off,
+   saved, with a macOS notification, until a person turns it on again. A
+   clicked passcode that leaves a locked phone locked turns it off the same
+   way (`auto_off` `still_locked`): the file's value is probably wrong. A
+   SEND that never comes back ends the try after 75 s (a stuck passcode SEND
+   as `unverified`).
+
+Renaming a phone turns its auto-unlock off (`auto_off` `renamed`), since
+its passcode key (`PHONE2_PASSCODE`) changes with the alias; an alias whose
+key another phone's alias already has (`phone-2` and `phone_2`) is refused.
+
+If iMirror stops during a try, it comes back with auto-unlock off
+(`auto_failed` `interrupted`). "Cannot tell" never types: a probe that
+fails, times out or prints anything but `true`/`false` reads unknown.
+
+Risks, plainly: every try that fails is a wrong attempt toward the phone's
+lockout, which escalates; the limits above cap that at one per lock and three
+an hour, and the first failure stops it. The dongle firmware (protocol v1)
+reconnects inside every SEND and has no shorter connect wait, so the reading
+that approves typing can be up to about 17 s old at the first key. iMirror
+can only notice that afterwards: a person who unlocks the phone in that
+window gets the Backspaces and digits in whatever has focus, once, and then
+auto-unlock is off (`slow_keyboard`). The 20 s settle rule and "only while
+WDA is down" make that unlikely, not impossible. Closing it needs firmware:
+a SEND with a short connect-wait cap, or a hold that keeps the link from the
+wake to the last key. Separately, `keyboard test` allows three digits per
+request, so two tests sent to a locked phone's keypad can make a 4- or
+6-digit code and submit it. The XCTest "Enable UI Automation" sheet (`needs_passcode`) is
+never auto-typed: click "Type passcode now" for it.
+
+The first pair or type asks for Bluetooth access (System Settings › Privacy &
+Security › Bluetooth). An ad hoc signed build may ask again after each rebuild;
+see "Signing for development".
+
+**`scripts/imirror-ctl`** reads and writes these files (system `python3`, no
+dependencies). `device` is an alias, a UDID, or a unique UDID prefix/suffix of
+4+ characters, as in the MCP server.
+
+```bash
+scripts/imirror-ctl status                 # every phone: state, reason, since, epoch
+scripts/imirror-ctl status phone2 -n 20    # one phone, with its last 20 events
+scripts/imirror-ctl restart phone2         # exit 0 accepted, 3 cooldown, 4 timeout
+scripts/imirror-ctl events --device phone2 --since 1h
+scripts/imirror-ctl keyboard pair phone2           # waits up to 130 s: paired, ambiguous, timeout
+scripts/imirror-ctl keyboard test phone2 "hello 123"
+scripts/imirror-ctl keyboard status phone2         # transport, slot/peer or central, last keyboard events
+scripts/imirror-ctl keyboard forget phone2
+scripts/imirror-ctl keyboard auto on phone2        # auto-unlock on (no passcode argument, ever)
+scripts/imirror-ctl keyboard auto off phone2
+scripts/imirror-ctl keyboard auto status phone2    # auto_unlock, reason, last auto_* and lock events
+```
+
+`keyboard` exits 0 on `paired`, `typed_test` or `forgotten` (`auto` on
+`auto_on` or `auto_off`), 1 on anything else the app answered, and 4 when it
+got no answer. `keyboard auto` refuses a Simulator, and `auto status` writes
+nothing. `test`, `forget` and
+`status` also take a UDID from `keyboard-pairs.json` for a phone no longer on
+USB.
+
+### Sleep and wake
+
+A sleeping Mac drops every phone's USB link. While Automation is on, iMirror
+holds a `PreventSystemSleep` power assertion, but only while a client sent a
+request through a phone's WDA port in the last 5 minutes, or a phone is
+recovering (any `reason` but `gave_up` or `mac_asleep`, and the ladder has
+not given up). Otherwise it lets the Mac sleep.
+`pmset -g assertions` shows it as "iMirror: …".
+
+**macOS honours that assertion on AC power only.** On battery, idle sleep and a
+lid close still sleep the Mac. When the Mac goes to sleep, every phone shows
+`reason: mac_asleep` and gets a `sleep` event. On wake, each phone logs `wake`
+and its chain restarts at once (`chain_epoch` goes up), without waiting for a
+probe to fail.
+
 ## Dependency security policy
 
 Supply-chain risk is treated as a first-class constraint:
@@ -272,8 +662,13 @@ Supply-chain risk is treated as a first-class constraint:
   transitive deps patched, and **built from source** (no prebuilt-binary trust).
 - **No `curl | sh`, no unsigned binaries.** Anything executable is subject to
   macOS Gatekeeper / notarization.
-- WebDriverAgent has no auth on the wire, so it is reached over **loopback only**;
-  the go-ios host identity (`selfIdentity.plist`) is gitignored.
+- WebDriverAgent has no auth on the wire, so it is reached over **loopback only**:
+  `scripts/build-go-ios.sh` patches go-ios's `forward` to bind 127.0.0.1 (upstream
+  binds 0.0.0.0) and refuses to build if the patch did not apply. The go-ios host
+  identity (`selfIdentity.plist`) is gitignored.
+- WebDriverAgent's text typing names its XCTest event after the typed text and
+  does not redact it, so a typed passcode would enter testmanagerd's event
+  record. The build scripts patch it to a fixed name with redaction on.
 
 ## MCP server (drive the phone from Claude)
 
@@ -301,6 +696,17 @@ safe merge into `claude_desktop_config.json` that leaves your other servers
 untouched). It shows installed status + version and flags when a re-register is
 needed. Prefer the manual route? See [mcp-server/README.md](mcp-server/README.md).
 
+What it registers is a **frozen copy**, not your checkout. Install copies the
+server files the app was built with into
+`~/Library/Application Support/iMirror/mcp/<version>-<hash8>/`, imports that copy
+with the venv's Python (and checks `devicelease.py --version` when it ships), and
+only then swaps `mcp/current` to it; a copy that fails is never used. Clients run
+`~/Library/Application Support/iMirror/mcp/current/imirror_mcp.py`, so editing or
+checking out the repo does not change what new sessions load. After rebuilding the
+app with new server code, press **Update**. pip re-runs only when
+`requirements.txt` changes. When the server ships `devicelease.py`, Install also
+writes the device-lease CLI launcher `~/Library/Application Support/iMirror/bin/imirror-lease`.
+
 It talks to the same loopback WDA the app brings up — open iMirror and wait for
 the green dot before driving the phone. See
 [mcp-server/README.md](mcp-server/README.md) for the tool table and report
@@ -309,7 +715,9 @@ walkthrough.
 **Headless automation.** The MCP server can also bring WebDriverAgent up on its
 own, without the Mac app: set `IMIRROR_AUTOWDA=1` and it runs the same go-ios
 tunnel / runwda / forward chain and talks to WDA directly. Useful for driving
-the phone from an agent without launching the GUI.
+the phone from an agent without launching the GUI. A bring-up that fails stops
+the children it started, and only those: it never sweeps other go-ios processes,
+so the app's other phones are left alone.
 
 **iOS Simulators (optional).** No phone handy, or testing a simulator build?
 Enable one or more simulators and iMirror boots each and brings WebDriverAgent up
@@ -366,6 +774,8 @@ swift scripts/make_icon.swift   # regenerate Resources/AppIcon.icns (one-off)
 ```
 
 `package.sh` builds the release `.app` (bundling go-ios + icon) and makes a DMG.
+Like `run.sh`, it refuses to replace a running `build/iMirror.app`; pass
+`--restart` to quit it first and relaunch the new build.
 With a **Developer ID Application** certificate it signs with hardened runtime +
 the camera entitlement (and signs the nested go-ios), ready for notarization:
 
@@ -409,13 +819,14 @@ distribute the notarized DMG directly.
   Apple's private wire protocols, so a new iOS major version can break the chain
   until those projects catch up. Pinned versions in
   [SECURITY-AUDIT.md](SECURITY-AUDIT.md) are what's actually tested.
-- **Landscape** adapts via WDA `window/size` (refreshed each poll) but hasn't been
-  physically rotation-tested.
+- **Landscape** adapts via WDA `window/size` (refreshed each poll, and at once
+  when the video changes shape; the video follows the rotation through WDA's
+  `mjpegFixOrientation`) but hasn't been physically rotation-tested.
 - Relaunching the app in quick succession can still briefly wedge the device's
   `testmanagerd`. Recovery now escalates in stages: a readiness-deadline
-  auto-restart of the runner, then a full chain restart, then (if the chain
-  still won't come up) a hard-stop "tap WDA to retry" state rather than
-  looping forever. A hard crash (rather than a clean quit) can orphan a go-ios
+  auto-restart of the runner, then a chain restart, then a tunnel restart, then
+  (if the chain still won't come up) a pause that retries by itself with a
+  growing backoff (2 min, 5 min, then every 10 min). A hard crash (rather than a clean quit) can orphan a go-ios
   child; the next launch sweeps it automatically.
 
 ## Credits

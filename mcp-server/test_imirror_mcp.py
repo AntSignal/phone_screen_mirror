@@ -16,14 +16,24 @@ import pytest
 
 
 @pytest.fixture()
-def mod(monkeypatch):
+def mod(monkeypatch, tmp_path):
     """Import a fresh copy of the module with a clean session, on a loopback target."""
     monkeypatch.setenv("IMIRROR_WDA", "http://127.0.0.1:8100")
+    # Installs take a Mac-wide lock there; keep tests off the real one.
+    monkeypatch.setenv("IMIRROR_DEVICES_FILE", str(tmp_path / "devices.json"))
     monkeypatch.delenv("IMIRROR_TARGET", raising=False)  # default (device) mode
     sys.modules.pop("imirror_mcp", None)
     m = importlib.import_module("imirror_mcp")
     m._session["id"] = None
     return m
+
+
+# WDA's real reply when the session in the URL no longer exists
+# (FBCommandStatus.m, FBResponsePayload.m): a W3C error object, plus the
+# session that IS active at the top level (null: none).
+INVALID_SESSION = {"value": {"error": "invalid session id",
+                             "message": "Session does not exist", "traceback": ""},
+                   "sessionId": None}
 
 
 class FakeWDA:
@@ -57,6 +67,10 @@ class FakeWDA:
         # _ensure_session always fires this boilerplate; succeed it by default.
         if path.endswith("/appium/settings"):
             return 200, {"value": {}}
+        # _ensure_session reads /status before it creates; by default no
+        # session is active on the phone, so it creates one.
+        if path == "/status":
+            return 200, {"value": {"ready": True}, "sessionId": None}
         if any(path.endswith(s) for s in self.allowed):
             return 200, {"value": {}}
         # Anything else unscripted is a test bug or a silently renamed route —
@@ -72,9 +86,10 @@ def wda(mod, monkeypatch):
 
 
 @pytest.fixture()
-def sim_mod(monkeypatch):
+def sim_mod(monkeypatch, tmp_path):
     """A fresh module imported in simulator mode (IMIRROR_TARGET=simulator)."""
     monkeypatch.setenv("IMIRROR_WDA", "http://127.0.0.1:8100")
+    monkeypatch.setenv("IMIRROR_DEVICES_FILE", str(tmp_path / "devices.json"))
     monkeypatch.setenv("IMIRROR_TARGET", "simulator")
     sys.modules.pop("imirror_mcp", None)
     m = importlib.import_module("imirror_mcp")
@@ -123,8 +138,10 @@ def test_req_parses_json_body(mod, monkeypatch):
 def test_req_returns_error_code_and_body(mod, monkeypatch):
     """4xx/5xx come back as a normal response (not an exception) so callers like
     _session_post can see the code and recreate a stale session."""
-    monkeypatch.setattr(mod, "_http", lambda *a: (404, b'{"value": "no session"}'))
-    assert mod._req("POST", "/session/s/actions", {}) == (404, {"value": "no session"})
+    body = {"value": {"error": "invalid session id", "message": "Session does not exist",
+                      "traceback": ""}, "sessionId": None}
+    monkeypatch.setattr(mod, "_http", lambda *a: (404, json.dumps(body).encode()))
+    assert mod._req("POST", "/session/s/actions", {}) == (404, body)
 
 
 def test_req_wraps_non_json_error_body(mod, monkeypatch):
@@ -306,9 +323,32 @@ def test_ensure_session_creates_once(mod, wda):
 def test_session_post_recreates_on_stale_404(mod, wda):
     wda.script("/session", (200, {"value": {"sessionId": "s1"}}),
                (200, {"value": {"sessionId": "s2"}}))
-    wda.script("/actions", (404, {"value": "no session"}), (200, {"value": {}}))
+    wda.script("/actions", (404, INVALID_SESSION), (200, {"value": {}}))
     mod._session_post("/actions", {"actions": []})
     # session got cleared and recreated, and the new id is cached
+    assert mod._session["id"] == "s2"
+
+
+def test_session_lost_on_both_attempts_raises_session_contested(mod, wda):
+    """A session that dies again right after being replaced means another
+    client keeps creating them. Say so instead of fighting it."""
+    wda.script("/session", (200, {"value": {"sessionId": "s1"}}),
+               (200, {"value": {"sessionId": "s2"}}))
+    wda.script("/actions", (404, INVALID_SESSION), (404, INVALID_SESSION))
+    with pytest.raises(mod.MCPToolError) as e:
+        mod.ios_tap(1, 1)
+    assert e.value.error_code == "SESSION_CONTESTED"
+    assert "another client on this phone" in str(e.value)
+    assert sum(1 for _, p, _ in wda.calls if p == "/session") == 2
+
+
+def test_session_post_recreates_on_an_older_builds_bare_404(mod, wda):
+    """Older WDA builds answer a dead session with a bare 404 body, not a W3C
+    error. They still get the old recreate-once, so they still recover."""
+    wda.script("/session", (200, {"value": {"sessionId": "s1"}}),
+               (200, {"value": {"sessionId": "s2"}}))
+    wda.script("/actions", (404, {"value": "no such session"}), (200, {"value": {}}))
+    mod._session_post("/actions", {"actions": []})
     assert mod._session["id"] == "s2"
 
 
@@ -328,7 +368,12 @@ def test_status_summarizes(mod, wda):
         "os": {"version": "17.4"}, "device": "iPhone"}}))
     out = json.loads(mod.ios_status())
     assert out == {"ready": True, "message": "ok", "ios": "17.4", "device": "iPhone",
-                   "server_version": mod.__version__}
+                   "server_version": mod.__version__,
+                   "script_path": os.path.realpath(mod.__file__),
+                   "target": "device", "wda_endpoint": mod.WDA,
+                   "selected_udid": os.environ.get("IMIRROR_UDID"), "leases": "on",
+                   "lease": {"state": "free", "holder": None, "queue": 0,
+                             "your_position": None}}
 
 
 def test_source_xml_format_truncates_large_output(mod, wda):
@@ -438,6 +483,7 @@ def test_source_text_caps_by_element_count(mod, wda, monkeypatch):
     """Output is capped by ELEMENT COUNT (400), with a trailing line reporting
     exactly how many elements were dropped — after parsing the FULL tree."""
     monkeypatch.setattr(mod, "_win_size", lambda: (400.0, 800.0))
+    monkeypatch.setattr(mod, "_SOURCE_MAX_TEXT_CHARS", 100000)
     n = mod._SOURCE_MAX_ELEMENTS + 50
     tree = {
         "type": "Application",
@@ -452,7 +498,7 @@ def test_source_text_caps_by_element_count(mod, wda, monkeypatch):
     lines = out.splitlines()
     element_lines = [l for l in lines if l.strip().startswith("Button")]
     assert len(element_lines) == mod._SOURCE_MAX_ELEMENTS
-    assert lines[-1] == "… (50 elements dropped; refine with a more specific screen)"
+    assert lines[-1] == "… (50 elements dropped; use ios_source(format='xml') for more detail.)"
 
 
 # ---- ios_await_idle (settle detection) ------------------------------------------
@@ -753,16 +799,25 @@ def test_screenshot_device_never_calls_simctl(mod, wda, monkeypatch):
 
 def test_screenshot_first_call_applies_quality(mod, wda):
     """Fable risk #1 regression guard: quality must be applied even when a
-    screenshot is the very first tool call of a session."""
+    screenshot is the very first tool call of a session. It goes through the
+    session already on the phone: creating one would kill another client's."""
     import base64
     assert mod._session["id"] is None
-    wda.script("/session", (200, {"value": {"sessionId": "s"}}))
+    wda.script("/status", (200, {"value": {"ready": True}, "sessionId": "theirs"}))
     png = b"\x89PNG\r\n\x1a\nfake"
     wda.script("/screenshot", (200, {"value": base64.b64encode(png).decode()}))
     mod.ios_screenshot()
-    assert any(p == "/session" for m, p, _ in wda.calls)
-    bodies = [b for m, p, b in wda.calls if p.endswith("/appium/settings")]
+    assert not any(p == "/session" for m, p, _ in wda.calls)
+    bodies = [b for m, p, b in wda.calls if p == "/session/theirs/appium/settings"]
     assert any("screenshotQuality" in b["settings"] for b in bodies)
+
+
+def test_screenshot_with_no_session_on_the_phone_creates_none(mod, wda):
+    import base64
+    png = b"\x89PNG\r\n\x1a\nfake"
+    wda.script("/screenshot", (200, {"value": base64.b64encode(png).decode()}))
+    assert mod.ios_screenshot().data == png
+    assert [p for _, p, _ in wda.calls] == ["/status", "/screenshot"]
 
 
 # ---- gestures ------------------------------------------------------------------
@@ -1755,6 +1810,8 @@ def test_gesture_timeout_does_not_retry(mod, monkeypatch):
     action_calls = []
 
     def fake_http(method, path, data, timeout):
+        if path == "/status":
+            return 200, b'{"value": {"ready": true}, "sessionId": null}'
         if path.endswith("/session"):
             return 200, b'{"value": {"sessionId": "s1"}}'
         if path.endswith("/appium/settings"):
@@ -2023,8 +2080,10 @@ def test_install_app_invokes_go_ios(mod, monkeypatch, tmp_path):
         class R: returncode = 0; stderr = ""
         return R()
     monkeypatch.setattr(mod.subprocess, "run", fake_run)
+    monkeypatch.setattr(mod._LEGACY, "udid", "00008140-0006423002D3401C")  # IMIRROR_UDID
     out = mod.ios_install_app(str(ipa))
     assert seen["args"][1] == "install" and f"--path={ipa}" in seen["args"]
+    assert "--udid=00008140-0006423002D3401C" in seen["args"]
     assert "installed" in out
 
 
@@ -2039,6 +2098,7 @@ def test_install_app_reports_go_ios_failure(mod, monkeypatch, tmp_path):
     def boom(args, **kw):
         raise subprocess.CalledProcessError(1, args, stderr="device locked")
     monkeypatch.setattr(mod.subprocess, "run", boom)
+    monkeypatch.setattr(mod._LEGACY, "udid", "00008140-0006423002D3401C")  # IMIRROR_UDID
     with pytest.raises(RuntimeError, match="install failed: device locked"):
         mod.ios_install_app(str(ipa))
 
@@ -2701,3 +2761,311 @@ def test_not_found_scroll_to_raises_mcp_tool_error(mod, monkeypatch):
     with pytest.raises(mod.MCPToolError, match="not found after 3 swipes") as exc_info:
         mod.ios_scroll_to("Ghost", max_swipes=3)
     assert exc_info.value.error_kind == "not_found"
+
+
+# ---- upstream port: OUTCOME_UNKNOWN (a lost reply is never sent again) ------------
+
+@pytest.mark.parametrize("failure", ["timeout", "oserror", "reset"])
+def test_typing_ambiguous_transport_failures_are_unknown_without_replay(mod, monkeypatch,
+                                                                       failure):
+    import socket
+    mod._session["id"] = "live"
+    failures = {"timeout": socket.timeout("timed out"),
+                "oserror": OSError("socket write failed"),
+                "reset": ConnectionResetError("reset after typing")}
+    calls = []
+
+    def interrupted(method, path, data, timeout):
+        calls.append(path)
+        raise failures[failure]
+    monkeypatch.setattr(mod, "_http", interrupted)
+    with pytest.raises(mod.MCPToolError) as error:
+        mod.ios_type("hello")
+    assert error.value.error_kind == mod.ErrorKind.OUTCOME_UNKNOWN
+    assert error.value.__cause__ is failures[failure]
+    assert "kind=outcome_unknown" in str(error.value)
+    assert calls == ["/session/live/wda/keys"]
+
+
+@pytest.mark.parametrize("method,path", [("GET", "/source"),
+                                         ("POST", "/session/live/element"),
+                                         ("POST", "/session/live/elements")])
+def test_read_only_timeout_keeps_wedged_classification(mod, monkeypatch, method, path):
+    import socket
+    calls = []
+
+    def slow(*args):
+        calls.append(args)
+        raise socket.timeout("timed out")
+    monkeypatch.setattr(mod, "_http", slow)
+    with pytest.raises(mod.MCPToolError) as error:
+        mod._req(method, path, timeout=mod._TIMEOUT_PROBE)
+    assert error.value.error_kind == mod.ErrorKind.WEDGED
+    assert len(calls) == 1
+
+
+def test_typing_connection_refused_is_unreachable_without_replay(mod, monkeypatch):
+    mod._session["id"] = "live"
+    calls = []
+
+    def refused(*args):
+        calls.append(args)
+        raise ConnectionRefusedError("connection refused before send")
+    monkeypatch.setattr(mod, "_http", refused)
+    with pytest.raises(mod.MCPToolError) as error:
+        mod.ios_type("hello")
+    assert error.value.error_kind == mod.ErrorKind.UNREACHABLE
+    assert len(calls) == 1
+
+
+@pytest.mark.parametrize("path", ["/session/live/element/button/click",
+                                  "/session/live/elements/extra", "/session/live/elemental",
+                                  "/session/live/wda/apps/launch", "/sessions"])
+def test_element_read_allowlist_does_not_replay_adjacent_mutation_routes(mod, monkeypatch,
+                                                                        path):
+    import http.client
+    calls = []
+
+    def lost(*args):
+        calls.append(args)
+        raise http.client.RemoteDisconnected("response lost")
+    monkeypatch.setattr(mod, "_http", lost)
+    with pytest.raises(mod.MCPToolError) as error:
+        mod._req("POST", path, {})
+    assert error.value.error_kind == mod.ErrorKind.OUTCOME_UNKNOWN
+    assert len(calls) == 1
+
+
+@pytest.mark.parametrize("path", ["/session", "/session/live/element",
+                                  "/session/live/wda/apps/state",
+                                  "/session/live/wda/getPasteboard",
+                                  "/session/live/appium/settings"])
+def test_posts_that_change_nothing_are_still_retried(mod, monkeypatch, path):
+    import http.client
+    calls = []
+
+    def stale_then_ok(*args):
+        calls.append(args)
+        if len(calls) == 1:
+            raise http.client.RemoteDisconnected("stale keepalive")
+        return 200, b'{"value": {}}'
+    monkeypatch.setattr(mod, "_http", stale_then_ok)
+    assert mod._req("POST", path, {})[0] == 200
+    assert len(calls) == 2
+
+
+def test_a_change_that_never_left_is_sent_again(mod, monkeypatch):
+    """The one exception: _http marks a failure before the first byte left.
+    WDA cannot have seen that request, so sending it again is safe."""
+    mod._session["id"] = "live"
+    calls = []
+
+    def unsent_then_ok(method, path, data, timeout):
+        calls.append(path)
+        if len(calls) == 1:
+            e = BrokenPipeError("peer gone")
+            e.imirror_unsent = True
+            raise e
+        return 200, b'{"value": null}'
+    monkeypatch.setattr(mod, "_http", unsent_then_ok)
+    assert mod.ios_type("hi") == "typed 2 char(s)"
+    assert calls == ["/session/live/wda/keys"] * 2
+
+
+def test_a_timeout_before_anything_left_is_wedged_not_unknown(mod, monkeypatch):
+    import socket
+    mod._session["id"] = "live"
+
+    def connect_timeout(*args):
+        e = socket.timeout("connect timed out")
+        e.imirror_unsent = True
+        raise e
+    monkeypatch.setattr(mod, "_http", connect_timeout)
+    with pytest.raises(mod.MCPToolError) as error:
+        mod.ios_type("hi")
+    assert error.value.error_kind == mod.ErrorKind.WEDGED
+
+
+def test_wait_for_retries_read_only_element_post_on_stale_keepalive(mod, monkeypatch):
+    import http.client
+    mod._session["id"] = "live"
+    calls = []
+
+    def stale_then_found(method, path, data, timeout):
+        calls.append((method, path, timeout))
+        if len(calls) == 1:
+            raise http.client.RemoteDisconnected("stale keepalive")
+        return 200, b'{"value":{"ELEMENT":"visible-button"}}'
+    monkeypatch.setattr(mod, "_http", stale_then_found)
+    assert "Ready" in mod.ios_wait_for("Ready", timeout_s=1)
+    assert calls == [("POST", "/session/live/element", mod._TIMEOUT_PROBE)] * 2
+
+
+# ---- upstream port: ios_alert -----------------------------------------------------
+
+def test_alert_reads_text_buttons_without_recording(mod, wda, monkeypatch):
+    mod._session["id"] = "live"
+    monkeypatch.setattr(mod, "_record",
+                        lambda *a, **kw: pytest.fail("alert content must not be recorded"))
+    wda.script("/alert/text", (200, {"value": "Example verification prompt"}))
+    wda.script("/wda/alert/buttons", (200, {"value": ["Not Now", "Continue"]}))
+    assert json.loads(mod.ios_alert()) == {
+        "present": True, "text": "Example verification prompt",
+        "buttons": ["Not Now", "Continue"]}
+
+
+@pytest.mark.parametrize("action", ["get", "accept", "dismiss"])
+def test_alert_missing_is_normal_result(mod, wda, action):
+    mod._session["id"] = "live"
+    route = "/alert/text" if action == "get" else "/alert/" + action
+    wda.script(route, (404, {"value": {"error": "no such alert", "message": "",
+                                       "traceback": ""}, "sessionId": "live"}))
+    assert json.loads(mod.ios_alert(action=action))["present"] is False
+    assert mod._session["id"] == "live"
+    assert len(wda.calls) == 1
+
+
+@pytest.mark.parametrize("action,label", [("bogus", ""), ("get", "Continue")])
+def test_alert_validates_before_http(mod, monkeypatch, action, label):
+    monkeypatch.setattr(mod, "_req", lambda *a, **kw: pytest.fail("validation must precede HTTP"))
+    with pytest.raises(mod.MCPToolError, match="action|button_label"):
+        mod.ios_alert(action=action, button_label=label)
+
+
+def test_alert_named_dismiss_uses_exact_button(mod, wda):
+    mod._session["id"] = "live"
+    wda.script("/alert/dismiss", (200, {"value": {}}))
+    assert json.loads(mod.ios_alert(action="dismiss", button_label="Not Now")) == {
+        "present": True, "action": "dismiss", "button_label": "Not Now"}
+    assert wda.calls == [("POST", "/session/live/alert/dismiss", {"name": "Not Now"})]
+
+
+def test_alert_failure_is_not_reported_as_absent(mod, wda):
+    mod._session["id"] = "live"
+    wda.script("/alert/text", (500, {"value": {"error": "unknown error",
+                                               "message": "private"}}))
+    with pytest.raises(mod.MCPToolError, match="HTTP 500") as failure:
+        mod.ios_alert()
+    assert "private" not in str(failure.value)
+
+
+def test_alert_mutation_response_loss_is_not_replayed(mod, monkeypatch):
+    import http.client
+    mod._session["id"] = "live"
+    calls = []
+
+    def lost(method, path, body, timeout):
+        calls.append(path)
+        raise http.client.RemoteDisconnected("response lost")
+    monkeypatch.setattr(mod, "_http", lost)
+    with pytest.raises(mod.MCPToolError, match="Outcome unknown") as error:
+        mod.ios_alert(action="dismiss", button_label="Not Now")
+    assert error.value.error_kind == mod.ErrorKind.OUTCOME_UNKNOWN
+    assert calls == ["/session/live/alert/dismiss"]
+
+
+def test_alert_default_accept_payload_is_empty(mod, wda):
+    mod._session["id"] = "live"
+    wda.script("/alert/accept", (200, {"value": {}}))
+    assert json.loads(mod.ios_alert(action="accept"))["action"] == "accept"
+    assert wda.calls == [("POST", "/session/live/alert/accept", {})]
+
+
+def test_alert_error_during_active_run_does_not_record_private_message(mod, wda,
+                                                                       monkeypatch):
+    mod._session["id"] = "live"
+    mod._run["active"] = True
+    monkeypatch.setattr(mod, "_record", lambda *a, **kw: pytest.fail("must not record alert errors"))
+    wda.script("/alert/dismiss", (400, {"value": {"error": "invalid element state",
+                                                  "message": "private alert contents"}}))
+    try:
+        with pytest.raises(mod.MCPToolError, match="HTTP 400") as failure:
+            mod.ios_alert(action="dismiss", button_label="Missing")
+        assert "private" not in str(failure.value)
+    finally:
+        mod._run["active"] = False
+
+
+def test_alert_accept_records_the_button_not_the_text(mod, wda, monkeypatch):
+    mod._session["id"] = "live"
+    steps = []
+    monkeypatch.setattr(mod, "_record", lambda *a, **kw: steps.append(a))
+    wda.script("/alert/accept", (200, {"value": {}}))
+    mod.ios_alert(action="accept", button_label="Allow")
+    assert steps == [("alert", "accept 'Allow'")]
+
+
+# ---- upstream port: source caps -----------------------------------------------------
+
+def test_source_text_huge_label_has_explicit_bounded_truncation(mod, monkeypatch):
+    monkeypatch.setattr(mod, "_win_size", lambda: (400, 800))
+    text = mod._render_source_text(dict(type="Button", label="x" * 1000000,
+                                        visible=True, hittable=True, rect=(0, 0, 100, 100)))
+    assert len(text) < 2000
+    assert "truncated" in text
+    assert "ios_source(format='xml')" in text
+    assert "[visible,hittable]" in text
+    assert "norm=" in text
+
+
+def test_source_text_total_budget_preserves_complete_element_lines(mod, monkeypatch):
+    monkeypatch.setattr(mod, "_win_size", lambda: (400, 800))
+    children = [dict(type="Button", label=f"{i}:" + "x" * 230,
+                     name="distinct-name", value="distinct-value", identifier="distinct-id",
+                     visible=True, hittable=True, rect=(0, 0, 100, 100), children=[])
+                for i in range(500)]
+    text = mod._render_source_text(dict(type="Other", children=children))
+    assert len(text) <= 20000
+    assert "elements dropped" in text
+    assert "ios_source(format='xml')" in text
+    for line in text.splitlines()[1:-1]:
+        assert "[visible,hittable]" in line
+        assert line.endswith("norm=(0.000,0.000,0.250,0.125)")
+
+
+def test_source_text_keeps_a_multiline_label_on_one_line_and_skips_repeats(mod, monkeypatch):
+    monkeypatch.setattr(mod, "_win_size", lambda: (400, 800))
+    text = mod._render_source_text(dict(type="Button", label="Two\nlines", name="Two\nlines",
+                                        rect=(0, 0, 100, 100)))
+    line = text.splitlines()[1]
+    assert line.startswith('Button label="Two\\nlines"')
+    assert "name=" not in line
+
+
+# ---- upstream port: snapshotMaxDepth, opt-in ---------------------------------------
+
+def test_snapshot_depth_is_left_to_wda_by_default(mod, wda, monkeypatch):
+    monkeypatch.delenv("IMIRROR_SNAPSHOT_MAX_DEPTH", raising=False)
+    wda.script("/session", (200, {"value": {"sessionId": "s1"}}))
+    mod._ensure_session()
+    sent = [b for m, p, b in wda.calls if p.endswith("/appium/settings")]
+    assert sent and not any("snapshotMaxDepth" in b["settings"] for b in sent)
+
+
+@pytest.mark.parametrize("raw,depth", [("30", 30), ("0", None), ("abc", None), ("500", None)])
+def test_snapshot_depth_is_sent_only_when_configured(mod, wda, monkeypatch, raw, depth):
+    monkeypatch.setenv("IMIRROR_SNAPSHOT_MAX_DEPTH", raw)
+    wda.script("/session", (200, {"value": {"sessionId": "s1"}}))
+    mod._ensure_session()
+    got = [b["settings"]["snapshotMaxDepth"] for m, p, b in wda.calls
+           if p.endswith("/appium/settings") and "snapshotMaxDepth" in b["settings"]]
+    assert got == ([depth] if depth else [])
+
+
+# ---- upstream port: no __pycache__ inside the signed app ------------------------------
+
+def test_importing_the_server_writes_no_bytecode_next_to_it(tmp_path):
+    """The bundled server lives in the app's sealed Resources. A __pycache__
+    written there on first import breaks the app's code signature."""
+    import shutil
+    import subprocess
+    here = os.path.dirname(os.path.abspath(__file__))
+    for name in ("imirror_mcp.py", "sim_control.py", "wda_bringup.py", "devicelease.py"):
+        shutil.copy(os.path.join(here, name), tmp_path / name)
+    env = {k: v for k, v in os.environ.items() if k != "PYTHONDONTWRITEBYTECODE"}
+    env.update(IMIRROR_WDA="http://127.0.0.1:8100")
+    # Run as a script, like the app: only imports cache.
+    load = "import runpy; runpy.run_path('imirror_mcp.py', run_name='check')"
+    subprocess.run([sys.executable, "-c", load], cwd=tmp_path, env=env,
+                   check=True, capture_output=True, timeout=60)
+    assert not (tmp_path / "__pycache__").exists()

@@ -21,3 +21,12 @@ public func downsample(_ points: [CGPoint], max: Int) -> [CGPoint] {
     for i in 0..<max { out.append(points[Int((Double(i) * step).rounded())]) }
     return out
 }
+
+/// Did the mirrored picture change shape, so WDA's cached window size may
+/// now be wrong? A rotation changes the frame size. The first frame of a
+/// stream (no previous size) is not a change: connect and the health probe
+/// fetch the size for it.
+public func videoShapeChanged(previous: CGSize?, current: CGSize) -> Bool {
+    guard let previous else { return false }
+    return previous != current
+}

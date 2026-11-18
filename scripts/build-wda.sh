@@ -7,19 +7,21 @@
 # bump is just a re-clone + re-run of this script. Produces one installable .ipa.
 #
 # Requires: Xcode, a connected iPhone (for provisioning), and a PAID Apple Team
-# (DEVELOPMENT_TEAM). Re-signs with your "Apple Development" identity.
+# (DEVELOPMENT_TEAM). Re-signs with the same "Apple Development" certificate
+# Xcode signed the runner with, which belongs to $DEVELOPMENT_TEAM. Set
+# WDA_SIGN_IDENTITY=<sha1> to choose one; the team check still applies.
 #
 #   DEVELOPMENT_TEAM=<TEAMID> ./scripts/build-wda.sh
-#   tools/go-ios/bin/ios install --path=build/WebDriverAgent.ipa
+#   tools/go-ios/bin/ios install --udid=<UDID> --path=build/WebDriverAgent.ipa
 set -euo pipefail
 
 # Emits a single "IPHONEOS_DEPLOYMENT_TARGET=<v>" build-setting arg on stdout,
 # or nothing. Additive: only overrides when the active SDK's own minimum
-# deployment target is above WebDriverAgent's pinned 12.0 floor, so older
-# Xcode (whose floor is <= 12.0) is left exactly as before. Set
-# WDA_DEPLOYMENT_TARGET to force a specific value (e.g. 12.0 to opt out).
+# deployment target meets WebDriverAgent's 15.0 floor, so older Xcode
+# (whose floor is < 15.0) is left exactly as before. Set
+# WDA_DEPLOYMENT_TARGET to force a specific value (e.g. 15.0 to opt out).
 wda_deployment_setting() {  # $1 = sdk name: iphonesimulator | iphoneos
-    local sdk="$1" proj_floor="12.0" sdk_min sdkpath plist lowest
+    local sdk="$1" proj_floor="15.0" sdk_min sdkpath plist lowest
     if [[ -n "${WDA_DEPLOYMENT_TARGET:-}" ]]; then
         echo "IPHONEOS_DEPLOYMENT_TARGET=${WDA_DEPLOYMENT_TARGET}"; return 0
     fi
@@ -29,24 +31,76 @@ wda_deployment_setting() {  # $1 = sdk name: iphonesimulator | iphoneos
     sdk_min="$(/usr/libexec/PlistBuddy -c "Print :SupportedTargets:$sdk:MinimumDeploymentTarget" "$plist" 2>/dev/null)" || return 0
     [[ -n "$sdk_min" ]] || return 0
     lowest="$(printf '%s\n%s\n' "$proj_floor" "$sdk_min" | sort -V | head -1)"
-    if [[ "$sdk_min" != "$proj_floor" && "$lowest" == "$proj_floor" ]]; then
+    # Vendored targets may say 12.0; override at 15.0 too.
+    if [[ "$lowest" == "$proj_floor" ]]; then
         echo "IPHONEOS_DEPLOYMENT_TARGET=$sdk_min"
     fi
     return 0
 }
+# The TeamIdentifier codesign reports for $1, or nothing.
+wda_team_of() {
+    { codesign -dvv "$1" 2>&1 || true; } | awk -F= '$1 == "TeamIdentifier" { print $2 }'
+}
+
+# SHA-1 of the certificate that signed $1. $2 is a scratch dir, since
+# --extract-certificates writes codesign0.. into the current directory.
+wda_signer_sha1() {
+    ( cd "$2" && rm -f codesign0 codesign1 codesign2 \
+        && codesign -d --extract-certificates "$1" ) >/dev/null 2>&1 || return 1
+    [[ -f "$2/codesign0" ]] || return 1
+    openssl x509 -inform DER -in "$2/codesign0" -noout -fingerprint -sha1 2>/dev/null \
+        | sed 's/.*=//; s/://g' | tr 'a-f' 'A-F'
+}
+
+# Every "Apple Development" identity in the keychain, one SHA-1 per line.
+wda_dev_identities() {
+    security find-identity -v -p codesigning | grep 'Apple Development' \
+        | grep -oE '[0-9A-F]{40}' || true
+}
+
+# The identity to re-sign with. A Mac with two "Apple Development" identities
+# made grep -m1 pick the wrong team, and installs failed with 0xe8008015.
+# $1 runner, $2 scratch dir, $3 wanted team.
+wda_pick_identity() {
+    local runner="$1" scratch="$2" team="$3" id ids probe
+    if [[ -n "${WDA_SIGN_IDENTITY:-}" ]]; then
+        echo "$WDA_SIGN_IDENTITY"; return 0
+    fi
+    ids="$(wda_dev_identities)"
+    id="$(wda_signer_sha1 "$runner" "$scratch" || true)"
+    if [[ -n "$id" ]] && grep -qx "$id" <<<"$ids"; then
+        echo "$id"; return 0
+    fi
+    # Not in the keychain: find the team by test-signing.
+    probe="$scratch/team-probe"
+    for id in $ids; do
+        cp /usr/bin/true "$probe"
+        codesign --force --sign "$id" "$probe" >/dev/null 2>&1 || continue
+        if [[ "$(wda_team_of "$probe")" == "$team" ]]; then
+            echo "$id"; return 0
+        fi
+    done
+    return 1
+}
+
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-PROJ="$ROOT/tools/WebDriverAgent/WebDriverAgent.xcodeproj"
+WDA_SRC="$ROOT/tools/WebDriverAgent"
+PROJ="$WDA_SRC/WebDriverAgent.xcodeproj"
+source "$ROOT/scripts/lib/wda-patches.sh"
 : "${DEVELOPMENT_TEAM:?set DEVELOPMENT_TEAM to your paid Apple Team id}"
 DERIVED="$ROOT/build/wda-derived"
 BUNDLE_ID="com.local.imirror.WebDriverAgentRunner"
 DISPLAY_NAME="iMirror"
 
 # Additive Xcode-27 accommodation: only set when the device SDK's own
-# minimum deployment target exceeds WDA's pinned 12.0 (see
+# minimum deployment target meets WDA's 15.0 (see
 # wda_deployment_setting above). Empty on older Xcode, so nothing changes.
 depset=()
 dep_setting="$(wda_deployment_setting iphoneos)"
 [[ -n "$dep_setting" ]] && depset=("$dep_setting")
+
+echo "==> patching WebDriverAgent so typed text is redacted"
+wda_patch_redact_typing "$WDA_SRC" || exit 1
 
 echo "==> building rebranded WebDriverAgentRunner (bundle id $BUNDLE_ID)"
 # Xcode-26 build accommodations for the vendored WDA:
@@ -94,7 +148,7 @@ cat > "$ICONSET/Contents.json" <<'JSON'
   "info":{"author":"xcode","version":1} }
 JSON
 xcrun actool "$ROOT/build/AppIcon.xcassets" --compile "$ASSETS" \
-  --platform iphoneos --minimum-deployment-target 12.0 --app-icon AppIcon \
+  --platform iphoneos --minimum-deployment-target 15.0 --app-icon AppIcon \
   --output-partial-info-plist "$ASSETS/partial.plist" >/dev/null
 
 # Preserve the runner's entitlements (get-task-allow etc.) across the re-sign —
@@ -107,13 +161,38 @@ cp "$ASSETS/Assets.car" "$RUNNER/Assets.car"
 cp "$ASSETS"/AppIcon*.png "$RUNNER/" 2>/dev/null || true
 /usr/libexec/PlistBuddy -c "Add :CFBundleDisplayName string $DISPLAY_NAME" "$RUNNER/Info.plist" 2>/dev/null \
   || /usr/libexec/PlistBuddy -c "Set :CFBundleDisplayName $DISPLAY_NAME" "$RUNNER/Info.plist"
-/usr/libexec/PlistBuddy -c "Merge $ASSETS/partial.plist" "$RUNNER/Info.plist"
+# Stamp the WDA release; the app upgrades older runners.
+WDA_VERSION="$(/usr/bin/plutil -extract version raw "$WDA_SRC/package.json" 2>/dev/null || true)"
+[[ -n "$WDA_VERSION" ]] || { echo "could not read the WDA version from $WDA_SRC/package.json" >&2; exit 1; }
+/usr/libexec/PlistBuddy -c "Set :CFBundleShortVersionString $WDA_VERSION" "$RUNNER/Info.plist" 2>/dev/null \
+  || /usr/libexec/PlistBuddy -c "Add :CFBundleShortVersionString string $WDA_VERSION" "$RUNNER/Info.plist"
+/usr/libexec/PlistBuddy -c "Set :CFBundleVersion $WDA_VERSION" "$RUNNER/Info.plist" 2>/dev/null \
+  || /usr/libexec/PlistBuddy -c "Add :CFBundleVersion string $WDA_VERSION" "$RUNNER/Info.plist"
+/usr/libexec/PlistBuddy -c "Merge '$ASSETS/partial.plist'" "$RUNNER/Info.plist"
 
-# Re-sign with the same Apple Development identity + preserved entitlements.
-SIGNID="$(security find-identity -v -p codesigning | grep -m1 'Apple Development' | grep -oE '[0-9A-F]{40}')"
-[[ -n "$SIGNID" ]] || { echo "no 'Apple Development' signing identity found" >&2; exit 1; }
+# Re-sign with Xcode's identity: nested code first, runner last.
+SIGNID="$(wda_pick_identity "$RUNNER" "$ASSETS" "$DEVELOPMENT_TEAM" || true)"
+[[ -n "$SIGNID" ]] || { echo "no 'Apple Development' identity for team $DEVELOPMENT_TEAM found" >&2; exit 1; }
+echo "    signing identity $SIGNID"
+shopt -s nullglob
+for nested in "$RUNNER"/PlugIns/*.xctest/Frameworks/* "$RUNNER"/PlugIns/*.xctest \
+              "$RUNNER"/Frameworks/*; do
+    codesign --force --sign "$SIGNID" --preserve-metadata=identifier,entitlements "$nested"
+done
+shopt -u nullglob
 codesign --force --sign "$SIGNID" --entitlements "$ASSETS/ent.plist" "$RUNNER"
 codesign --verify --deep --strict "$RUNNER"
+
+# The runner and its test bundle must both carry the team, or iOS refuses
+# the install. --verify does not check which team signed.
+for signed in "$RUNNER" "$RUNNER"/PlugIns/*.xctest; do
+    got="$(wda_team_of "$signed")"
+    if [[ "$got" != "$DEVELOPMENT_TEAM" ]]; then
+        echo "signed with the wrong team: $signed has TeamIdentifier=${got:-none}," >&2
+        echo "but DEVELOPMENT_TEAM is $DEVELOPMENT_TEAM (identity $SIGNID)." >&2
+        exit 1
+    fi
+done
 
 # Package the runner .app into an installable .ipa (Payload/<App> then zip).
 rm -rf "$ROOT/build/Payload" "$ROOT/build/WebDriverAgent.ipa"
@@ -121,4 +200,4 @@ mkdir -p "$ROOT/build/Payload"
 cp -R "$RUNNER" "$ROOT/build/Payload/"
 ( cd "$ROOT/build" && zip -qr WebDriverAgent.ipa Payload )
 rm -rf "$ROOT/build/Payload"
-echo "==> ipa: $ROOT/build/WebDriverAgent.ipa  (id ${BUNDLE_ID}.xctrunner, name '$DISPLAY_NAME', branded icon)"
+echo "==> ipa: $ROOT/build/WebDriverAgent.ipa  (id ${BUNDLE_ID}.xctrunner, name '$DISPLAY_NAME', branded icon, WDA $WDA_VERSION)"

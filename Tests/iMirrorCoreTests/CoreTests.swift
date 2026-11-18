@@ -125,6 +125,79 @@ final class RunnerInstallTests: XCTestCase {
         XCTAssertFalse(shouldSpawnRunwda(after: .failed(.deviceLocked(raw: "x"))))
         XCTAssertFalse(shouldSpawnRunwda(after: .failed(.other(raw: "x"))))
     }
+
+    // MARK: Runner upgrade
+
+    private let runner = "com.local.imirror.WebDriverAgentRunner.xctrunner"
+
+    /// `ios apps --list` in go-ios v1.3.2 prints "%s %s %s\n": bundle id,
+    /// CFBundleName, CFBundleShortVersionString (main.go, appsList).
+    func testRunnerVersionFromGoIOS132AppsList() {
+        let list = """
+        com.apple.TestFlight TestFlight 4.0.2
+        com.local.imirror.WebDriverAgentRunner Old 9.9.0
+        \(runner) WebDriverAgentRunner-Runner 16.14.2
+        """
+        XCTAssertEqual(runnerVersion(inAppsList: list, bundleId: runner), "16.14.2")
+    }
+
+    func testRunnerVersionIsTheLastFieldEvenWhenTheNameHasSpaces() {
+        XCTAssertEqual(runnerVersion(inAppsList: "\(runner) iMirror Runner 1.0", bundleId: runner), "1.0")
+        // An empty version after a spaced name is "", not the name's last word.
+        XCTAssertEqual(runnerVersion(inAppsList: "\(runner) iMirror Runner \n", bundleId: runner), "")
+        XCTAssertEqual(runnerVersion(inAppsList: "\(runner)", bundleId: runner), "")
+    }
+
+    func testRunnerVersionIsNilWhenNotListed() {
+        XCTAssertNil(runnerVersion(inAppsList: "", bundleId: runner))
+        // A prefix of another id does not count.
+        XCTAssertNil(runnerVersion(inAppsList: "\(runner).other X 1.0", bundleId: runner))
+        XCTAssertNil(runnerVersion(inAppsList: "com.local.imirror.WebDriverAgentRunner X 1.0", bundleId: runner))
+    }
+
+    func testRunnerAction() {
+        XCTAssertEqual(runnerAction(installed: nil, bundled: "16.14.2"), .install)
+        XCTAssertEqual(runnerAction(installed: nil, bundled: nil), .install)
+        // The unstamped v9.9.0 runner reports Xcode's default "1.0".
+        XCTAssertEqual(runnerAction(installed: "1.0", bundled: "16.14.2"), .upgrade)
+        XCTAssertEqual(runnerAction(installed: "", bundled: "16.14.2"), .upgrade)
+        XCTAssertEqual(runnerAction(installed: "16.14.2", bundled: "16.14.2"), .keep)
+        XCTAssertEqual(runnerAction(installed: "17.0.0", bundled: "16.14.2"), .keep)   // never downgrade
+        XCTAssertEqual(runnerAction(installed: "1.0", bundled: nil), .keep)
+        XCTAssertEqual(runnerAction(installed: "1.0", bundled: ""), .keep)
+    }
+
+    func testAFailedUpgradeIsNotRetriedOnTheSameChain() {
+        XCTAssertEqual(runnerAction(installed: "1.0", bundled: "16.14.2", failedUpgradeTo: "16.14.2"), .keep)
+        // A newer bundle is a new attempt.
+        XCTAssertEqual(runnerAction(installed: "1.0", bundled: "16.15.0", failedUpgradeTo: "16.14.2"), .upgrade)
+        // A missing runner is installed whatever failed before.
+        XCTAssertEqual(runnerAction(installed: nil, bundled: "16.14.2", failedUpgradeTo: "16.14.2"), .install)
+    }
+
+    func testIsVersionOlderThan() {
+        XCTAssertTrue(isVersion("1.0", olderThan: "16.14.2"))
+        XCTAssertTrue(isVersion("9.9", olderThan: "10.0"))
+        XCTAssertTrue(isVersion("16.14.1", olderThan: "16.14.2"))
+        XCTAssertFalse(isVersion("16.14.2", olderThan: "16.14.2.0"))
+        XCTAssertFalse(isVersion("16.14.2.0", olderThan: "16.14.2"))
+        XCTAssertTrue(isVersion("", olderThan: "1"))
+        XCTAssertFalse(isVersion("1", olderThan: ""))
+        XCTAssertTrue(isVersion("1.x", olderThan: "1.1"))
+    }
+
+    func testAFailedUpgradeKeepsTheOldRunner() {
+        XCTAssertEqual(upgradeResult(.failed(.deviceLocked(raw: "locked"))), .alreadyPresent)
+        XCTAssertEqual(upgradeResult(.failed(.other(raw: "x"))), .alreadyPresent)
+        XCTAssertEqual(upgradeResult(.installed), .installed)
+        XCTAssertTrue(shouldSpawnRunwda(after: upgradeResult(.failed(.notProvisioned(raw: "x")))))
+    }
+
+    func testInstallErrorRaw() {
+        XCTAssertEqual(RunnerInstallError.notProvisioned(raw: "a").raw, "a")
+        XCTAssertEqual(RunnerInstallError.deviceLocked(raw: "b").raw, "b")
+        XCTAssertEqual(RunnerInstallError.other(raw: "c").raw, "c")
+    }
 }
 
 final class MCPConfigTests: XCTestCase {
@@ -605,29 +678,45 @@ final class ChainRecoveryGraceSecTests: XCTestCase {
     }
 }
 
+/// The video watchdog used to restart the chain, then hard-stop it, while
+/// WDA itself was fine and agents were driving it.
 final class MjpegRecoveryActionTests: XCTestCase {
+    private func action(noFrame: TimeInterval, sinceBounce: TimeInterval? = nil,
+                        answers: Bool = true) -> MjpegRecoveryAction {
+        nextMjpegRecoveryAction(noFrameForSec: noFrame, sinceBounceSec: sinceBounce,
+                                statusAnswers: answers, thresholdSec: 20)
+    }
+
     func testBelowThresholdWaits() {
-        XCTAssertEqual(nextMjpegRecoveryAction(noFrameForSec: 19.9, alreadyBounced: false, thresholdSec: 20), .wait)
+        XCTAssertEqual(action(noFrame: 19.9), .wait)
     }
 
-    func testBelowThresholdWaitsEvenAlreadyBounced() {
-        XCTAssertEqual(nextMjpegRecoveryAction(noFrameForSec: 5, alreadyBounced: true, thresholdSec: 20), .wait)
+    func testAtThresholdBouncesTheForward() {
+        XCTAssertEqual(action(noFrame: 20), .bounceForward)
+        XCTAssertEqual(action(noFrame: 45), .bounceForward)
     }
 
-    func testAtThresholdNotYetBouncedBouncesForward() {
-        XCTAssertEqual(nextMjpegRecoveryAction(noFrameForSec: 20, alreadyBounced: false, thresholdSec: 20), .bounceForward)
+    func testDoesNothingWhileStatusDoesNotAnswer() {
+        // The ladder owns a WDA that doesn't answer.
+        XCTAssertEqual(action(noFrame: 600, answers: false), .wait)
     }
 
-    func testAboveThresholdNotYetBouncedBouncesForward() {
-        XCTAssertEqual(nextMjpegRecoveryAction(noFrameForSec: 45, alreadyBounced: false, thresholdSec: 20), .bounceForward)
+    func testRebouncesAtMostOncePerInterval() {
+        XCTAssertEqual(action(noFrame: 79, sinceBounce: 59), .wait)
+        XCTAssertEqual(action(noFrame: 80, sinceBounce: 60), .bounceForward)
     }
 
-    func testAtThresholdAlreadyBouncedEscalates() {
-        XCTAssertEqual(nextMjpegRecoveryAction(noFrameForSec: 20, alreadyBounced: true, thresholdSec: 20), .escalate)
-    }
-
-    func testAboveThresholdAlreadyBouncedEscalates() {
-        XCTAssertEqual(nextMjpegRecoveryAction(noFrameForSec: 41, alreadyBounced: true, thresholdSec: 20), .escalate)
+    /// An hour of no video with a healthy /status: only ever bounces.
+    func testALongStallWithAHealthyWDAOnlyEverBounces() {
+        var bouncedAt: TimeInterval?
+        var bounces = 0
+        for t in stride(from: 0.0, through: 3_600, by: 3) {
+            switch action(noFrame: t, sinceBounce: bouncedAt.map { t - $0 }) {
+            case .wait: break
+            case .bounceForward: bounces += 1; bouncedAt = t
+            }
+        }
+        XCTAssertEqual(bounces, 60)
     }
 }
 

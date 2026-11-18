@@ -32,21 +32,21 @@ struct ClaudeDesktopAdapter: MCPClientAdapter {
     func status(_ profile: MCPProfile) -> MCPClientStatus {
         guard let data = try? Data(contentsOf: configURL),
               let entry = MCPConfig.entry(data, name: profile.serverName) else { return .notInstalled }
-        var stale = false
-        if entry.command != MCPPaths.venvPython.path || entry.args.first != MCPPaths.scriptURL()?.path {
-            stale = true
-        }
+        // As in Claude Code: only the frozen copy is current.
+        var stale = entry.command != MCPPaths.venvPython.path
+            || entry.args.first != MCPPaths.registeredScriptURL().path
         if MCPConfig.entryEnv(data, name: profile.serverName) != profile.env { stale = true }
         return stale ? .stale : .installed
     }
 
     func install(_ profile: MCPProfile) throws -> String? {
-        guard detect(), let script = MCPPaths.scriptURL() else { return nil }
+        guard detect() else { return nil }
         do {
             let existing = try? Data(contentsOf: configURL)
             let merged = try MCPConfig.merged(into: existing, name: profile.serverName,
                                               command: MCPPaths.venvPython.path,
-                                              args: [script.path], env: profile.env)
+                                              args: [MCPPaths.registeredScriptURL().path],
+                                              env: profile.env)
             try merged.write(to: configURL)
             return "\(displayName) (restart it)"
         } catch {
