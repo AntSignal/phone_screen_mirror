@@ -64,7 +64,7 @@ public struct DeviceReasonInputs: Equatable, Sendable {
 /// client can act on, or wait out, comes before the generic ones.
 public func deviceReason(_ i: DeviceReasonInputs) -> DeviceReason? {
     if i.ready { return nil }
-    // No runner: nothing else can start until a person installs one.
+    // No runner: nothing starts until a person installs one.
     if i.runnerMissing { return .runnerMissing }
     if let r = i.runwda { return r.reason }   // a person can fix it now
     // A locked phone explains every other symptom below.
