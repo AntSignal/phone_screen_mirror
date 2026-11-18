@@ -28,6 +28,8 @@ public enum DeviceReason: String, CaseIterable, Sendable {
     /// The phone does not trust this Mac ("Trust This Computer"), or the
     /// runner's developer (Settings > General > VPN & Device Management).
     case untrusted
+    /// No runner on the phone and none bundled: a person must install it.
+    case runnerMissing = "runner_missing"
 }
 
 /// What `deviceReason` looks at. The app fills it from its controller.
@@ -45,14 +47,16 @@ public struct DeviceReasonInputs: Equatable, Sendable {
     public var everConnected: Bool
     /// A recent lock probe said the phone is locked (LockProbe.swift).
     public var locked: Bool
+    /// The runner check found no runner and none to install.
+    public var runnerMissing: Bool
 
     public init(ready: Bool, runwda: RunwdaLogClass? = nil, gaveUp: Bool = false, macAsleep: Bool = false, usbReset: Bool = false,
                 tunnelHasDevice: Bool = true, restarting: Bool = false, everConnected: Bool = false,
-                locked: Bool = false) {
+                locked: Bool = false, runnerMissing: Bool = false) {
         self.ready = ready; self.runwda = runwda; self.gaveUp = gaveUp; self.macAsleep = macAsleep
         self.usbReset = usbReset; self.tunnelHasDevice = tunnelHasDevice
         self.restarting = restarting; self.everConnected = everConnected
-        self.locked = locked
+        self.locked = locked; self.runnerMissing = runnerMissing
     }
 }
 
@@ -60,6 +64,8 @@ public struct DeviceReasonInputs: Equatable, Sendable {
 /// client can act on, or wait out, comes before the generic ones.
 public func deviceReason(_ i: DeviceReasonInputs) -> DeviceReason? {
     if i.ready { return nil }
+    // No runner: nothing else can start until a person installs one.
+    if i.runnerMissing { return .runnerMissing }
     if let r = i.runwda { return r.reason }   // a person can fix it now
     // A locked phone explains every other symptom below.
     if i.locked { return .locked }

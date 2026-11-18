@@ -242,7 +242,7 @@ final class DeviceController {
         if (ladder.hardStopped && !locked) || unrecoverable { return .failed }
         switch lastRunnerInstall {
         case .failed(.deviceLocked) where locked: break
-        case .failed: return .failed
+        case .failed, .missing: return .failed
         default: break
         }
         if installingRunner { return .installing }
@@ -257,7 +257,14 @@ final class DeviceController {
         deviceReason(DeviceReasonInputs(
             ready: registryState == .ready, runwda: runwdaClass, gaveUp: ladder.hardStopped, macAsleep: macAsleep,
             usbReset: usbResetPending, tunnelHasDevice: chain == nil || tunnelHasDevice(),
-            restarting: ladder.stage >= 1, everConnected: ladder.hadSuccessfulConnection, locked: isLocked))
+            restarting: ladder.stage >= 1, everConnected: ladder.hadSuccessfulConnection, locked: isLocked,
+            runnerMissing: runnerMissing))
+    }
+
+    /// The last runner check found none on the phone and none to install.
+    private var runnerMissing: Bool {
+        if case .missing? = lastRunnerInstall { return true }
+        return false
     }
 
     /// This phone's devices.json entry. Logs a state event when the state
@@ -393,7 +400,8 @@ final class DeviceController {
         let afterUnlock = ladder.unlockedAt != nil
         let action = ladder.tick(now: ProcessInfo.processInfo.systemUptime,
                                  othersHealthy: othersHealthy(), tunnelHasDevice: tunnelHasDevice(),
-                                 held: chain?.passcodeHeld ?? false, locked: isLocked)
+                                 // Restarts can't install a runner; hold the climb.
+                                 held: (chain?.passcodeHeld ?? false) || runnerMissing, locked: isLocked)
         switch action {
         case .wait:
             break
@@ -584,6 +592,9 @@ final class DeviceController {
                 status("WebDriverAgent installed on \(alias) — starting…")
             case .alreadyPresent, .noBundle:
                 break                           // normal boot; the probe takes over
+            case .missing:
+                // The chain looks again every 30 s by itself.
+                status(runnerMissingMessage(alias: alias, udid: udid))
             case .failed(let err):
                 if case .other(let raw) = err { lastError = String(raw.prefix(200)) }
                 setHealth(.down)
@@ -627,6 +638,7 @@ final class DeviceController {
         case .failed(.notProvisioned): return "WebDriverAgent not signed for this iPhone"
         case .failed(.deviceLocked): return "Unlock the iPhone, then Restart"
         case .failed(.other): return "WebDriverAgent install failed"
+        case .missing: return "No WebDriverAgent on this iPhone — see the status line"
         case .noBundle, nil: return "Starting WebDriverAgent…"
         }
     }

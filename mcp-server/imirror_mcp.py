@@ -674,12 +674,14 @@ _PASSCODE_REASONS = frozenset({"needs_passcode", "locked"})
 
 def _chain_phase(state: str | None, reason: str | None) -> str:
     """What a devices.json entry says about the phone's chain: "ready",
-    "recovering" (worth waiting for), "needs_passcode", "gave_up", or "down"
-    (nothing to wait for). Pure, so every branch is unit-tested. An app
-    without `reason` says "down" while its ladder retries, and "failed" once
-    it stops for good."""
+    "recovering" (worth waiting for), "needs_passcode", "runner_missing",
+    "gave_up", or "down" (nothing to wait for). Pure, so every branch is
+    unit-tested. An app without `reason` says "down" while its ladder
+    retries, and "failed" once it stops for good."""
     if reason in _PASSCODE_REASONS:
         return "needs_passcode"
+    if reason == "runner_missing":
+        return "runner_missing"         # waits for a person, not a restart
     if reason == "gave_up" or state == "failed":
         return "gave_up"
     if state == "ready" and reason is None:
@@ -732,8 +734,19 @@ def _parse_iso(s: str | None) -> datetime | None:
 
 def _chain_error(app: _Target, phase: str, *, idempotent: bool) -> MCPToolError:
     """The error a call gets when the phone is not back: RECOVERING,
-    NEEDS_PASSCODE or DEVICE_GAVE_UP, each with what to do next."""
+    NEEDS_PASSCODE, RUNNER_MISSING or DEVICE_GAVE_UP, each with what to do
+    next."""
     a = app.alias
+    if phase == "runner_missing":
+        u = app.udid or "<udid>"
+        return MCPToolError(
+            f"{a} has no WebDriverAgent runner, and this iMirror build has none to "
+            "install. A person builds and installs it: "
+            f"DEVELOPMENT_TEAM=<team> WDA_DESTINATION=\"id={u}\" ./scripts/build-wda.sh, "
+            f"then tools/go-ios/bin/ios install --udid={u} --path=build/WebDriverAgent.ipa. "
+            "iMirror checks again every 30 s; restarting or recovering it will not help.",
+            kind=ErrorKind.UNREACHABLE, code="RUNNER_MISSING",
+            fields={"reason": app.reason, "retry_after_s": 30})
     if phase == "needs_passcode":
         # Only a lock can be auto-unlocked; the sheet never is.
         if app.reason == "locked":
@@ -3436,7 +3449,8 @@ def _write_expected_reset(udid: str | None) -> None:
 @contextlib.contextmanager
 def _mac_wide_install_lock():
     """Hold devicectl.lock, the flock every session on this Mac shares
-    (antsignalctl takes the same file around devicectl install/launch).
+    (antsignalctl takes the same file around devicectl install/launch, and
+    the iMirror app around its runner installs).
     An install resets the phone's USB link; two at once reset each other.
     The kernel drops the lock when the process dies, so a crash never leaves
     the Mac locked. After _INSTALL_LOCK_PATIENCE_S we go ahead anyway: no

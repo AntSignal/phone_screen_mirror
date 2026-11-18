@@ -5,6 +5,9 @@ public enum RunnerInstall: Equatable {
     case alreadyPresent          // runner already on the device — nothing to do
     case installed               // we just installed the bundled ipa
     case noBundle                // dev build ships no ipa; assume external install
+    /// No bundled ipa and no runner on the phone. A person must install it;
+    /// spawning runwda would only fail-loop.
+    case missing
     case failed(RunnerInstallError)
 }
 
@@ -104,9 +107,70 @@ public func shouldSpawnRunwda(after result: RunnerInstall) -> Bool {
     switch result {
     case .alreadyPresent, .installed, .noBundle:
         return true
-    case .failed:
+    case .failed, .missing:
         return false
     }
+}
+
+// MARK: - Listing the phone's apps
+
+/// What `ios apps --list` said about the runner. A failed listing used to
+/// read as "not installed", so a tunnel restart could reinstall the runner
+/// on every phone; each install resets USB and may raise the passcode sheet.
+public enum RunnerListing: Equatable, Sendable {
+    /// The listing worked. nil: the runner is not on the phone.
+    case listed(version: String?)
+    case failed
+}
+
+public enum RunnerListingPolicy {
+    /// One retry: the tunnel is briefly unusable right after it appears.
+    public static let retries = 1
+    public static let retryDelaySec: TimeInterval = 2
+    /// `apps --list` goes through the tunnel and can hang with it.
+    public static let timeoutSec: TimeInterval = 30
+}
+
+/// Install, upgrade or keep, from a listing. A failed listing keeps
+/// whatever is there and lets runwda try: a wrong guess costs one runwda
+/// failure, while a needless install costs a USB reset.
+public func runnerAction(listing: RunnerListing, bundled: String?,
+                         failedUpgradeTo: String? = nil) -> RunnerAction {
+    guard case .listed(let installed) = listing else { return .keep }
+    return runnerAction(installed: installed, bundled: bundled, failedUpgradeTo: failedUpgradeTo)
+}
+
+/// A build with no bundled ipa. Only a listing that worked and shows no
+/// runner is `.missing`; a failed one is given the benefit of the doubt.
+public func noBundleOutcome(_ listing: RunnerListing) -> RunnerInstall {
+    listing == .listed(version: nil) ? .missing : .noBundle
+}
+
+public enum RunnerMissingPolicy {
+    /// How often a chain with no runner looks again, so a runner a person
+    /// installs by hand is picked up without restarting anything.
+    public static let recheckSec: TimeInterval = 30
+}
+
+/// What a person must run, for devices.json `detail` and the status line.
+public func runnerMissingMessage(alias: String, udid: String) -> String {
+    "No WebDriverAgent runner on \(alias), and this iMirror build has none bundled. Build and "
+        + "install it; iMirror checks again every \(Int(RunnerMissingPolicy.recheckSec)) s: "
+        + "DEVELOPMENT_TEAM=<team> WDA_DESTINATION=\"id=\(udid)\" ./scripts/build-wda.sh, then "
+        + "tools/go-ios/bin/ios install --udid=\(udid) --path=build/WebDriverAgent.ipa"
+}
+
+// MARK: - The Mac-wide install lock
+
+/// `ios install` resets the phone's USB. The MCP server and antsignalctl
+/// hold devicectl.lock (flock) around their installs, and two installs at
+/// once reset each other, so the app's installs take the same lock.
+public enum InstallLockPolicy {
+    public static let fileName = "devicectl.lock"
+    /// Longer than any install. Past it the holder is likely stuck, so we
+    /// go ahead, as the MCP server does: no lock beats no install.
+    public static let waitSec: TimeInterval = 300
+    public static let pollSec: TimeInterval = 1
 }
 
 // MARK: - Runner upgrade

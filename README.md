@@ -346,7 +346,7 @@ with a different uniqueid knows the file is stale), `app_version`, `updated_at`,
 
 | key | meaning |
 |---|---|
-| `reason` | absent/null when ready; else one of `usb_reset`, `wda_wedged`, `needs_passcode`, `locked`, `tunnel_down`, `mac_asleep`, `gave_up`, `recovering`, `booting`, `untrusted` (the phone doesn't trust this Mac, or WDA's developer). Accept values you don't know. |
+| `reason` | absent/null when ready; else one of `usb_reset`, `wda_wedged`, `needs_passcode`, `locked`, `tunnel_down`, `mac_asleep`, `gave_up`, `recovering`, `booting`, `untrusted` (the phone doesn't trust this Mac, or WDA's developer), `runner_missing` (no runner on the phone and none bundled; `state` is `failed`, `detail` names the commands to install one, and the app looks again every 30 s). Accept values you don't know. |
 | `state_since` | UTC ISO-8601: when `state` or `reason` last changed |
 | `chain_epoch` | +1 each time the phone's chain (runwda + forwards) starts |
 | `last_error` | go-ios's last error line for this phone (`msg: error`, ≤200 chars), or absent |

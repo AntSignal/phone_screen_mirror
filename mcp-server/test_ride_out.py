@@ -124,6 +124,8 @@ def dead(monkeypatch, tmp_path):
     ("failed", None, "gave_up"),
     ("down", None, "recovering"),            # an app without `reason`
     ("down", "mac_asleep", "down"),
+    ("failed", "runner_missing", "runner_missing"),
+    ("starting", "runner_missing", "runner_missing"),
     (None, None, "down"),
 ])
 def test_chain_phase(dead, state, reason, phase):
@@ -264,6 +266,20 @@ def test_a_phone_the_app_gave_up_on_says_when_it_retries(dead):
     assert "next_retry_at=2099-01-01T00:00:00Z" in str(e.value)
     assert e.value.fields["retry_after_s"] > 0
     assert "runwda exited" in str(e.value) and "ios_recover" in str(e.value)
+
+
+def test_a_phone_with_no_runner_says_what_to_run_and_is_not_recovering(dead):
+    m, app = dead
+    app.write("failed", reason="runner_missing", chain_epoch=1)
+    t0 = time.monotonic()
+    with pytest.raises(m.MCPToolError) as e:
+        m.ios_screenshot()
+    assert time.monotonic() - t0 < m._RIDE_OUT_S      # nothing to wait out
+    assert e.value.error_code == "RUNNER_MISSING"
+    msg = str(e.value)
+    assert f'WDA_DESTINATION="id={PHONE}" ./scripts/build-wda.sh' in msg
+    assert f"ios install --udid={PHONE} --path=build/WebDriverAgent.ipa" in msg
+    assert "RECOVERING" not in msg
 
 
 def test_an_old_apps_failed_state_is_a_give_up_without_a_retry_time(dead):

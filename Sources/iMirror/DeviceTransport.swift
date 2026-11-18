@@ -14,6 +14,7 @@
 //
 // SECURITY: relays bind 127.0.0.1 only. WDA has no auth on the wire.
 
+import Darwin
 import Foundation
 import iMirrorCore
 
@@ -370,10 +371,24 @@ final class DeviceChain {
                 Thread.sleep(forTimeInterval: 0.5)
             }
             guard self.generation == gen else { return }
-            let install = self.installOrUpgradeRunner(generation: gen)
-            guard self.generation == gen, shouldSpawnRunwda(after: install) else { return }
-            self.onMainIfCurrent(gen) { $0.spawnChildren(generation: gen) }
+            self.checkRunnerThenSpawn(generation: gen)
         }
+    }
+
+    /// On startupQueue. With no runner to install, look again every 30 s
+    /// rather than spawn runwda into a fail-loop; a stop or restart ends it.
+    private func checkRunnerThenSpawn(generation gen: Int) {
+        let install = installOrUpgradeRunner(generation: gen)
+        guard generation == gen else { return }
+        if install == .missing {
+            startupQueue.asyncAfter(deadline: .now() + RunnerMissingPolicy.recheckSec) { [weak self] in
+                guard let self, self.generation == gen else { return }
+                self.checkRunnerThenSpawn(generation: gen)
+            }
+            return
+        }
+        guard shouldSpawnRunwda(after: install) else { return }
+        onMainIfCurrent(gen) { $0.spawnChildren(generation: gen) }
     }
 
     private func spawnChildren(generation gen: Int) {
@@ -447,15 +462,21 @@ final class DeviceChain {
         let emit = { (e: RunnerInstallEvent) in self.emitInstall(e, generation: gen) }
         emit(.checking)
         guard let ipa = bundledIPA else {
-            emit(.done(.noBundle))
-            return .noBundle
+            let result = noBundleOutcome(runnerListing(generation: gen))
+            emit(.done(result))
+            return result
         }
         installLock.lock(); defer { installLock.unlock() }
         // Replaced while waiting: bringUp drops this result anyway.
         guard generation == gen else { return .alreadyPresent }
-        let installed = installedRunnerVersion()
+        let listing = runnerListing(generation: gen)
+        if listing == .failed {
+            NSLog("iMirror: apps --list failed twice for \(udid); keeping its runner, starting runwda")
+        }
+        var installed: String?
+        if case .listed(let v) = listing { installed = v }
         let bundled = Self.bundledRunnerVersion(ipa: ipa)
-        switch runnerAction(installed: installed, bundled: bundled, failedUpgradeTo: failedUpgradeTo) {
+        switch runnerAction(listing: listing, bundled: bundled, failedUpgradeTo: failedUpgradeTo) {
         case .keep:
             emit(.done(.alreadyPresent))
             return .alreadyPresent
@@ -487,6 +508,10 @@ final class DeviceChain {
     /// `ios install` with retries: `.installed` or the last `.failed`.
     /// Stops retrying once the chain has moved past generation `gen`.
     private func installWithRetry(ipa: URL, generation gen: Int) -> RunnerInstall {
+        let lock = MacInstallLock.acquire(udid: udid, abandon: { [weak self] in self?.generation != gen })
+        defer { lock?.release() }
+        // Replaced while waiting: install nothing; bringUp drops this.
+        guard generation == gen else { return .failed(.other(raw: "chain restarted before the install")) }
         // The tunnel is briefly unusable right after it appears; retry the
         // unrecognised (transient) failures, stop at once on a definite one
         // (not provisioned for this phone, phone locked).
@@ -504,13 +529,20 @@ final class DeviceChain {
         return result
     }
 
-    /// The phone's runner version: nil when it is not installed or the
-    /// listing failed (then we install, as before), "" when it has none.
-    private func installedRunnerVersion() -> String? {
-        let r = GoIOS.run(bin, GoIOS.appsListArgs(udid: udid), workDir: workDir)
-        guard r.status == 0 else { return nil }
-        return runnerVersion(inAppsList: String(decoding: r.out, as: UTF8.self),
-                             bundleId: WDAIdentity.runnerBundleId)
+    /// The runner as `apps --list` sees it, retried once. A failure is its
+    /// own outcome, never "not installed" (RunnerListing).
+    private func runnerListing(generation gen: Int) -> RunnerListing {
+        for attempt in 0...RunnerListingPolicy.retries {
+            let r = GoIOS.runBounded(bin, GoIOS.appsListArgs(udid: udid), workDir: workDir,
+                                     timeout: RunnerListingPolicy.timeoutSec)
+            if r.status == 0 {
+                return .listed(version: runnerVersion(inAppsList: String(decoding: r.out, as: UTF8.self),
+                                                      bundleId: WDAIdentity.runnerBundleId))
+            }
+            guard attempt < RunnerListingPolicy.retries, generation == gen else { break }
+            Thread.sleep(forTimeInterval: RunnerListingPolicy.retryDelaySec)
+        }
+        return .failed
     }
 
     // The ipa never changes while the app runs.
@@ -531,4 +563,54 @@ final class DeviceChain {
         bundledVersionCache = v
         return v
     }
+}
+
+// MARK: - The Mac-wide install lock
+
+/// flock(2) on devicectl.lock, the file the MCP server and antsignalctl
+/// lock around their installs (InstallLockPolicy). It sits next to
+/// devices.json, as the MCP server's does. The kernel drops the lock if
+/// the app dies, so a crash never leaves the Mac locked.
+final class MacInstallLock {
+    private let fd: Int32
+
+    private init(fd: Int32) { self.fd = fd }
+
+    static var defaultURL: URL {
+        DeviceRegistryWriter().url.deletingLastPathComponent().appendingPathComponent(InstallLockPolicy.fileName)
+    }
+
+    /// Blocking: call off main. Waits up to InstallLockPolicy.waitSec, then
+    /// logs and goes ahead without it. nil when unlocked: no file, a wait
+    /// that ran out, or `abandon` turned true (the chain moved on).
+    static func acquire(udid: String, url: URL = defaultURL, waitSec: TimeInterval = InstallLockPolicy.waitSec,
+                        abandon: () -> Bool) -> MacInstallLock? {
+        try? FileManager.default.createDirectory(at: url.deletingLastPathComponent(),
+                                                 withIntermediateDirectories: true)
+        let fd = open(url.path, O_CREAT | O_RDWR | O_CLOEXEC, 0o644)
+        guard fd >= 0 else {
+            NSLog("iMirror: can't open \(url.path) (errno \(errno)); installing on \(udid) unlocked")
+            return nil
+        }
+        let deadline = Date().addingTimeInterval(waitSec)
+        var told = false
+        while flock(fd, LOCK_EX | LOCK_NB) != 0 {
+            if abandon() { close(fd); return nil }
+            if Date() >= deadline {
+                NSLog("iMirror: \(url.path) still held after \(Int(waitSec)) s; "
+                      + "installing on \(udid) anyway")
+                close(fd)
+                return nil
+            }
+            if !told {
+                NSLog("iMirror: waiting for another install (\(url.path)) before installing on \(udid)")
+                told = true
+            }
+            Thread.sleep(forTimeInterval: InstallLockPolicy.pollSec)
+        }
+        return MacInstallLock(fd: fd)
+    }
+
+    /// Closing the file drops the flock.
+    func release() { close(fd) }
 }
