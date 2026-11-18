@@ -314,7 +314,11 @@ tunnel's 2 min cooldown refuses that restart, it asks again every 15 s (up to
 failed health probes in a row, and a probe that times out while other requests
 (say an agent's slow `/source`) are already waiting on WDA counts as busy, not
 failed. If WDA stays down, a ladder restarts that phone's own chain first, then
-the shared tunnel; each restart gets its full grace from the moment it starts. If it still won't come up, the app stops the chain and
+the shared tunnel; each restart gets its full grace from the moment it starts.
+While another phone is working, a phone the tunnel cannot reach restarts only
+its own chain until three of those restarts have failed (a brief reconnect in
+between does not wipe the count; 10 min of health does), and then may cost the
+others one tunnel restart. If it still won't come up, the app stops the chain and
 retries by itself after 2 min, then 5 min, then every 10 min; tapping the WDA
 dot retries at once. Those retries never restart the shared tunnel while
 another phone is working. A separate MJPEG no-frame watchdog covers the case where
@@ -369,7 +373,11 @@ locked. The state is then `starting` or `down`, never `failed`.
 runner is older than the bundled one and is reinstalled; `from`/`to` are
 versions; the new runner may raise the passcode sheet once), `lock`
 (`detail` `locked` or `unlocked`; an unlock has `reason` `auto`, `click` or
-`other`; while WDA is down a `restart` with `detail` `unlocked` follows), `keyboard` (see
+`other`; while WDA is down a `restart` with `detail` `unlocked` follows),
+`tunnel_restart` (the shared tunnel restarted, so every phone's chain did;
+`udid`/`alias` name the phone that asked, empty when a person used the menu;
+`reason` is `ladder`, `unlocked`, `retry` or `user`; `detail` lists the phones
+that were healthy), `keyboard` (see
 below). The same lines go to the unified log, subsystem
 `com.local.imirror`, category `events`, in the clear.
 

@@ -201,6 +201,68 @@ public func shouldRestartTunnel(lastAt: TimeInterval?, now: TimeInterval,
     return now - lastAt >= minInterval
 }
 
+/// When a phone the tunnel cannot reach may restart the shared tunnel while
+/// other phones are up. That restart costs every healthy phone its WDA and
+/// bumps its chain_epoch, so their agents' calls fail. So the phone first
+/// restarts only its own chain, and the tunnel goes only after
+/// `failuresForTunnel` of those failed. Within one outage every failure
+/// counts; a reconnect forgets only failures older than `windowSec`, so a
+/// flap clears nothing recent. `settleSec` of health clears it all. Each
+/// phone may cost the others one tunnel restart per settle.
+public struct TunnelEscalation: Equatable, Sendable {
+    public static let failuresForTunnel = 3
+    public static let windowSec: TimeInterval = 300
+    /// Twice the window. A phone that flaps every few minutes never stays
+    /// up this long; one that does has recovered, so its old failures and
+    /// its spent tunnel restart no longer say anything about it.
+    public static let settleSec: TimeInterval = 600
+
+    public enum Choice: Equatable, Sendable { case ownChain, tunnel, giveUp }
+
+    /// When this phone's own-chain restarts were judged failed.
+    public private(set) var failures: [TimeInterval] = []
+    /// An own-chain restart has not yet been followed by a settle.
+    public private(set) var pending = false
+    /// This phone already cost the others a tunnel restart.
+    public private(set) var tunnelSpent = false
+    /// Since when health has been green without a break.
+    public private(set) var upSince: TimeInterval?
+
+    public init() {}
+
+    /// The ladder decided to restart again, so the last own restart failed.
+    public mutating func restartDecided(now: TimeInterval) {
+        if pending { failures.append(now) }
+        pending = false
+    }
+
+    /// The ladder wants the tunnel and other phones are up.
+    public func choose() -> Choice {
+        if failures.count < Self.failuresForTunnel { return .ownChain }
+        return tunnelSpent ? .giveUp : .tunnel
+    }
+
+    public mutating func ownChainRestarted() { pending = true }
+
+    /// `costOthers`: other phones were up, so this spent its one go.
+    public mutating func tunnelRestarted(costOthers: Bool) {
+        failures = []
+        pending = false
+        if costOthers { tunnelSpent = true }
+    }
+
+    /// Called on every green probe. Pruning only here means a long
+    /// outage still reaches the tunnel, however slow each attempt is.
+    public mutating func connected(now: TimeInterval) {
+        if upSince == nil { failures.removeAll { now - $0 > Self.windowSec } }
+        let since = upSince ?? now
+        upSince = since
+        if now - since >= Self.settleSec { self = TunnelEscalation(); upSince = since }
+    }
+
+    public mutating func down() { upSince = nil }
+}
+
 /// One phone's recovery-ladder state, lifted out of the app delegate so each
 /// phone carries its own. Times are monotonic seconds (systemUptime), never
 /// wall-clock, so a Mac sleep can't skew them.
@@ -225,6 +287,8 @@ public struct ChainLadderState: Equatable, Sendable {
     /// Ask for a refused post-unlock tunnel restart again then.
     public private(set) var unlockTunnelRetryAt: TimeInterval?
     private var unlockTunnelRefusals = 0
+    /// Holds back tunnel restarts while other phones are up.
+    public private(set) var escalation = TunnelEscalation()
 
     /// How long each give-up lasts: 2 min, 5 min, then 10 min for good. Most
     /// outages (a USB reset, a crashed runner, a passcode sheet the user
@@ -254,7 +318,10 @@ public struct ChainLadderState: Equatable, Sendable {
     public init() {}
 
     /// Health went green: the next outage starts a fresh stage-0 grace.
-    public mutating func onConnected() {
+    /// `now` lets the tunnel escalation see how long health has held; nil
+    /// leaves it alone.
+    public mutating func onConnected(now: TimeInterval? = nil) {
+        if let now { escalation.connected(now: now) }
         wedgeSince = nil
         stage = 0
         hardStopped = false
@@ -287,6 +354,7 @@ public struct ChainLadderState: Equatable, Sendable {
     /// during first boot, runwda starting does (onRunwdaStarted), so tunnel
     /// and install time don't count against WDA's own boot grace.
     public mutating func onDown(now: TimeInterval) {
+        escalation.down()
         if hadSuccessfulConnection, wedgeSince == nil { wedgeSince = now }
     }
 
@@ -296,6 +364,7 @@ public struct ChainLadderState: Equatable, Sendable {
 
     /// Automation turned on or off: start clean.
     public mutating func reset() {
+        escalation = TunnelEscalation()
         wedgeSince = nil
         stage = 0
         hardStopped = false
@@ -393,14 +462,27 @@ public struct ChainLadderState: Equatable, Sendable {
         var action = nextDeviceRecoveryAction(downForSec: now - since, graceSec: grace, stage: stage,
                                               othersHealthy: othersHealthy,
                                               tunnelHasDevice: tunnelHasDevice)
-        if action == .restartTunnelAndChains,
-           !Self.retryMayRestartTunnel(giveUps: giveUps, othersHealthy: othersHealthy) {
-            action = .giveUp
+        if action == .restartDeviceChain || action == .restartTunnelAndChains {
+            escalation.restartDecided(now: now)
+        }
+        if action == .restartTunnelAndChains, othersHealthy {
+            if !Self.retryMayRestartTunnel(giveUps: giveUps, othersHealthy: othersHealthy) {
+                action = .giveUp
+            } else {
+                switch escalation.choose() {
+                case .ownChain: action = .restartDeviceChain
+                case .tunnel: break
+                case .giveUp: action = .giveUp
+                }
+            }
         }
         switch action {
         case .wait: break
-        case .restartDeviceChain: stage = 1; beginRestart(now: now)
-        case .restartTunnelAndChains: stage = 2; beginRestart(now: now)
+        case .restartDeviceChain: stage = 1; escalation.ownChainRestarted(); beginRestart(now: now)
+        case .restartTunnelAndChains:
+            stage = 2
+            escalation.tunnelRestarted(costOthers: othersHealthy)
+            beginRestart(now: now)
         case .giveUp: hardStop(now: now)
         case .autoRetry, .holdForLock: break
         }

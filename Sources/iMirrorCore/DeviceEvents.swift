@@ -113,6 +113,9 @@ public enum DeviceEventKind: String, Sendable {
     case keyboard
     /// The lock probe saw the phone lock or unlock (detail locked|unlocked).
     case lock
+    /// The shared tunnel restarted. udid/alias name the phone that asked
+    /// (empty for the user's menu item); reason says why.
+    case tunnelRestart = "tunnel_restart"
 }
 
 /// One line of events.jsonl.
