@@ -348,7 +348,13 @@ atomically on each change (format: `Sources/iMirrorCore/DeviceRegistry.swift`).
 Top level: `schema` (1), `owner_pid`, `owner_uniqueid` (the app's kernel
 `p_uniqueid`, never reused within a boot: a reader that finds a live `owner_pid`
 with a different uniqueid knows the file is stale), `app_version`, `updated_at`,
-`goios`, `devices`. Each device has `udid`, `alias`, `kind`, `wda_url`, `state`
+`goios`, `devices`, and `problems` (absent in older builds, so treat a missing
+key as none): `[{"udid"?, "reason", "message"}]`, what keeps a phone or every
+phone from starting. `reason` is `slot_conflict` (the phone's port is held by
+another process), `slots_full`, or `app_bundle_missing` (no `udid`: the app's
+go-ios binary is gone, so nothing new starts until `scripts/run.sh --restart`;
+the app also posts one notification). A phone with a slot problem has no
+`devices` entry. Accept reasons you don't know. Each device has `udid`, `alias`, `kind`, `wda_url`, `state`
 (`starting|installing|ready|down|failed`), `detail`, and:
 
 | key | meaning |

@@ -78,6 +78,73 @@ public struct RegisteredDevice: Codable, Equatable, Sendable {
     }
 }
 
+/// Something that keeps the app from driving a phone, or any phone, that
+/// no device entry can say: a phone that got no slot has no entry at all.
+public struct RegistryProblem: Codable, Equatable, Sendable {
+    /// The phone it is about; nil when it is about the app itself.
+    public var udid: String?
+    /// A `RegistryProblem.Reason` raw value. A String so a reader never
+    /// fails on a reason a newer app adds.
+    public var reason: String
+    public var message: String
+
+    public enum Reason: String, Sendable {
+        /// The phone's sticky port is held by another process.
+        case slotConflict = "slot_conflict"
+        /// Every port slot belongs to an attached phone.
+        case slotsFull = "slots_full"
+        /// The go-ios binary the app runs is gone (its bundle was deleted).
+        case appBundleMissing = "app_bundle_missing"
+    }
+
+    public init(udid: String?, reason: Reason, message: String) {
+        self.udid = udid; self.reason = reason.rawValue; self.message = message
+    }
+
+    /// The problem a slot assignment leaves, or nil when it got a slot.
+    public static func slot(_ result: SlotAssignment, udid: String) -> RegistryProblem? {
+        switch result {
+        case .assigned:
+            return nil
+        case .conflict(let slot, let port):
+            return RegistryProblem(udid: udid, reason: .slotConflict,
+                                   message: "port \(port) (its slot \(slot.index)) is held by another process")
+        case .full:
+            return RegistryProblem(udid: udid, reason: .slotsFull,
+                                   message: "all \(PortSlot.maxSlots) port slots belong to attached phones")
+        }
+    }
+
+    public static func appBundleMissing(goios: String) -> RegistryProblem {
+        RegistryProblem(udid: nil, reason: .appBundleMissing,
+                        message: "iMirror's go-ios binary (\(goios)) is gone: the app bundle was deleted or "
+                            + "moved. No phone can start until iMirror restarts: scripts/run.sh --restart")
+    }
+
+    /// The file's list: the app-wide problem first, then phones by UDID,
+    /// so the bytes only change when a problem does.
+    public static func list(bundle: RegistryProblem?, phones: [String: RegistryProblem]) -> [RegistryProblem] {
+        (bundle.map { [$0] } ?? []) + phones.keys.sorted().compactMap { phones[$0] }
+    }
+}
+
+/// Watches that the app's go-ios binary is still on disk. A deleted
+/// bundle is told once per run: the fix, a restart, ends the run anyway.
+public struct AppBundleWatch: Equatable, Sendable {
+    public private(set) var missing = false
+    public private(set) var notified = false
+
+    public init() {}
+
+    /// Record one check. True when the user must be told now.
+    public mutating func check(binaryExists: Bool) -> Bool {
+        missing = !binaryExists
+        guard missing, !notified else { return false }
+        notified = true
+        return true
+    }
+}
+
 /// The whole file. `ownerPid` lets a reader tell a live list from one a
 /// crashed app left behind: the MCP server ignores the file unless that
 /// process is alive. `ownerUniqueID` (the kernel's p_uniqueid, never reused
@@ -93,17 +160,20 @@ public struct DeviceRegistryFile: Codable, Equatable, Sendable {
     /// The go-ios binary the app drives, so `ios_install_app` uses the same one.
     public var goios: String?
     public var devices: [RegisteredDevice]
+    /// What stops a phone, or every phone, from starting. Absent in older
+    /// app builds, so readers must treat a missing key as none.
+    public var problems: [RegistryProblem]?
 
     public init(ownerPid: Int32, ownerUniqueID: UInt64? = nil, appVersion: String, updatedAt: String,
-                goios: String?, devices: [RegisteredDevice],
+                goios: String?, devices: [RegisteredDevice], problems: [RegistryProblem]? = nil,
                 schema: Int = DeviceRegistryFile.schemaVersion) {
         self.schema = schema; self.ownerPid = ownerPid; self.ownerUniqueID = ownerUniqueID
         self.appVersion = appVersion; self.updatedAt = updatedAt; self.goios = goios
-        self.devices = devices
+        self.devices = devices; self.problems = problems
     }
 
     enum CodingKeys: String, CodingKey {
-        case schema, goios, devices
+        case schema, goios, devices, problems
         case ownerPid = "owner_pid"
         case ownerUniqueID = "owner_uniqueid"
         case appVersion = "app_version"

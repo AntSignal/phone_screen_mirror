@@ -186,6 +186,25 @@ def format_device(d, pairs=None):
     return "\n".join(lines)
 
 
+def read_problems(registry):
+    """devices.json `problems`: what keeps a phone, or every phone, from
+    starting. Older apps write none, so a missing or odd value is no
+    problems, and an entry without a string reason and message is skipped."""
+    raw = registry.get("problems")
+    if not isinstance(raw, list):
+        return []
+    out = []
+    for p in raw:
+        if isinstance(p, dict) and isinstance(p.get("reason"), str) and isinstance(p.get("message"), str):
+            out.append({k: p[k] for k in ("udid", "reason", "message") if isinstance(p.get(k), str)})
+    return out
+
+
+def format_problem(p):
+    # An unslotted phone has no entry or alias: show its UDID.
+    return f"problem: {p.get('udid') or 'iMirror'}: {p['message']} ({p['reason']})"
+
+
 def format_summary(d):
     extra = f" retry at {d['next_retry_at']}" if d.get("next_retry_at") else ""
     return (f"{str(d.get('alias')):<10} {str(d.get('state')):<11} {str(d.get('reason') or '-'):<15}"
@@ -418,16 +437,20 @@ def main(argv=None):
         if a.cmd == "keyboard":
             return keyboard_main(a, devices, folder)
         if a.cmd == "status":
+            problems = read_problems(reg)
             if not a.device:
-                print(json.dumps(devices, indent=2) if a.json else "\n".join(map(format_summary, devices)))
+                # --json stays a bare device list, as scripts expect.
+                print(json.dumps(devices, indent=2) if a.json
+                      else "\n".join(list(map(format_summary, devices)) + list(map(format_problem, problems))))
                 return 0
             d = resolve(a.device, devices)
+            problems = [p for p in problems if p.get("udid") in (None, d.get("udid"))]
             evs = read_events(folder, d.get("udid"))[-max(a.n, 0):] if a.n > 0 else []
             if a.json:
                 kb = read_pairs(folder).get(d.get("udid"))
-                print(json.dumps({"device": d, "events": evs, "keyboard": kb}, indent=2))
+                print(json.dumps({"device": d, "events": evs, "keyboard": kb, "problems": problems}, indent=2))
             else:
-                print(format_device(d, read_pairs(folder)))
+                print("\n".join([format_device(d, read_pairs(folder))] + list(map(format_problem, problems))))
                 print(f"last {len(evs)} events:")
                 print("\n".join("  " + format_event(ev) for ev in evs) or "  (none)")
             return 0
