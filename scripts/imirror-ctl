@@ -201,7 +201,7 @@ def read_problems(registry):
 
 
 def format_problem(p):
-    # A phone with no slot has no entry, so no alias: name its UDID.
+    # An unslotted phone has no entry or alias: show its UDID.
     return f"problem: {p.get('udid') or 'iMirror'}: {p['message']} ({p['reason']})"
 
 
